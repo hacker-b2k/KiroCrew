@@ -720,7 +720,7 @@ function CrewCard({ agent, isDefault, shared, onOpen }: {
               member. The chip says "this is an identifier" without a caption. */}
           <div className="flex items-center gap-2 min-w-0">
             <span className={`truncate text-[14px] font-semibold text-text-strong ${memberLabel(agent) === agent.name ? 'font-mono' : ''}`} data-testid="crew-card-label">{memberLabel(agent)}</span>
-            {memberLabel(agent) !== agent.name && <span className="shrink-0 truncate max-w-[40%] rounded border border-border bg-bg-elevated px-1 font-mono text-[11px] text-muted" title={i18nT('pages.membersPage.member_id')} aria-label={`${i18nT('pages.membersPage.member_id')}: ${agent.name}`} data-testid="crew-card-id">{agent.name}</span>}
+            {memberLabel(agent) !== agent.name && <span className="shrink-0 truncate max-w-[40%] rounded border border-border bg-bg-elevated px-1 font-mono text-[11px] text-muted" title={i18nT('pages.kiroCrewAgentsPage.agent_id')} aria-label={`${i18nT('pages.kiroCrewAgentsPage.agent_id')}: ${agent.name}`} data-testid="crew-card-id">{agent.name}</span>}
             {isDefault && <Badge variant="ok" className="shrink-0">{i18nT('pages.kiroCrewAgentsPage.default_2')}</Badge>}
             {agent.source && agent.source !== 'kirocrew' && <SourceBadge source={agent.source} />}
           </div>
@@ -811,7 +811,7 @@ function CrewRow({ agent, isDefault, shared, onOpen }: {
               >
                 {memberLabel(agent)}
               </Clickable>
-              {memberLabel(agent) !== agent.name && <span className="shrink-0 truncate max-w-[30%] rounded border border-border bg-bg-elevated px-1 font-mono text-[11px] text-muted" title={i18nT('pages.membersPage.member_id')} aria-label={`${i18nT('pages.membersPage.member_id')}: ${agent.name}`} data-testid="crew-row-id">{agent.name}</span>}
+              {memberLabel(agent) !== agent.name && <span className="shrink-0 truncate max-w-[30%] rounded border border-border bg-bg-elevated px-1 font-mono text-[11px] text-muted" title={i18nT('pages.kiroCrewAgentsPage.agent_id')} aria-label={`${i18nT('pages.kiroCrewAgentsPage.agent_id')}: ${agent.name}`} data-testid="crew-row-id">{agent.name}</span>}
               {isDefault && <Badge variant="ok" className="shrink-0">{i18nT('pages.kiroCrewAgentsPage.default_2')}</Badge>}
               {agent.source && agent.source !== 'kirocrew' && <SourceBadge source={agent.source} />}
             </div>
@@ -1246,18 +1246,36 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   }, [refetchWorkspaces])
 
   const createMut = useMutation({
-    mutationFn: ({ epoch: _epoch, ...data }: CreatePayload & { epoch: number }) => api.createKirocrewAgent(data),
+    // Two verbs behind one form. From the crew manager the form CREATES a
+    // crew: a plain row bound to a shared template, a session agent. From the
+    // Crew page ("Add a Crewmate") it HIRES: the same fields -- the template
+    // picked, the name typed, Hire pressed -- go to POST /api/members, which
+    // copies the template into the crewmate's own definition, gives it private
+    // memory and enrolls it, so the roster the form returns to actually lists
+    // what was just added. A plain create there would land on a Crew page that
+    // omits the row and says it is not on the roster.
+    mutationFn: ({ epoch: _epoch, ...data }: CreatePayload & { epoch: number }) =>
+      fromMembers
+        ? api.hireMember({
+            source: { kind: 'local', agent: data.kiro_agent },
+            display_name: data.name,
+            role: data.role,
+            workspace: data.workspace,
+            triggers: data.triggers,
+            session_color: data.session_color,
+          }).then((r): AgentMutationResult => ({ error: r.error, name: r.id }))
+        : api.createKirocrewAgent(data),
     onSuccess: (r: AgentMutationResult, vars) => {
       refetchAgents()
-      // The Members roster sent the user here to add a member; the member now
-      // exists, so the next step they want is its thread, not the crew list.
-      // Only for the panel the write was fired from (see settleFor). Exact
-      // name, not slug — MembersPage's `?member=` resolves by name.
+      // The Crew page sent the user here to add a crewmate; the crewmate now
+      // exists and is enrolled, so the next step they want is its thread, not
+      // the crew list. Only for the panel the write was fired from (see
+      // settleFor).
       if (fromMembers && !r.error && vars.epoch === sheetEpoch.current) {
         dismissSheet()
-        // By the MINTED id the server answered with, not the typed text: for
+        // By the MINTED id the hire answered with, not the typed text: for
         // "case competition" the id is "case-competition", and the roster's
-        // `?member=` resolves by id. A pre-split gateway echoes the name.
+        // `?member=` resolves by id.
         navigate(`/members?member=${encodeURIComponent(r.name || vars.name)}`)
         return
       }
@@ -1265,9 +1283,9 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     },
     onError: (e: Error, vars) => {
       // The server's wording is the crew manager's ("Agent 'x' already
-      // exists"); inside the member-titled form the same outcome is said in
-      // the form's own word. 409 is the create route's one "name taken"
-      // answer, so the status is the signal, not the message text.
+      // exists"); inside the crewmate-titled form the same outcome is said in
+      // the form's own word. 409 is the one "name taken" answer of both the
+      // create and the hire, so the status is the signal, not the message text.
       if (fromMembers && e instanceof ApiError && e.status === 409) {
         settleFor(vars.epoch, i18nT('pages.kiroCrewAgentsPage.member_already_exists', { name: vars.name }))
         return
@@ -2190,7 +2208,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
               <DialogTitle className={creating || !editingAgent?.display_name || editingAgent.display_name === editing ? 'flex-1 font-mono' : 'flex-1'}>
                 {creating ? i18nT('pages.kiroCrewAgentsPage.add_crew_member') : (editingAgent?.display_name || editing)}
                 {!creating && editingAgent?.display_name && editingAgent.display_name !== editing && (
-                  <span className="ml-2 rounded border border-border bg-bg-elevated px-1 font-mono text-[12px] font-normal text-muted" title={i18nT('pages.membersPage.member_id')} aria-label={`${i18nT('pages.membersPage.member_id')}: ${editing}`} data-testid="crew-editor-id">{editing}</span>
+                  <span className="ml-2 rounded border border-border bg-bg-elevated px-1 font-mono text-[12px] font-normal text-muted" title={i18nT('pages.kiroCrewAgentsPage.agent_id')} aria-label={`${i18nT('pages.kiroCrewAgentsPage.agent_id')}: ${editing}`} data-testid="crew-editor-id">{editing}</span>
                 )}
               </DialogTitle>
               {!creating && editingAgent?.source && <SourceBadge source={editingAgent.source} />}
