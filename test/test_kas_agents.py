@@ -715,12 +715,37 @@ class TestRuntimeSuppliesTheStubbedSet:
             kas_agents_mod, "load_agent_spec", lambda _dir, agent: {"name": agent, "prompt": "p"}
         )
 
-        def _capture(_dir, agent, _spec, *, stub_server_names=frozenset(), member_dispatch=False):
+        def _capture(
+            _dir,
+            agent,
+            _spec,
+            *,
+            stub_server_names=frozenset(),
+            member_dispatch=False,
+            session_key="",
+        ):
             seen.append(stub_server_names)
             return [{"id": agent}]
 
         monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", _capture)
         return rt
+
+    @pytest.mark.asyncio
+    async def test_runtime_carries_each_callers_identity_through_the_harness(self, monkeypatch):
+        rt = self._runtime(monkeypatch, None, [])
+        import kiro_crew.acp.kas_agents as kas_agents_mod
+
+        seen = []
+
+        def capture(directory, agent, spec, *, stub_server_names, member_dispatch, session_key):
+            seen.append((session_key, member_dispatch))
+            return [{"id": agent}]
+
+        monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", capture)
+        await rt._kas_custom_agents("worker", session_key="subagent:first")
+        await rt._kas_custom_agents("worker", session_key="subagent:second")
+        await rt._kas_custom_agents("worker")
+        assert seen == [("subagent:first", False), ("subagent:second", False), ("", False)]
 
     @pytest.mark.asyncio
     async def test_the_overlay_set_is_forwarded(self, monkeypatch):
@@ -923,3 +948,59 @@ class TestSpecLookup:
             load_agent_spec(tmp_path, "kirocrew")
 
         assert str(tmp_path / "kirocrew.json") in str(exc.value)
+
+
+class TestNativeManagedMcpIdentity:
+    def test_managed_callback_targets_live_gateway_without_relaying_spec_env(self, monkeypatch):
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "61234")
+        monkeypatch.setenv("KIROCREW_PORT", "5476")
+        out = to_client_custom_agent(
+            "a",
+            _spec(
+                mcpServers={
+                    "kirocrew-core": {
+                        "command": "x",
+                        "env": {
+                            "KIROCREW_HOME": "/h",
+                            "KIROCREW_PORT": "secret-in-editable-spec",
+                            "SECRET_TOKEN": "secret",
+                        },
+                    },
+                    "third-party": {"command": "y"},
+                }
+            ),
+            "p",
+        )
+        assert out["mcpServers"]["kirocrew-core"]["env"] == {
+            "KIROCREW_HOME": "/h",
+            "KIROCREW_PORT": "61234",
+        }
+        assert "env" not in out["mcpServers"]["third-party"]
+        assert "secret" not in json.dumps(out)
+
+    @pytest.mark.parametrize("port", ["", "auto", "secret", "0", "-1", "65536", "１２３"])
+    def test_invalid_bound_port_never_reaches_managed_spec(self, monkeypatch, port):
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", port)
+        out = to_client_custom_agent("a", _spec(), "p")
+        assert "KIROCREW_PORT" not in out["mcpServers"]["kirocrew-core"].get("env", {})
+
+    def test_worker_identity_is_runtime_scoped_without_member_control_tools(self):
+        spec = _spec(
+            tools=["@kirocrew-work"],
+            mcpServers={
+                "kirocrew-work": {
+                    "command": "worker",
+                    "env": {"KIROCREW_SESSION_KEY": "forged-parent"},
+                },
+                "third-party": {"command": "other"},
+            },
+        )
+        worker = to_client_custom_agent("worker", spec, "p", session_key="subagent:abc12345")
+        assert worker["mcpServers"]["kirocrew-work"]["env"] == {
+            "KIROCREW_SESSION_KEY": "subagent:abc12345",
+        }
+        assert "env" not in worker["mcpServers"]["third-party"]
+        assert "kirocrew-dashboard" not in json.dumps(worker)
+        assert "forged-parent" not in json.dumps(worker)
+        unrelated = to_client_custom_agent("worker", spec, "p")
+        assert "env" not in unrelated["mcpServers"]["kirocrew-work"]

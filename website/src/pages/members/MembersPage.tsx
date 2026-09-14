@@ -440,7 +440,9 @@ export default function MembersPage() {
   const slotsLoaded = useAppSelector((s) => s.dashboard.slotsLoaded)
   const liveRunning = useMemo(() => {
     const byKey: Record<string, boolean> = {}
-    for (const s of liveSlots) if (s.mode === 'member') byKey[s.key] = !!s.running
+    for (const s of liveSlots) {
+      if (s.mode === 'member') byKey[s.key] = !!(s.running || s.subagents_running)
+    }
     return byKey
   }, [liveSlots])
   const isRunning = useCallback(

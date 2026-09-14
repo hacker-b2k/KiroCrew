@@ -398,6 +398,55 @@ an empty `mcpServers` map — opts out via
 `AcpRuntime(expect_mcp_reports=False)`, which passes a zero ceiling and keeps
 the idle shortcut active from the start (the pre-ceiling behavior).
 
+### KAS managed MCP readiness
+
+KAS opts into a readiness barrier through its harness notification declaration.
+Its `_kiro/mcp/status` and `_kiro/tools/didChange` notifications carry an explicit
+`params.sessionId` and full `servers` / `tags` snapshots. The reader stages both
+methods before the create/load response and transfers only that session's frames.
+Status entries carry `name`, `status`, `failedAuthorization`, `errorMessage`, and
+`_meta.kiro.resource.source.origin`; the required Crew declarations have origin
+`client`. Tool tags have `source: "mcp"` and `tag: "@server/tool"`; these establish
+exposure, not the native callable identifier.
+
+After activation, create and load wait for every required managed server to be
+`connected` and represented in the tool-tag snapshot when exposure is permitted.
+The required roster is the union of the ACTIVE custom agent's `mcpServers`
+declarations and the actual session-level injection, intersected with Crew's
+managed server catalog. Inactive agents and inherited global/external servers do
+not contribute requirements or satisfy them. Other-session and sessionless reports
+are ignored. Reports queued
+before a mode change cannot satisfy the new activation; when the prior mode is
+unknown, KAS conservatively treats activation as a change. A reconnect invalidates
+that server's prior tool exposure.
+
+For a derived worker, the projected payload carries both its checked specification
+snapshot and its runtime session key through create and load. Activation checks
+that same snapshot before readiness: connected tools cannot admit a revoked
+template, and an unchanged template still waits for its managed tools.
+
+The exposure check reads the active agent's projected `tools` and `excludedTools`,
+plus the connected status's `tools[].disabled` flags. If these deliberately hide
+every tool from a declared server, connection is sufficient: an absent tag must
+not make a restricted agent unusable. An empty or missing catalog alone does not
+prove that restriction. `allowedTools`/`permissions` governs approval, not
+exposure; readiness never changes grants or declarations to obtain a tag.
+
+The barrier retains the ordinary drain's config updates, pending OAuth requests,
+and initialization-failure diagnostics, including for unrelated external servers.
+These side effects do not satisfy or extend managed readiness. An agent with no
+required managed servers keeps the ordinary drain.
+
+The wait uses the existing `agent.session_start_timeout_secs` budget, with no
+idle-success shortcut or extra sleep. `failed`, `disabled`, and failed
+authorization terminate startup with `AcpRuntimeError`; connecting, missing
+reports, or missing tool exposure remain pending until `AcpRequestTimeout`.
+Errors name the required server and sanitize backend failure text. Failure,
+runtime death, and cancellation unregister the local handle without sending
+KAS's destructive session-delete request, preserving resumable history. No
+first prompt is sent on these paths. Harnesses without this opt-in retain their
+existing initialization drain.
+
 ## Key APIs
 
 | Method | Purpose |
@@ -626,6 +675,15 @@ before session creation. Tool mirroring, reload, resume and runtime recreation
 use direct MCP servers confined to that member's sandbox. Original agent server
 definitions remain available to direct-MCP-capable backends. V1 retains its
 existing broker routing.
+
+KAS projects the gateway's validated `KIROCREW_BOUND_PORT` as `KIROCREW_PORT`
+for native managed MCP servers. This value is derived inside the gateway at
+session creation, not relayed from an editable agent spec. Native children do
+not inherit the gateway environment, and private sandboxes cannot discover its
+listener through host process markers. Without this explicit address, core
+tools can dial the default port while member-scoped ledger tools reach the
+correct instance. Declared secrets and arbitrary environment values remain
+withheld, and non-managed servers receive no gateway port.
 
 The original trusted broker endpoint remains available only for sandbox
 validation. Private execution cannot reach that endpoint or its aliases. A

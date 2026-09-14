@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -326,6 +327,7 @@ def _project_mcp_servers(
     spec: dict[str, Any],
     agent_id: str,
     stub_server_names: frozenset[str],
+    session_key: str = "",
 ) -> dict[str, dict[str, Any]]:
     """The spec's ``mcpServers``, minus stubbed names and minus two field classes.
 
@@ -378,6 +380,20 @@ def _project_mcp_servers(
         projected.pop("autoApprove", None)
         managed = name in MANAGED_MCP_SERVER_NAMES
         withheld = _withhold_credential_fields(projected, managed=managed)
+        if managed:
+            # Native MCP children do not inherit the gateway's environment.
+            # Take the live listener from the gateway, never from an editable
+            # spec: private sandboxes cannot discover it through host PIDs.
+            bound_port = os.environ.get("KIROCREW_BOUND_PORT", "")
+            if (
+                1 <= len(bound_port) <= 5
+                and bound_port.isascii()
+                and bound_port.isdecimal()
+                and 0 < int(bound_port) < 65536
+            ):
+                projected.setdefault("env", {})["KIROCREW_PORT"] = bound_port
+            if session_key:
+                projected.setdefault("env", {})["KIROCREW_SESSION_KEY"] = session_key
         if withheld:
             logger.info(
                 "agent %r: not relaying %s for MCP server %r — the field can carry "
@@ -439,6 +455,7 @@ def to_client_custom_agent(
     *,
     stub_server_names: frozenset[str] = frozenset(),
     member_dispatch: bool = False,
+    session_key: str = "",
 ) -> dict[str, Any]:
     """Project one Crew agent spec onto a KAS ``ClientCustomAgent`` descriptor.
 
@@ -535,7 +552,7 @@ def to_client_custom_agent(
         if entries:
             out["resources"] = entries
 
-    mcp_servers = _project_mcp_servers(spec, agent_id, stub_server_names)
+    mcp_servers = _project_mcp_servers(spec, agent_id, stub_server_names, session_key)
     if mcp_servers:
         out["mcpServers"] = mcp_servers
 
@@ -607,6 +624,7 @@ def build_kas_custom_agents(
     *,
     stub_server_names: frozenset[str] = frozenset(),
     member_dispatch: bool = False,
+    session_key: str = "",
 ) -> list[dict[str, Any]]:
     """Build the ``_meta.kiro.customAgents`` batch that binds *agent_id* on KAS.
 
@@ -641,5 +659,6 @@ def build_kas_custom_agents(
             prompt,
             stub_server_names=stub_server_names,
             member_dispatch=member_dispatch,
+            session_key=session_key,
         )
     ]

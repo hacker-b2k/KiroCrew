@@ -49,8 +49,12 @@ from kiro_crew.acp.types import (
     EVENT_MCP_OAUTH_REQUEST,
     EVENT_MCP_SERVER_INIT_FAILURE,
     EVENT_MCP_SERVER_INITIALIZED,
+    METHOD_KAS_MCP_STATUS,
+    METHOD_KAS_TOOLS_CHANGED,
     JsonRpcMessage,
 )
+from kiro_crew.agent_sdk.mcp_refs import parse_tools_refs
+from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 # A server name is config-derived, so an installed app chooses it: it reaches a
@@ -133,6 +137,154 @@ def roster_names(servers: Any) -> tuple[str, ...]:
         if name and name not in out:
             out.append(name)
     return tuple(out[:_BUCKET_CAP])
+
+
+def active_custom_agent(params: dict[str, Any], agent: str) -> dict[str, Any] | None:
+    """The active descriptor as projected onto this session's outgoing wire."""
+    agents = params.get("_meta", {}).get("kiro", {}).get("customAgents", [])
+    for entry in agents:
+        if entry.get("id") == agent:
+            return entry
+    return None
+
+
+def required_managed_servers(params: dict[str, Any], agent: str) -> tuple[str, ...]:
+    """Managed declarations actually sent for the ACTIVE agent and session."""
+    names = set(roster_names(params.get("mcpServers")))
+    active = active_custom_agent(params, agent)
+    if active is not None:
+        names.update(active.get("mcpServers", {}))
+    return tuple(name for name in KIROCREW_BIN_MCP_SERVERS if name in names)
+
+
+@dataclass
+class KasMcpReadiness:
+    """One activation's required servers; global and other-session state cannot satisfy it.
+
+    Status and tool tags are full snapshots. Tags establish exposure, not the
+    callable spelling: ``@server/tool`` need not be the native function ID.
+    """
+
+    session_id: str
+    required: tuple[str, ...]
+    tool_policy: dict[str, Any] | None = None
+    states: dict[str, str] = field(default_factory=dict)
+    errors: dict[str, str] = field(default_factory=dict)
+    advertised: set[str] = field(default_factory=set)
+    intentionally_hidden: set[str] = field(default_factory=set)
+
+    def _needs_exposure(self, name: str, server: dict[str, Any]) -> bool:
+        """Do not demand tags for tools the active agent deliberately hides.
+
+        ``permissions`` controls approval, not exposure. Read only the projected
+        ``tools`` / ``excludedTools`` and the backend's per-tool disabled flags.
+        Missing or empty catalogs alone never establish an intentional restriction.
+        """
+        if self.tool_policy is None or "tools" not in self.tool_policy:
+            return True
+        raw = self.tool_policy["tools"]
+        tools = ["*"] if raw == "*" else raw if isinstance(raw, list) else []
+        excluded = self.tool_policy.get("excludedTools", [])
+        if not isinstance(excluded, list):
+            excluded = []
+        tools = [tool for tool in tools if tool not in excluded]
+        grant_all, refs = parse_tools_refs(tools)
+        if not (grant_all or name in refs) or "*" in excluded or f"@{name}" in excluded:
+            return False
+        catalog = server.get("tools")
+        if not isinstance(catalog, list) or not catalog:
+            return True
+        selected = []
+        for tool in catalog:
+            if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
+                return True
+            tag = f"@{name}/{tool['name']}"
+            if grant_all or f"@{name}" in tools or tag in tools:
+                selected.append((tag, tool))
+        if not selected:
+            return True
+        return any(
+            tool.get("disabled") is not True and tag not in excluded for tag, tool in selected
+        )
+
+    def record(self, msg: JsonRpcMessage) -> None:
+        params = msg.params if isinstance(msg.params, dict) else {}
+        if msg.id is not None or params.get("sessionId") != self.session_id:
+            return
+        if msg.is_method(METHOD_KAS_MCP_STATUS):
+            servers = params.get("servers")
+            if not isinstance(servers, list):
+                return
+            self.states.clear()
+            self.errors.clear()
+            self.intentionally_hidden.clear()
+            for server in servers:
+                if not isinstance(server, dict):
+                    continue
+                name = server.get("name")
+                if not isinstance(name, str) or name not in self.required:
+                    continue
+                meta = server.get("_meta")
+                kiro = meta.get("kiro") if isinstance(meta, dict) else None
+                resource = kiro.get("resource") if isinstance(kiro, dict) else None
+                source = resource.get("source") if isinstance(resource, dict) else None
+                if not isinstance(source, dict) or source.get("origin") != "client":
+                    # A same-named inherited global server is not the private
+                    # declaration Crew sent for this session.
+                    continue
+                state = server.get("status")
+                if state not in ("connecting", "connected", "failed", "disabled"):
+                    state = "unreported"
+                if server.get("failedAuthorization") is True:
+                    state = "authorization failed"
+                self.states[name] = state
+                if not self._needs_exposure(name, server):
+                    self.intentionally_hidden.add(name)
+                error = server.get("errorMessage")
+                if isinstance(error, str):
+                    self.errors[name] = sanitize_sink_text(error, _ERROR_CAP)
+            # A reconnect must obtain fresh catalog evidence.
+            self.advertised.intersection_update(
+                name for name in self.required if self.states.get(name) == "connected"
+            )
+        elif msg.is_method(METHOD_KAS_TOOLS_CHANGED):
+            tags = params.get("tags")
+            if not isinstance(tags, list):
+                return
+            self.advertised = {
+                name
+                for name in self.required
+                if any(
+                    isinstance(tag, dict)
+                    and tag.get("source") == "mcp"
+                    and isinstance(tag.get("tag"), str)
+                    and tag["tag"].startswith(f"@{name}/")
+                    for tag in tags
+                )
+            }
+
+    @property
+    def failure(self) -> str:
+        for name in self.required:
+            state = self.states.get(name)
+            if state in ("failed", "disabled", "authorization failed"):
+                detail = self.errors.get(name)
+                return f"{name}: {state}" + (f" ({detail})" if detail else "")
+        return ""
+
+    @property
+    def pending(self) -> str:
+        return ", ".join(
+            f"{name}: "
+            + (
+                "tools not advertised"
+                if self.states.get(name) == "connected"
+                else self.states.get(name, "unreported")
+            )
+            for name in self.required
+            if self.states.get(name) != "connected"
+            or (name not in self.advertised and name not in self.intentionally_hidden)
+        )
 
 
 @dataclass

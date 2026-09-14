@@ -1221,6 +1221,27 @@ describe('MembersPage side panel (Crew summary tab) and edit jump', () => {
     expect(screen.getAllByTestId('member-presence-dot')).toHaveLength(1)
   })
 
+  it('keeps a member present while its delegated workers run, then clears it', async () => {
+    const { store } = await renderPage([
+      row({ bound: true, slot_key: 'member-oncall', running: false }),
+    ])
+    await rosterRow('oncall')
+    act(() => {
+      store.dispatch(sseSlots([{
+        key: 'member-oncall', mode: 'member', running: false,
+        subagents_running: true, messages: 0,
+      }] as never))
+    })
+    expect(screen.getAllByTestId('member-presence-dot')).toHaveLength(1)
+    act(() => {
+      store.dispatch(sseSlots([{
+        key: 'member-oncall', mode: 'member', running: false,
+        subagents_running: false, messages: 0,
+      }] as never))
+    })
+    expect(screen.queryByTestId('member-presence-dot')).toBeNull()
+  })
+
   it('the search box filters the roster by name', async () => {
     await renderPage([
       row({ name: 'radar', slug: 'radar' }),

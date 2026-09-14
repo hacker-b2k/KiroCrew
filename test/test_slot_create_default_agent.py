@@ -19,6 +19,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard import chat_handlers
@@ -363,7 +364,7 @@ async def test_switch_resolves_off_loop_and_refuses_rebound_slot_before_reset(
     app = web.Application()
     app["state"] = dashboard_state
     app.router.add_post("/api/chat/slots/{slot}/agent", chat_handlers.api_chat_slot_agent)
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(TestServer(as_owner(app))) as client:
         response = await client.post(f"/api/chat/slots/{slot.key}/agent", json={"agent": "worker"})
         data = await response.json()
     assert len(calls) == 1
