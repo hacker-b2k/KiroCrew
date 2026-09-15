@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import stat as _stat
+import sys
 import tempfile
 import threading
 import time
@@ -2380,7 +2381,23 @@ def _tool_matches(pattern: str, tool_name: str) -> bool:
 
 
 def is_unc_shape(raw: str) -> bool:
-    """True for a UNC-shaped path: two leading separators, either style."""
+    """True for a UNC-shaped path: two leading separators, either style.
+
+    One exception, because Windows ``os.readlink`` returns an ordinary local target in
+    EXTENDED-LENGTH form -- ``\\\\?\\C:\\Users\\...`` -- which starts with two separators and
+    would otherwise be judged a network share, refusing every local symlink as if it reached a
+    host over SMB. A real UNC in that form is ``\\\\?\\UNC\\server\\share``; ``\\\\?\\C:`` is a
+    LOCAL drive path. So a ``\\\\?\\`` prefix whose remainder is drive-absolute (``C:\\...``) is
+    NOT a share. The distinction is exactly the one the readlink-chain walker already draws
+    (``\\\\?\\UNC\\`` -> share, ``\\\\?\\<drive>:`` -> local): ``\\\\?\\UNC\\...`` stays a share,
+    and other extended namespaces (``\\\\?\\GLOBALROOT\\...``, ``\\\\?\\Volume{guid}\\...``,
+    device paths) stay shaped-as-UNC so they are refused fail-closed rather than admitted as
+    local. The fold is case-insensitive because the OS honours the ``UNC`` component that way.
+    """
+    if len(raw) >= 4 and raw[:4] == "\\\\?\\":
+        # Extended-length prefix. A drive-absolute remainder is a plain local path, not a share;
+        # ``\\?\UNC\...`` and every other extended namespace remain UNC-shaped (refused).
+        return not _DRIVE_ABS_RE.match(raw[4:])
     return len(raw) >= 2 and raw[0] in "\\/" and raw[1] in "\\/"
 
 
@@ -2462,6 +2479,23 @@ _DRIVE_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
 
 
+def _fold_extended_length_local(raw: str) -> str:
+    r"""Fold a ``\\?\<drive>:\...`` extended-length LOCAL path to plain ``<drive>:\...``.
+
+    Only a DRIVE-absolute remainder is folded. ``\\?\UNC\...`` and every other
+    extended namespace (``\\?\GLOBALROOT\...``, ``\\?\Volume{guid}\...``, device
+    paths) are returned unchanged, so ``is_unc_shape`` still reports them
+    UNC-shaped and the UNC trusted-root gate refuses them fail-closed --
+    stripping the prefix there would launder a share (or a kernel object) into a
+    local-looking string. The lexical twin of the readlink-target ``\\?\`` fold
+    in :func:`validate_file_path`; a cheap string test with no filesystem or
+    network I/O.
+    """
+    if len(raw) >= 4 and raw[:4] == "\\\\?\\" and _DRIVE_ABS_RE.match(raw[4:]):
+        return raw[4:]
+    return raw
+
+
 def unc_probe_allowed(raw: str) -> bool:
     """Whether a UNC-shaped path may touch the filesystem on Windows.
 
@@ -2498,10 +2532,58 @@ def unc_probe_allowed(raw: str) -> bool:
     return False
 
 
+def _is_representable_path(raw: str) -> bool:
+    """Can the OS path layer represent this string at all?
+
+    ``realpath``/``lstat`` raise on a string the filesystem cannot carry:
+    ``ValueError`` for an embedded NUL, and ``UnicodeEncodeError`` (a
+    ``ValueError`` subclass) for a lone surrogate the platform's own error
+    handler cannot round-trip. Callers of :func:`validate_file_path` treat only
+    ``None`` as a refusal, so such a path resolved into the resolution below and
+    surfaced from the dashboard file handlers as an uncaught HTTP 500 rather than
+    the 400 it is.
+
+    Scoped to strings that are genuinely unrepresentable, and nothing else. This
+    is a SHARED chokepoint -- ``safe_read_file_bytes_nolink`` routes through it,
+    and its callers include diagnostics that deliberately enumerate a file whose
+    name holds a control character in order to report on it (an agent-writeable
+    directory can contain one, and the reporting layer escapes the name for
+    display). Refusing a broader class here would turn such a report into "could
+    not be compared" and so suppress the finding it exists to make. A path whose
+    control characters must be refused is refused by the boundary that receives
+    it, not here: see ``_validate_dashboard_path`` in the dashboard file
+    handlers. Only NUL is refused here, because no file can be named with one, so
+    no consumer loses a real name.
+
+    Nor is this "refuse anything a sanitizer would alter". A canonically
+    decomposed name is the form macOS stores and a name may legally end in a
+    space; both differ from their sanitized form and both resolve correctly.
+
+    The encoding attempt is the discriminator rather than a character list,
+    because it asks the question the syscall will ask: it accepts a surrogate the
+    platform's own error handler round-trips -- ``surrogateescape`` for a POSIX
+    name holding non-UTF-8 bytes, ``surrogatepass`` for an unpaired surrogate in
+    a legal NTFS name -- and rejects one it cannot. Both the encoding and the
+    error handler are read from ``sys``, which is what makes this the same
+    operation as ``os.fsencode`` on every platform rather than only on POSIX.
+    ``sys`` rather than ``os`` because this module's ``os`` is substituted
+    wholesale by tests exercising the Windows gates below, and a check a stub can
+    silently remove is not a check.
+    """
+    if "\x00" in raw:
+        return False
+    try:
+        raw.encode(sys.getfilesystemencoding(), sys.getfilesystemencodeerrors())
+    except (UnicodeError, ValueError):
+        return False
+    return True
+
+
 def validate_file_path(raw: str) -> str | None:
     """Validate and canonicalize a file path for dashboard file I/O.
 
-    Enforces: the Windows UNC trusted-root gate (BEFORE any resolution --
+    Enforces: representability in the OS path layer (BEFORE any syscall sees the
+    string), the Windows UNC trusted-root gate (BEFORE any resolution --
     ``realpath`` on a UNC path is itself the outbound SMB probe), the Windows
     linked-ancestor gate (a linked ancestor launders the same probe past the
     lexical UNC check), is_sensitive_path(), realpath canonicalization.
@@ -2509,6 +2591,27 @@ def validate_file_path(raw: str) -> str | None:
     """
     if not raw:
         return None
+    if not _is_representable_path(raw):
+        return None
+    if os.name == "nt":
+        # Fold a ``\\?\<drive>:\...`` extended-length LOCAL path down to its
+        # plain ``<drive>:\...`` spelling BEFORE any gate below.
+        # ``is_unc_shape`` correctly reports ``\\?\C:\...`` as non-UNC (it names
+        # a local drive, not a share), so the UNC gate lets it through -- but
+        # the sensitive-path fence at the tail compares the resolved path
+        # against ``$HOME``-anchored credential leaves, and the ``\\?\``-prefixed
+        # spelling matches none of them, so a dashboard read of
+        # ``\\?\C:\Users\<user>\.aws\credentials`` would slip the fence.
+        # Normalising here makes every downstream form the fence can see -- the
+        # raw string, its ``normpath``, and ``realpath`` -- the ordinary
+        # ``C:\Users\...`` path, so ``is_sensitive_path`` recognises the
+        # credential leaf regardless of whether ``realpath`` happens to strip
+        # the prefix (it does not for a non-existent target on every CPython).
+        # Only a DRIVE-absolute remainder is folded: ``\\?\UNC\...`` and every
+        # other extended namespace stay untouched and UNC-shaped so the gate
+        # below refuses them fail-closed. Mirrors the readlink-target ``\\?\``
+        # fold later in this function.
+        raw = _fold_extended_length_local(raw)
     if os.name == "nt" and is_unc_shape(raw) and not unc_probe_allowed(raw):
         return None
     expanded = os.path.expanduser(raw)

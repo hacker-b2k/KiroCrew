@@ -245,6 +245,35 @@ class TestEventLogging:
         assert data["event_type"] == "api_access"
         assert data["source"] == "dashboard"
 
+    def test_log_api_access_redacts_and_clips_outcome(self, log, sel_dir):
+        """``outcome`` is scrubbed like ``resources``/``error``, not forwarded raw.
+
+        It reads as a constrained vocabulary, and is one for in-tree callers, but
+        an installed app reaches this helper through ``ctx.audit`` -- so the value
+        can be caller text. This log is append-only and served over
+        ``/api/sel/events``, so a credential landing here cannot be taken back.
+        """
+        log.log_api_access(
+            caller="app:doc-store",
+            operation="doc-store.publish",
+            outcome="failed for AKIAIOSFODNN7EXAMPLE " + "x" * 900,
+        )
+        sel_file = sel_dir / "security_events.jsonl"
+        data = json.loads(sel_file.read_text(encoding="utf-8").strip())
+        assert "AKIAIOSFODNN7EXAMPLE" not in data["outcome"]
+        assert len(data["outcome"]) <= 500
+
+    @pytest.mark.parametrize(
+        "outcome", ["ok", "allowed", "denied", "completed", "rejected", "failed"]
+    )
+    def test_log_api_access_leaves_a_real_outcome_unaltered(self, log, sel_dir, outcome):
+        # The scrub above must be the identity function on every spelling in-tree
+        # code writes, or it would rewrite the meaning of existing audit rows.
+        log.log_api_access(caller="token:abc", operation="GET /api/x", outcome=outcome)
+        sel_file = sel_dir / "security_events.jsonl"
+        data = json.loads(sel_file.read_text(encoding="utf-8").strip())
+        assert data["outcome"] == outcome
+
     def test_resources_truncated(self, log, sel_dir):
         long_resource = "x" * 1000
         log.log_tool_invocation(
@@ -1272,7 +1301,8 @@ class TestHmacKeyManagementExtras:
         """A restrict_to_owner failure must not crash SecurityEventLog init.
 
         The chmod test above only exercises the POSIX arm of
-        ``restrict_to_owner``; on Windows it runs icacls instead, so this
+        ``restrict_to_owner``; on Windows it applies an owner-only DACL
+        in-process instead, so this
         variant injects the failure at ``restrict_to_owner`` itself — the seam
         ``atomic_write`` calls on every platform — pinning that
         ``restrict_on_error="warn"`` keeps key creation fail-soft.
@@ -4866,3 +4896,47 @@ class TestMetadataRedaction:
         assert self.AKIA_TOKEN not in raw
         assert self.AKIA_TOKEN[:10] not in raw
         assert len(json.loads(raw.strip())["resources"]) <= _MAX_ARG_LEN
+
+
+class TestControlCharacterSerialization:
+    """A control character in an audited value is escaped, never written raw.
+
+    Audited values include caller-supplied ones -- a requested file path, for
+    instance -- and the record is read back in a terminal (`kirocrew logs`). A
+    raw ESC or 8-bit CSI byte in the file would be EXECUTED as a terminal escape
+    rather than displayed: screen clears, forged output, hidden lines. The record
+    is JSON, so json.dumps escapes those bytes, and this pins that property
+    rather than leaving it an incidental consequence of the format.
+    """
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "/tmp/(a\x1b[2Jb)",  # ESC: clear-screen
+            "/tmp/a\x9bb",  # 8-bit CSI
+            "/tmp/a\x85b",  # NEL
+            "/tmp/a\rforged: line",  # CR: overwrite the rendered line
+            "/tmp/a\nforged: line",  # LF: forge a whole record
+        ],
+    )
+    def test_a_control_character_is_escaped_in_the_written_record(
+        self, log, sel_dir, payload
+    ):
+        log.log_tool_invocation(
+            session_key="dashboard",
+            tool_name="file_read",
+            outcome="denied",
+            resources=payload,
+        )
+        written = (sel_dir / "security_events.jsonl").read_bytes()
+        # Exactly one record: an embedded LF in the value did not forge a second.
+        lines = written.splitlines()
+        assert len(lines) == 1
+        # The RECORD carries no control character for a terminal to act on.
+        # splitlines has already removed the line terminator, which is the log's
+        # own framing and is \r\n on Windows -- not part of the audited value.
+        record = lines[0].decode("utf-8")
+        assert not any(ch <= "\x1f" or "\x7f" <= ch <= "\x9f" for ch in record)
+        # The value is present and round-trips intact, so escaping is not dropping
+        # information -- it is only making it inert.
+        assert json.loads(record)["resources"] == payload

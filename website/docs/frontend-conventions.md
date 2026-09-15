@@ -35,7 +35,8 @@ hand-rolling:
 `Slider`, `Checkbox`, `FilteredEmpty`.
 
 There is deliberately no `Select` primitive: use `SimpleSelect`,
-`SettingsSelect`, or `SearchableSelect`.
+`SettingsSelect`, `SearchableSelect`, or `SettingsMultiSelect` for a searchable
+checkbox list in Settings.
 
 `SimpleSelect` accepts optional decorative `optionIcons` alongside its text
 labels. Desktop rows and the selected value show those identities; touch devices
@@ -429,8 +430,12 @@ Pierre chunk loads, because Pierre constructs the raw diff synchronously before
 its worker pool or row virtualizer participates. Inputs outside the budget keep
 both complete files, header controls, native selection, wrapping, and theme
 styling in a bounded plain side-by-side or sequential surface. A translated
-status identifies the simplified view; it omits syntax colour, hunk interleaving,
-and line-level diff controls. The content limit is measured in JavaScript UTF-16
+status identifies the simplified view; it omits syntax colour and hunk
+interleaving by default, and a "Show line-by-line diff" control in a strip
+between the header and the scroller opts one pair into the real diff: the
+computation runs in a Web Worker (`src/pierre/diffOffThread.ts`), so the
+renderer never blocks, and the result renders through the hunk-based patch
+path with unchanged ranges folded. The content limit is measured in JavaScript UTF-16
 code units rather than encoded bytes so the guard stays allocation-free while an
 editor changes. Editable live diffs use the same
 predicate and degrade to the ordinary editable file surface rather than becoming
@@ -468,3 +473,46 @@ against `location.pathname` only, so a multi-segment, query, or hash route would
 register and then never resolve. The same constraint and the reasoning behind it
 are in [extension-seams](extension-seams.md), which covers registering routes and
 icons from a downstream edition instead of editing the seed maps.
+
+## Crew capability drafts
+
+The Crew editor has an independent Capabilities rail pane with MCP, Tools,
+Auto-approved and Skills categories. It stays mounted while hidden so both its
+local draft and its signed server preview survive rail changes. Its footer owns
+Discard draft and Review/save; the generic crew save cannot discard a capability
+draft. Closing or opening chat asks before losing that draft. A capability
+request in progress holds dismissal. Dirty and busy state reach the parent in
+layout effects, before paint, so an immediate Escape after pasting cannot close
+against an older clean state. Browser unload also warns about the draft.
+Opening the embedded editor writes an explicit `tab=crews` route, so a resize
+cannot replace its ancestry with the mobile root list. On narrow screens the
+member identity owns a full header row. The capability form scrolls independently
+above a non-overlapping footer. The horizontally scrollable category strip does
+not flex-shrink when an expanded transport form exceeds the pane height; all
+category labels retain their full height. Review shows values from the server's sanitized
+projected rows, never from secret-bearing local drafts. Source validation errors
+are distinct from provider loading failures.
+
+The editor reads and writes through `api/crewCapabilities.ts`, using the shared
+transport. Preview and save send the same explicit inheritance operations; save
+adds only the server-issued preview token. A stale version preserves the draft
+and requires reloading and reviewing against the new version. Save success never
+stands in for runtime application: runtime status comes from the server and
+active sessions are not promised a hot reload.
+
+The legacy template pane keeps its instant-save behavior for independent and
+shared definitions. Enrolled definitions direct model and skill edits to
+Capabilities instead. Reset and publish remain in the template pane but lock
+while a capability draft exists. A mask is never a literal replacement value.
+The form can keep unchanged secrets, select a configured connection, or replace the
+whole transport using a blank form. MCP set operations carry a complete transport
+plus RFC6901 `retain_paths` for unchanged `[REDACTED]` leaves. Each pointer keeps
+its original member/revision binding. Editing a hidden value removes that pointer;
+a typed mask without a retained pointer blocks preview. Hidden argument positions
+and hidden map keys cannot move until their values are replaced explicitly.
+Environment and HTTP header values remain password inputs. Managed transport
+fields use the row's authoritative `managed` flag, independently of the connection
+catalog; their supported enable switch sends only `disabled`. Absent prompt/model
+rows can be set, and model choices use the shared advertised-model query. Version
+hashes live in a collapsed details section rather than in the main status banner.
+Parent-change and impact previews use the server's redacted projection.

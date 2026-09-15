@@ -48,8 +48,7 @@ from kiro_crew.platform.context import current_context, safe_context_call
 from kiro_crew.security import (
     contains_injection,
     is_sensitive_path,
-    redact_credentials,
-    redact_exfiltration_urls,
+    redact_with_findings,
 )
 from kiro_crew.vector_memory import VectorMemoryStore
 
@@ -893,10 +892,8 @@ def _read_text(
 
 def _sanitize_text(text: str, scan: _Scan) -> str:
     bounded = text[:_MAX_TEXT_CHARS]
-    cleaned, warnings = redact_credentials(bounded)
-    scan.secret_count += len(warnings)
-    cleaned, url_warnings = redact_exfiltration_urls(cleaned)
-    scan.secret_count += len(url_warnings)
+    cleaned, credential_warnings, url_warnings = redact_with_findings(bounded)
+    scan.secret_count += len(credential_warnings) + len(url_warnings)
     return cleaned.strip()
 
 
@@ -1338,8 +1335,7 @@ def _skill_package(
         except UnicodeDecodeError:
             scan.diagnostic("skills", "binary_skill_asset_excluded", unsupported=True)
             return None
-        screened, credential_warnings = redact_credentials(text)
-        screened, url_warnings = redact_exfiltration_urls(screened)
+        screened, credential_warnings, url_warnings = redact_with_findings(text)
         scan.secret_count += len(credential_warnings) + len(url_warnings)
         if credential_warnings or url_warnings or screened != text:
             scan.diagnostic("skills", "credential_bearing_skill")
@@ -2077,11 +2073,16 @@ def _column0_activation_declared(text: str) -> bool:
             return True
         if key != "always":
             continue
-        # Strip whitespace AFTER removing the quotes as well as before. The loader
-        # unquotes with ``str.strip("\"'")`` and its consumers then compare
-        # ``.strip().lower() == "true"``, so ``always: " true "`` activates a skill --
-        # while stripping only on the outside leaves ``" true "`` -> `` true ``, which
-        # matches no truthy word here and let that spelling through the screen.
+        # Strip whitespace AFTER removing the quotes as well as before: the
+        # loader's consumers compare ``.strip().lower() == "true"``, so
+        # ``always: " true "`` activates a skill -- while stripping only on the
+        # outside leaves ``" true "`` -> `` true ``, which matches no truthy
+        # word here and let that spelling through the screen. This run-strip is
+        # deliberately WIDER than the loader's unquote (one matched wrapping
+        # level; see ``frontmatter.FrontmatterDialect.strip_quotes``): every
+        # spelling the loader reads as truthy is run-strip truthy too, so the
+        # divergence only ever detects MORE spellings as activating -- the
+        # fail-closed direction this gate must err on.
         value = raw.strip().strip("\"'").strip().casefold()
         if value in {"1", "true", "yes"} or parse_block_scalar_header(value) is not None:
             return True

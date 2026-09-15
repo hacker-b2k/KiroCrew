@@ -30,6 +30,45 @@ surfaces, out-of-range values are clamped with a warning rather than raising, an
 a malformed section degrades to defaults so a hand-edited file cannot prevent the
 gateway from starting.
 
+## Embedding rebuild request publication
+
+`memory.embed_rebuild_generation` is an explicit-apply request identity, not a
+model label or a completion counter. Model apply commits it with the validated
+model settings before invalidating vectors. Managed vector publications hold the
+same config sidecar lock while checking that request and committing their SQLite
+write. They cannot publish an old result after a newly committed request, even
+when the store has not yet been reconciled. Store-local signatures and handled
+requests remain checked inside SQLite write admission. Conditional model rollback
+preserves the request and unrelated edits, and refuses a competing model/request
+change. An untouched upgrade retains the empty request default.
+
+This field is install-local runtime obligation state even though it is published
+atomically in the model-settings transaction in `config.json`. It is not a
+portable preference or a completed-work flag. Back up and restore the model
+settings, this request, and memory databases together. Copying a non-empty request
+to a different installation intentionally invalidates stores that have not
+acknowledged that request, including aligned ones; do not distribute it in a
+fleet configuration template. Clearing/resetting it while keeping existing
+memory databases loses the outstanding same-label rebuild obligation. The
+ordinary model-space signature check remains, but cannot replace that lost
+request. Such a reset is not a supported way to cancel or complete rebuilding:
+after a reset or mismatched restore, explicitly apply the intended model again
+(`Rebuild memory vectors` for an unchanged path) before relying on vector search.
+That publishes a fresh obligation for open and later-opened stores. This design
+accepts config/state coupling to retain one atomic publication point; it does
+not claim to recover obligations that an operator deletes out of band.
+
+Managed vector publication resolves a symlinked config through `_lock_target`,
+exactly as the config writer does, before taking its sidecar lock. Within a
+store operation the order is config sidecar, the store's process-local lock,
+then SQLite write admission. A writer waiting for the config sidecar therefore
+holds no database lock that could stall a concurrent reader. Both locks remain
+held through vector validation, commit or rollback. Model apply releases its config mutation before
+aligning stores; it never holds that sidecar while waiting for a store lock.
+Native inference runs before those publication locks. Store close releases its
+SQLite and lifetime handles without saving a vector index or acquiring config
+admission again, including when rollback failure closes an uncertain connection.
+
 ## Data Home Location
 
 KiroCrew's data root nests **under kiro-cli's own `~/.kiro/` base** so all
@@ -475,6 +514,11 @@ parsed field still EQUALS `old_default`, so a value the loader clamped or coerce
 keeps the loader's correction. A key the `config.local.json` overlay supplies is
 cleared on disk but left alone in memory: the overlay is the operator's live choice.
 
+After the config write succeeds, the loader warns at the default log level for each
+adopted key, naming the removed value and the `kirocrew config set` command that
+restores it. A deferred or failed write emits no adoption notice. The warning
+describes the stored value without claiming to know whether the operator chose it.
+
 `stt.provider` is deliberately absent from `SUPERSEDED_DEFAULTS` even though its
 default moved to `local`: `_validated_stt_provider` coerces a retired value at
 parse time, so the stored value never wins and there is no *default* for an
@@ -808,6 +852,12 @@ prevent. `test_default_emitted_section_keys_are_all_recognized` guards
 Loads config from disk. Merges `config.local.json` overlay if present.
 Returns defaults if file is missing or invalid.
 
+The installed package declares `jsonschema` as a core runtime dependency so
+schema validation runs outside development environments too. The import guard
+still lets an incomplete or manually damaged install load, but that fallback
+must not be treated as the normal packaged behavior. Generated package metadata
+is tested to ensure the validator is required without the `dev` extra.
+
 **Hot-path cache.** `load()` is called per message / per request on several hot
 paths. The expensive work — reading `config.json` (+ `config.local.json`),
 `json.loads`, `_deep_merge`, and the full `jsonschema.validate` — is cached as
@@ -819,6 +869,16 @@ corrupt the shared cache. The cache is mtime-keyed (not a blind TTL), so a
 runtime edit is reflected on the next `load()`; `save()` also invalidates it
 eagerly via `_invalidate_config_cache()`. The defaults-only path (neither file
 present) is not cached.
+
+**Section construction.** Compound section constructors run in small private
+helpers in the loader namespace. This bounds each construction frame instead of
+putting every field expression in one large traced resolver frame. The helpers
+preserve field evaluation order, coercion, defaults, and section-local assignment
+expressions. Each call creates fresh dataclasses and mutable defaults; no resolved
+configuration or permission value is cached by a helper. File fingerprinting,
+validation, overlay handling, cache-generation fencing, migration, degradation,
+and publication remain in the existing load path. Store admission and workflow
+identity checks still run at every existing call site.
 
 ### `KiroCrewConfig._resolve_agent_model() -> str`
 Reads model from installed agent config (`~/.kiro/agents/kirocrew.json`),
@@ -1170,6 +1230,121 @@ once into `~/.kiro/crew` — see "Data Home Location & Migration" above.
 Returns `~/.kiro/crew/config.json` (or `$KIROCREW_HOME/config.json` if overridden).
 
 ### Agent Bookkeeping Sidecar (`agent_model_state.json`)
+
+A `publish` receipt on a destination entry records the owning member, original
+private template and internal source/target digests plus the pinned Parent
+identity. It is saved before binding publication and retained after completion
+so a same-name retry can distinguish its own publish from an occupied name.
+Finalization removes only `private_to` and `forked_from`; model bookkeeping and
+the receipt survive. Receipts contain no transport bodies and never appear in
+agent specs or API responses. See [crew-mode](crew-mode.md#owner-reviewed-capability-inheritance).
+
+Explicit capability enrollment adds a `capabilities` object to the private
+agent's existing sidecar entry, never to its harness JSON. It records schema
+version 1, one pinned Parent descriptor, accepted Parent rows, explicit local
+operations, the catalog URI snapshot and the saved materialization digest.
+`pending` means publication has not been verified; `saved` verifies disk state
+only. Neither means a provider loaded that version. Capability responses expose
+runtime `status`, `saved_revision`, `sessions` and an optional `error_code`;
+Parent errors live in `template.error_code`. There is no duplicate `warnings`
+array or constant `runtime.apply_mode`; adoption still requires a new runtime.
+Rows expose `managed` for transport ownership, not constant `editable` or
+`locked_reason` metadata; managed-server Enabled remains supported.
+Schema-v1 reads require
+all capability section maps and validate accepted row values and persisted
+`set`/`remove` overrides. Present null intent, missing sections and malformed
+rows fail closed; they are never dropped or interpreted as legacy mode. The
+owner API returns its bounded unavailable response without exposing source
+bytes. The pinned Parent requires string name, scope, source, path and project
+fields; an empty project remains valid. Optional catalog, revision, materialization
+and ordinary-field bookkeeping remain optional, but present values are checked
+before a consumer can use them. Publish receipts use the same Parent check;
+explicit null receipts are corrupt, not absent. Known MCP transport fields are
+checked before accepted or local rows
+can be materialized, including string-list contents, string-valued environment
+and header maps, boolean `disabled`, and positive finite `timeout`. The same
+field validator runs on source transports and editor sets. Source metadata and
+policy-only entries remain intact; native `oauth.oauthScopes` arrays are valid
+in persisted source rows. The editor's narrower request allowlist and managed
+or app transport ownership checks still apply separately. A corrupt persisted
+transport refuses cold allocation before reconciliation can publish a new
+spec or change a member binding. The owner API and resolver contract is
+documented in [crew-mode](crew-mode.md#owner-reviewed-capability-inheritance).
+
+Selected `accept_parent` rows must be genuine pending Parent changes in each
+member's pre-operation snapshot. An explicit `inherit` in the same request may
+advance that row to the current Parent (including removal) without invalidating
+its selected acceptance. `inherit` also works without selected acceptance;
+acceptance alone preserves local values and removal overrides. Missing or
+unchanged selections still refuse with `parent_change_missing`, including when
+paired with `inherit`. Batch acceptance validates every selected member before
+publication; local operations apply only to the primary member, and unselected
+rows and peers gain no new approvals. Stale revisions and all Parent identity,
+managed transport, wildcard and ambient MCP exclusion checks remain enforced.
+
+Capability GET, preview and PUT projections mask every non-empty environment
+and header value and native `oauth.clientSecret`, regardless of length or
+recognizable token prefix. Credential-bearing argument options are also masked,
+including split values (`--api-key VALUE`) and inline values (`--token=VALUE`).
+Complete `NAME=VALUE` argument elements also identify credentials when NAME is
+an environment-variable identifier with a credential suffix, including assignments
+passed after `-e` or `--env`. Values may be short and contain further `=` characters.
+A bare name without `=` never consumes the following argument. The whole original
+assignment is masked and retained byte for byte, without parsing a shell command.
+Native OAuth edits and selected connections retain nested `oauthScopes` lists;
+the shared transport validator still requires every scope to be a string.
+The basic-auth forms `-u user:password`, `-uuser:password`, `--user user:password`
+and `--user=user:password` are masked when the value contains a colon, including
+an empty username or password.
+No other short aliases or arbitrary positional credentials are inferred, and
+option detection stops at `--`. A bare `-u` or a colon-free value stays visible;
+another program's colon-bearing `-u` value may be conservatively masked.
+Known credential copies in the same transport's strings, argument arrays and
+nested metadata are masked too, without changing map/list shapes or rewriting
+unrelated rows. Empty credential values remain empty. The original secret stays
+on disk; a whole-transport edit retains it only through the existing signed
+preview and revision-bound `retain_paths` pointer (for example `/oauth/clientSecret`
+or `/args/1`) paired with `[REDACTED]`. An inline option is retained as its entire
+original argument, byte for byte. A stale revision or a path to a
+non-masked/non-scalar leaf still refuses without writing. Legacy reset and
+publish routes also bound
+strict capability and publish-receipt reads: unreadable or malformed state
+returns `503 capabilities_unavailable` before any mutation. Absent intent and
+absent receipts still fall through to legacy handling; owner checks remain
+before these reads. Legacy PATCH and binding changes use the same bounded
+`503 capabilities_unavailable` response for strict-read failures; an enrolled
+legacy write remains a 409 conflict. PATCH checks both the actual file stem and
+the declared name, regardless of which spelling resolved the request. It repeats
+both checks using the fresh read under the existing spec lock before model
+bookkeeping or spec writes, retaining the spec-then-sidecar lock order. A late
+binding-check failure preserves the old binding. Legacy publish
+may already have staged a private destination at that point and runs its existing
+reference-aware rollback; this is rollback, not a claim that no writes occurred.
+
+Each pending generation records only its own `materialized` digest. Failed spec
+publication leaves the old generation's bytes intact; a failed final receipt can
+be completed without minting another generation. Startup still refuses pending
+state until reconciliation succeeds.
+
+With ambient MCP loading enabled (`includeMcpJson` true or absent), resolved
+removals of servers, tools or approval entries refuse with
+`global_mcp_exclusion_unrepresentable` before publication. The check compares
+the saved and final projected rows, so Parent reconciliation, selected acceptance,
+per-item inheritance and whole reset cannot bypass the explicit-remove guard.
+A final projection with `includeMcpJson: false` can represent these removals.
+
+Sidecar reads are capped at 8 MiB and require a single-link regular file.
+Mutators refuse unreadable state instead of replacing it with an empty map.
+The stable sidecar lock refuses non-regular/multiply-linked handles and uses
+no-follow opening where supported. Writes use owner-restricted atomic replace.
+Capability publication takes the config lock, spec lock and sidecar lock in
+that order. Config loading and catalog preparation happen before that hold;
+locked publication rechecks the relevant bindings, sources and intent.
+Base and config.local locks are acquired in that order before the spec and
+sidecar locks. A local member keeps its binding delta in config.local; a
+multi-member batch spanning layers commits one overlay delta atomically.
+Public capability versions are random identifiers tied to the saved internal
+materialization digest, never the digest of secret-bearing source bytes.
 
 KiroCrew tracks two pieces of per-agent state that are **not** part of the
 kiro-cli agent schema: `model_managed` (whether an agent's `model` tracks the
@@ -1538,7 +1713,6 @@ class AgentConfig:
     provider: str = "acp"          # fixed to "acp" (kiro-cli) — the only provider
     sandbox: str = "auto"          # default "auto" (namespace on Linux, seatbelt on macOS; delegates to kiro-cli's internal sandbox on macOS when enabled); "off" skips Kiro Crew's sandbox
     sandbox_allow_no_isolation: bool = False  # SEC-009: acknowledge running un-isolated when no sandbox backend exists; false = loud SECURITY warning, true = info-level
-    enforce_denied_commands: str = "all"  # "all" or "kirocrew"
     soft_stop_budget_secs: float = 10.0  # seconds to wait for cooperative cancel before hard kill [0.5, 60.0]
     yolo: bool = False             # permanent YOLO mode (skip tool approval); tracked via _yolo_from_config flag
     max_subagents: int = 3         # concurrent subagent cap; 0 = auto-size from host memory/CPU. Load-time: 0 (auto) or [3, 64] — a fixed pin of 1/2 is raised to 3
@@ -1555,7 +1729,7 @@ class SessionConfig:
     empty_response_max_continues: int = 1  # how many continue nudges may run back to back before the give-up card (EMPTY_RESPONSE_MAX_CONTINUES_MIN/MAX; load-time clamped to [1, 10] so a hand-edited 0 cannot disable recovery and a large value cannot arm an unbounded ladder). Default 1 keeps the pre-knob behavior byte-identical; above 1 the notice numbers each recovery ("recovery 2 of 3").
     autocompact_pct: float = 70.0  # context usage % at which auto-compaction triggers (DEFAULT_AUTOCOMPACT_PCT). Load-time clamped to [5.0, 90.0] (one constant pair shared with the dashboard write gate)
     pool_size: int = 0             # pre-warmed kiro-cli processes kept ready for instant session start; 0 (the default) disables. Single source of truth: DEFAULT_POOL_SIZE, read by both the field default and load()'s file-parse fallback. Load-time clamped to [0, 10]
-    watchdog_rss_max_mb: int = 0   # recycle a session when its process tree RSS exceeds this many MiB; 0 disables (default). Busy sessions (turn in flight) are never recycled.
+    watchdog_rss_max_mb: int = 1536   # DEFAULT_WATCHDOG_RSS_MAX_MB: recycle a session when its process tree RSS exceeds this many MiB; 0 disables. Non-zero by default so a runaway session tree is bounded out of the box. Busy sessions (turn in flight) are never recycled, and neither is a parent whose sub-agents are still running, queued, or delivering their results on its runtime.
 
 @dataclass
 class TaskRunnerConfig:
@@ -1563,6 +1737,9 @@ class TaskRunnerConfig:
 
 @dataclass
 class MemoryConfig:
+    embed_rebuild_generation: str = ""  # managed explicit-apply request; each store acknowledges after invalidation
+    embed_model_stamp: list[int] = field(default_factory=list)  # managed device/inode/size/mtime_ns/ctime_ns; empty means unverified
+    embed_model_legacy_ids: list[str] = field(default_factory=list)  # managed compatibility labels retained across restarts; explicit model apply clears them and rebuilds inherited vectors
     history_idle_hours: float = 3.0  # consolidate history after N hours idle
     history_max_days: int = 365      # prune daily history files older than this
 
@@ -1697,11 +1874,16 @@ and it is deliberately NOT re-exported from `loader.py` — the loader's
   storing a featureless third state, and a ghost override left with nothing but
   `kind` collapses to `{}` (the one canonical "reset" spelling). `traits` is
   therefore optional: `{"kind": "ghost", "sounds": {...}}` is valid and means
-  "name-derived face, plus these per-state overrides".
+  "name-derived face, plus these per-state reactions". The ghost is the ONE tier
+  that carries `motions` and `sounds` (below).
 - `{"kind": "image", "v": <int>, "file": "<16-hex>.<png|jpg|webp>"}` — the crew
   wears an uploaded picture served from `GET /api/agents/{name}/avatar`; the
   file itself lives under `<data home>/run/avatars/` and the record only marks
-  the choice. `v` (a positive real int; `True` is rejected) is the cache-busting
+  the choice. A picture has no face to move, so it carries no `motions`; it does
+  still carry `sounds`, because the shipped renderer plays a crew-record cue
+  whatever face it draws (`CrewStateAvatar.tsx` reads `soundsFrom(avatar)`
+  kind-agnostically). Retiring the key here ahead of that renderer would silence a
+  crew on an unrelated save with no way to restore the sound. `v` (a positive real int; `True` is rejected) is the cache-busting
   mtime stamp the frontend appends as `?v=`; `file` pins the exact committed,
   content-addressed variant and must match `^[0-9a-f]{16}\.(png|jpg|webp)$`.
   Wire-only keys (`promote`, `token`) never reach the record.
@@ -1716,49 +1898,87 @@ and it is deliberately NOT re-exported from `loader.py` — the loader's
   still EXISTS is deliberately not checked — config load must not touch the disk,
   and a pack deleted out of band would otherwise make the whole config unloadable
   instead of making one face fall back — so a dangling id renders as the
-  name-derived ghost on the client. **A pack survives a faceless save.** The
+  name-derived ghost on the client. A pack carries its own per-state art
+  (`GET /api/appearances/{id}/slot/{slot}`) and its own per-state audio
+  (`GET /api/appearances/{id}/sound/{state}`), so it needs no `motions` on the
+  record. It keeps accepting `sounds` for the same reason the picture tier does --
+  that key is audible today on every tier -- and retires it in the change that
+  makes the pack's own audio what plays. **A pack survives a faceless save.** The
   shipped crew editor rebuilds the override from a closed ghost/picture shape,
   so for a pack-wearing crew it renders the name-derived face and any unrelated
   save (a model change, a colour) submits `{}` — or `{"kind": "ghost", ...}`
-  carrying only `expressions`/`sounds` — which read as reset would silently
-  clear a pack set through the API. `PUT /api/agents/{name}` therefore keeps
-  the current pack id when the record is a pack and the save names no face
-  (`handlers/agents._carry_pack_through_faceless_save`), and the save's
-  reactions ride onto the kept pack. It is narrow: ghost and picture keep
+  carrying only the ghost tier's own reactions — which read as reset would
+  silently clear a pack set through the API. `PUT /api/agents/{name}` therefore
+  keeps the current pack id when the record is a pack and the save names no face
+  (`handlers/agents._carry_pack_through_faceless_save`), and rides the save's
+  `expressions` and `sounds` onto the kept pack: both are legal on every tier, a
+  faceless save is the one way the shipped editor can change them on a pack crew,
+  and a pack's own cue answers a different route (`/sound/{state}`) than a
+  crew-record cue does, so the two do not collide. Only `motions` is left
+  behind, because it is the ghost's alone. It is narrow: ghost and picture keep
   their reset semantics; `avatar: null` (which the editor never sends) is
   still an explicit reset that takes the pack off; a real face — a ghost with
   traits, a picture, another pack — replaces it. The carve-out exists until the
   picker can display a pack, at which point the editor round-trips it itself.
+  **A ghost's `motions` survive a save that does not name them** for the same
+  reason (`handlers/agents._carry_motions_through_motionless_save`): the shipped
+  editor rebuilds a ghost draft from the axes it can draw and submits exactly
+  those, so a `motions` pick set through the API would be erased by the next
+  unrelated save with no click that meant it. The rule is the tri-state
+  `save_pack` gives a pack's cues — a payload with NO `motions` key leaves the
+  stored ones alone, a payload naming the key (`{}` included) replaces them —
+  and it applies only when the stored record and the validated save are both
+  ghosts: a tier change is a real face replacing the old one and `motions` is the
+  ghost's alone, and a reset (`null`, `{}`, the all-empty collapse) means reset.
+  It retires with the frontend change that submits `motions` itself.
 
-**Per-state overrides (`expressions`, `sounds`).** All three kinds may carry two
-optional keys, keyed on the agent lifecycle state (`working`, `done`, `error`
-exactly; any other key is dropped, so a version-skewed caller cannot grow the
-key set):
+**Per-state reactions (`motions`, `sounds`).** Where a reaction may be stored
+follows from which tier can play it, and the two keys differ. `motions` is the
+GHOST's alone: it names a built-in animation of a trait-composed face, so a
+picture has nothing to move and a pack animates from its own files. `sounds` is
+legal on EVERY tier, because the shipped renderer reads a crew-record cue
+kind-agnostically — so this is the one reaction key that is not the ghost's. Both
+are keyed on the agent lifecycle state (`working`, `done`, `error` exactly; any other
+key is dropped, so a version-skewed caller cannot grow the key set):
 
-- `expressions: {"<state>": {"eyes"?: str, "mouth"?: str}}` — only those two
-  axes, under the same 32-char truncation as a trait, with an empty string
-  dropped (it already means "absent"). The identity axes
-  (`brows`/`accessory`/`prop`/`tile`/`blush`/`flip`) are deliberately not
-  accepted per state: a crew must stay recognisable as itself while its
-  expression changes. Legal on `kind: "image"` too — stored, and ignored by the
-  picture renderer.
-- `sounds: {"<state>": "none"|"chime"|"ding"|"blip"|"pop"|"pulse"}` — a shipped
-  cue preset. Unlike a trait value this IS pinned to a vocabulary, because the
-  name selects a shipped asset rather than an option the renderer can resolve to
-  absent. `"none"` is kept as explicit silence, distinct from an absent state
-  (also silent), so one state can opt out of a cue the others use. No per-crew
-  audio upload exists.
+- `motions: {"done"?: "none"|"bounce"|"nod"|"sparkle", "error"?: "none"|"shake"|"cross-eyes"|"droop"}`
+  — a built-in reaction animation the frontend implements. Each state has its OWN
+  vocabulary (`_AVATAR_MOTIONS`) and a value from the other state's list is
+  dropped: `{"done": "shake"}` would play a failure animation on success, which is
+  not what its author wrote. There is no `working` entry — the ghost's working
+  animation is its idle breathing, and a reaction fires on a transition. `"none"`
+  is kept as explicit stillness, distinct from an absent state, so one state can
+  opt out of a motion the others use.
+- `sounds: {"<state>": "none"|"chime"|"ding"|"blip"|"pop"|"pulse"}` — a
+  synthesized cue preset. Unlike a trait value this IS pinned to a vocabulary,
+  because the name selects a shipped preset rather than an option the renderer can
+  resolve to absent. `"none"` is explicit silence, distinct from an absent state
+  (also silent). No per-crew audio upload exists: a crew that needs its own audio
+  wears a pack, which carries its own.
 
 Either key is omitted from the record when validation leaves it empty, so a
-stored avatar never carries `{}` for one. Junk (`expressions: "x"`,
-`sounds: {"working": 5}`, a list) is stripped silently and never refused: the
-same forgiveness traits get, so a malformed per-state value costs that value and
-never the crew's whole avatar. The roster masks the `eyes`/`mouth` values like
-any other user-authored string (`_roster_avatar`) and leaves the preset-pinned
-`sounds` intact, for the same reason it leaves `file` intact.
+stored avatar never carries `{}` for one, and a key illegal on this tier is
+DROPPED rather than refused — `{"kind": "image", "motions": {...}}` loads as a
+bare picture. No stored cue is lost by that rule: `sounds` stays legal wherever it
+already worked, so an existing picture- or pack-wearing crew keeps the sound its
+owner chose. Junk (`motions: "x"`, `sounds: {"working": 5}`, a list) is stripped
+silently and never refused: the same forgiveness traits get, so a malformed
+reaction costs that reaction and never the crew's whole avatar. `expressions`
+(a per-state `eyes`/`mouth` pick, which `motions` supersedes) round-trips on
+EVERY tier — `{"<state>": {"eyes"?: str, "mouth"?: str}}`, only those two
+axes, 32-char truncation, empty strings dropped — because the shipped renderer
+still draws it on a ghost and the shipped builder still SUBMITS it on a picture
+or a pack, so stripping it there would erase a pick a ghost → picture → ghost
+round-trip then cannot restore; a value a user can see is not dropped ahead of
+the renderer that shows it, and the frontend change that removes the picker is
+where it retires. `sounds` stays for the same reason on every tier, and only
+`motions` is tier-gated. The roster leaves all three keys intact rather than masking them
+(`_roster_avatar`), for the same reason it leaves `file` intact — a value pinned
+to a closed vocabulary is not user-authored text, and masking it would break the
+reaction while destroying nothing an attacker could have put there.
 
 Anything else — a non-dict, an unknown `kind`, a ghost override carrying no
-trait, expression or sound that survives validation — collapses to `{}` on load (config.json is hand-editable and
+trait, motion or sound that survives validation — collapses to `{}` on load (config.json is hand-editable and
 agent-writable, so junk must never crash the load), while the endpoints answer a
 non-empty raw value the coercer collapses with 400 `invalid_avatar` — except a
 well-formed ghost override whose traits all coerce to absent, which is the
@@ -1942,6 +2162,21 @@ appears.
 them at boot via `GET /api/theme/boot`; empty `theme_mode`/`theme_color` mean
 unset (the frontend falls back to `localStorage` or the built-in default).
 
+### Interactive model picker visibility
+
+`DashboardConfig.model_picker_hidden_models` is a workspace-persistent list of
+model IDs hidden from interactive chat model pickers. The default is `[]`, which
+shows the full advertised list. The loader accepts only string arrays, trims and
+deduplicates entries, and ignores empty strings and `auto`. The dashboard PUT
+endpoint applies the shared model-ID grammar and a bounded list length. Changes
+apply to ChatPage and ChatPane without a restart; they do not alter `/api/models`,
+entitlement, defaults, role or fallback models, bulk switching, crew editors, or
+app-specific selectors. `model_picker_configured` records the first successful
+visibility save and is read-only through the dashboard API; the same atomic write
+that replaces the hidden list sets it. Existing configurations with a non-empty,
+valid hidden list migrate to configured, while an empty or invalid legacy value
+does not dismiss the first-use shortcut.
+
 ### Dashboard UI language
 
 `DashboardConfig.language` selects the dashboard interface language. It rides the
@@ -2098,7 +2333,18 @@ Two consequences fall out of naming in a non-latin script:
   free, and the full-width terminators `。！？` are matched without the ASCII
   rule's trailing-whitespace requirement (those scripts do not space after
   punctuation). A short refusal with no terminator remains a documented false
-  negative.
+  negative for those unspaced scripts. Korean is spaced, so the word ceiling
+  bounds its long sentences, but a SHORT Korean refusal clears every other
+  check -- and Korean puts the refusal verb last, so English-style prefix
+  openers cannot catch it. `_looks_like_prose` therefore also matches Korean
+  sentence shape: the sentence-final polite conjugations
+  (`_TITLE_KO_SENTENCE_ENDINGS`, the formal "-nida" family and the
+  informal-polite "-yo" family) plus the apology opener
+  (`_TITLE_KO_PROSE_OPENERS`), which a title as a noun phrase never carries. A
+  plain-form (banmal) Korean refusal remains a documented false negative, and
+  a sentence-form Korean title loses to the fallback name -- the deliberate
+  direction of the trade, since a fallback name is still the user's own words
+  while a stored refusal is the bug.
 - **The reveal animation needs characters.** The sidebar types a new title in one
   word at a time; a single-token title skipped the animation entirely, so
   `_title_reveal_prefixes` steps unspaced scripts two characters at a time
@@ -2106,6 +2352,14 @@ Two consequences fall out of naming in a non-latin script:
 
 `_clean_title` strips the full-width and CJK quote/period forms (`「」`, `“”`,
 `。`) alongside the ASCII ones, since that is what a zh/ja reply wraps a name in.
+It also keeps the reply's first line only -- the rule
+`messaging/auto_title.clean_title` states as "Keeps the first line only" -- so a
+`SKIP` verdict followed by a reason collapses back to the bare control word.
+`_validate_title_reply` treats BOTH taught control words (`SKIP`, `KEEP`) as
+no-title sentinels on every path, matched case-insensitively, alone or with a
+punctuation-separated reason on one line (`_is_verdict_reply`) -- while a real
+title that merely opens with the word ("SKIP and KEEP handling", "KEEP-ALIVE
+header bug") survives.
 
 ### Foreign-agent import onboarding state
 

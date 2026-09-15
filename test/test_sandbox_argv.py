@@ -1076,10 +1076,10 @@ class TestSealedRuntimeParentPredicate:
     both backends, and the write carve-out above is validated for self-derived
     scratch only — so the caller's only safe move is to stop honoring the path,
     which it can only do if ``classify_declared_temp_path`` answers honestly.
-    Every test asserts the CLASSIFICATION (``None`` = honor; ``sealed``,
-    ``remote-or-device`` or ``unclassifiable`` = refuse, and why), because the
-    probe names that cause in its WARNING and a wrong cause misdirects the
-    operator even when the refusal itself is right.
+    Every test asserts the CLASSIFICATION (``None`` = honor; ``sealed`` or
+    ``unclassifiable`` = refuse, and why), because the probe names that cause
+    in its WARNING and a wrong cause misdirects the operator even when the
+    refusal itself is right.
     """
 
     def _home(self, monkeypatch, tmp_path):
@@ -1104,6 +1104,10 @@ class TestSealedRuntimeParentPredicate:
         assert sandbox_mod.classify_declared_temp_path(str(chosen)) is None
         # An empty declaration is not a path and must not read as refused.
         assert sandbox_mod.classify_declared_temp_path("") is None
+
+    def test_relative_declaration_is_unclassifiable(self, monkeypatch, tmp_path):
+        self._home(monkeypatch, tmp_path)
+        assert sandbox_mod.classify_declared_temp_path("run/x") == "unclassifiable"
 
     @_POSIX_ONLY
     def test_both_spellings_of_a_symlinked_data_home_are_sealed(self, monkeypatch, tmp_path):
@@ -2292,6 +2296,37 @@ class TestCleanupStaleSandboxProfiles:
                 == 0
             )
 
+    def test_reclaims_pi_gate_artifacts_of_a_dead_gateway_only(self, tmp_path):
+        """The pi gate launcher and sealed copy go with their gateway, never by age.
+
+        Both are written once per gateway process and reused by its later spawns
+        (``acp/client.py``), so an old-but-owned file is live and the age rule
+        that fits the once-consumed sandbox launchers would delete it between a
+        spawn's cache hit and its exec. The PID in the name is the owner's own.
+        """
+        from kiro_crew.sandbox import cleanup_stale_sandbox_profiles
+
+        run_dir = tmp_path / ".kirocrew" / "run"
+        run_dir.mkdir(parents=True)
+        dead = [run_dir / "kirocrew_pi_gate_99999_abc.sh", run_dir / "kirocrew_pi_gate_99999.ts"]
+        for f in dead:
+            f.write_text("x")
+        mine_sh = run_dir / f"kirocrew_pi_gate_{os.getpid()}_def.sh"
+        mine_ts = run_dir / f"kirocrew_pi_gate_{os.getpid()}.ts"
+        for f in (mine_sh, mine_ts):
+            f.write_text("x")
+            old_time = time.time() - 10 * 3600
+            os.utime(f, (old_time, old_time))
+
+        with patch("kiro_crew.sandbox.config_dir", return_value=tmp_path / ".kirocrew"):
+            removed = cleanup_stale_sandbox_profiles(
+                legacy_dir=str(tmp_path / "nonexistent"), data_home=sandbox_mod.config_dir()
+            )
+
+        assert removed == 2
+        assert not any(f.exists() for f in dead)
+        assert mine_sh.exists() and mine_ts.exists(), "an owned file is live however old"
+
     def test_preserves_live_pid_profile(self, tmp_path):
         """Profile file whose PID is alive (current process) is preserved."""
         from kiro_crew.sandbox import cleanup_stale_sandbox_profiles
@@ -2723,6 +2758,18 @@ class TestCgroupScopeArgv:
             available, _ = sb._probe_cgroup_scope()
             if not available:
                 pytest.skip("no cgroup v2 delegation on this host")
+            # Delegated controllers do not prove the user bus is reachable.
+            # Only an unavailable bus is a skip; a broken scope stays a failure.
+            preflight = subprocess.run(
+                sb.cgroup_scope_argv([sys.executable, "-c", ""]),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=30,
+            )
+            if preflight.returncode != 0 and "Failed to connect to bus" in preflight.stderr:
+                pytest.skip(f"user session bus unavailable: {preflight.stderr.strip()}")
+            assert preflight.returncode == 0, preflight.stderr
             with patch(
                 "kiro_crew.sandbox._cgroup_limits_from_config", return_value=(20, 8192, 50, 0)
             ):

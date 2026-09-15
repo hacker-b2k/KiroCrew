@@ -25,7 +25,7 @@ from aiohttp import web
 
 import kiro_crew.dashboard.handlers as _h
 from kiro_crew import members as members_mod
-from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.config.loader import KiroCrewConfig, default_project_dir
 from kiro_crew.dashboard.chat_persistence import (
     pin_private_agent_store,
     rehydrate_slot_from_history_async,
@@ -232,7 +232,7 @@ async def api_members(request: web.Request) -> web.Response:
     # transcript's mtime is the one durable signal that survives restarts and
     # covers live and dormant threads alike. File stats are IO — one thread
     # hop for the whole roster, mirroring the binding reads above.
-    def _read_transcript_tails() -> dict[str, tuple[float, str]]:
+    def _read_transcript_tails() -> dict[str, tuple[float, str, bool]]:
         if state is None or state.conversation_log is None:
             return {}
 
@@ -244,7 +244,7 @@ async def api_members(request: web.Request) -> web.Response:
             text, _ = _h.redact_credentials(text)
             return text
 
-        out: dict[str, tuple[float, str]] = {}
+        out: dict[str, tuple[float, str, bool]] = {}
         for row in rows:
             if not row["slot_key"]:
                 continue
@@ -258,19 +258,30 @@ async def api_members(request: web.Request) -> web.Response:
             mt = state.conversation_log.session_mtime(log_key)
             if not mt:
                 continue
-            preview, msg_ts = state.conversation_log.last_message_info(log_key, sanitize=_sanitize)
+            preview, msg_ts, stopped = state.conversation_log.last_message_info(
+                log_key, sanitize=_sanitize
+            )
             # Order by the newest MESSAGE, not the file: metadata writes and
             # rehydration bump the mtime without any new message, which made
             # rows reorder with no visible cause. mtime remains only as the
             # fallback for pre-timestamp transcript rows.
-            out[row["slot_key"]] = (msg_ts or mt, preview)
+            out[row["slot_key"]] = (msg_ts or mt, preview, stopped)
         return out
 
     tails = await asyncio.to_thread(_read_transcript_tails)
     for row in rows:
-        mt, preview = tails.get(row["slot_key"], (0.0, ""))
+        mt, preview, stopped = tails.get(row["slot_key"], (0.0, "", False))
         row["last_active_ts"] = mt
         row["last_message"] = preview
+        # A locale-independent boolean, NEVER the word "Stopped": the preview
+        # is computed here where the client's locale is unknown, which is why
+        # the trailing stop is SKIPPED from `last_message` rather than rendered
+        # as a sentence. This flag lets the locale-aware client render its own
+        # "Stopped" chip beside the preview, so a thread the user has stopped
+        # does not read as ongoing work. Omitted when false so the common row
+        # stays byte-for-byte what it is without it.
+        if stopped:
+            row["last_message_stopped"] = True
 
     return web.json_response({"members": rows})
 
@@ -330,15 +341,19 @@ async def api_member_thread(request: web.Request) -> web.Response:
     # The bound member wins as long as it still exists AND still derives this
     # slug — dm.json's `member` field is operator-editable state, so it is
     # honored only when the registry independently corroborates it (the name
-    # exists and folds to the slug being opened). Otherwise fall back to the
-    # first crew (config order) whose name derives this slug. This keeps a
-    # colliding slug's thread stably attributed to whoever bound it first.
+    # exists and folds to the slug being opened). This keeps a colliding
+    # slug's thread stably attributed to whoever bound it first. With no
+    # binding at all, the first crew in config order whose name derives this
+    # slug takes the thread. An uncorroborated binding resolves to that same
+    # crew here — but only far enough to look up its slot; the branches below
+    # refuse the open rather than rebinding the slug to it.
     slug_owners = _member_names_for_slug(cfg, slug)
-    member_name = (
-        binding["member"]
-        if binding is not None and binding.get("member") in slug_owners
-        else (slug_owners[0] if slug_owners else "")
-    )
+    if binding is not None and binding.get("member") in slug_owners:
+        member_name = binding["member"]
+    elif slug_owners:
+        member_name = slug_owners[0]
+    else:
+        member_name = ""
     slot_key, generation = "", ""
     if member_name:
         try:
@@ -350,19 +365,19 @@ async def api_member_thread(request: web.Request) -> web.Response:
 
             return _store_unavailable_response(cfg.agents[member_name].memory_store, exc)
     if binding is not None:
-        if binding.get("member") in slug_owners:
-            member_name = binding["member"]
-        else:
-            # The binding names a crew that no longer derives this slug
-            # (renamed, or deleted with a same-slug successor). Falling
-            # through to the successor here would hand it the SAME derived
-            # key — and with it the previous crew's entire transcript,
-            # rendered under the successor's name with the pin chip vouching
-            # for it. The live-slot mismatch check below cannot catch this
-            # (after a restart no live slot exists), so the refusal must
-            # key off the BINDING itself. Fail closed, leave dm.json
-            # untouched (re-entrant), and let the user resolve it in the
-            # crew manager.
+        if binding.get("member") not in slug_owners:
+            # The binding names a crew absent from the registry (renamed, or
+            # deleted). It still derives this slug — `read_dm_binding`
+            # refuses any binding that does not — so falling through to a
+            # same-slug successor here would hand it the SAME derived key,
+            # and with it the previous crew's entire transcript, rendered
+            # under the successor's name with the pin chip vouching for it.
+            # The live-slot mismatch check below cannot catch this (after a
+            # restart no live slot exists), so the refusal must key off the
+            # BINDING itself. Fail closed, leave dm.json untouched
+            # (re-entrant), and let the user resolve it in the crew manager.
+            # A binding whose slug has no owner left lands here too, and is
+            # refused the same way rather than reaching the 404 below.
             try:
                 _sel().log_api_access(
                     caller=request.remote or "",
@@ -382,7 +397,6 @@ async def api_member_thread(request: web.Request) -> web.Response:
                 status=409,
             )
     else:
-        member_name = slug_owners[0] if slug_owners else ""
         # No binding, but the canonical history key already holds a
         # transcript: rebinding here would hand whoever currently derives the
         # slug the PREVIOUS occupant's entire conversation (ChatPane hydrates
@@ -435,13 +449,23 @@ async def api_member_thread(request: web.Request) -> web.Response:
         # member thread, so a ✕-closed transcript reopens with its history.
         slot = await rehydrate_slot_from_history_async(state, slot_key, adopt_closed=True)
     if slot is None:
-        # No usable history — a genuinely fresh thread.
-        slot = state.get_or_create_slot(
-            name=slot_key,
-            agent=member_name,
-            mode=members_mod.DM_SLOT_MODE,
-            origin=request_slot_origin(request.get("app", "")),
-        )
+        member_workspace = cfg.agents[member_name].workspace
+        if member_workspace not in cfg.workspaces:
+            member_workspace = cfg.default_workspace
+        project = await asyncio.to_thread(default_project_dir, member_workspace)
+        # Resolve before publication, then re-check: another opener can create
+        # the slot while path validation waits. Its project remains its choice.
+        slot = state._slots.get(slot_key)
+        if slot is None:
+            with state.suspend_slots_push():
+                slot = state.get_or_create_slot(
+                    name=slot_key,
+                    agent=member_name,
+                    workspace=member_workspace,
+                    mode=members_mod.DM_SLOT_MODE,
+                    origin=request_slot_origin(request.get("app", "")),
+                )
+                slot.project = project
     if slot.mode != members_mod.DM_SLOT_MODE:
         # The derived key is already occupied by a foreign slot (mode is set at
         # creation only, so a pre-existing non-member slot keeps its own). Never

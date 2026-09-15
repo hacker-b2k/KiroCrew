@@ -72,18 +72,27 @@ async def test_client_session_requests_do_not_restore_private_broker_routing(
         mcp_gateway_overlay=broker_overlay,
         mcp_gateway_socket=socket,
     )
+
     # Model the direct Claude projection after spawn; its resolver is exercised
     # separately below. Kiro reads its original agent spec without an injection.
-    client._session_mcp_cache = [{"name": "direct", "command": "local-mcp", "args": [], "env": []}]
+    # The claude mirror now places the pooled broker stubs INTO the projection
+    # (held to the spec's `tools` allowlist), so the post-spawn cache carries the
+    # stub for a non-private session; the shared _pooled_mcp_servers append is
+    # inert for mirrored backends and must not re-add it at the call site.
+    def _projected_cache() -> list:
+        cache = [{"name": "direct", "command": "local-mcp", "args": [], "env": []}]
+        if backend == ACP_BACKEND_CLAUDE and not private:
+            cache.append({"name": "builder", "command": "broker-stub", "args": [], "env": []})
+        return cache
+
+    client._session_mcp_cache = _projected_cache()
     claims = Mock()
     monkeypatch.setattr(client_mod, "schedule_claim", claims)
     if entry == "reset-and-rekey":
         client._reset_state()
         client.rekey("dashboard:next", channel_id="next-channel")
         client._agent = "another-agent"
-        client._session_mcp_cache = [
-            {"name": "direct", "command": "local-mcp", "args": [], "env": []}
-        ]
+        client._session_mcp_cache = _projected_cache()
         assert claims.call_args.args[0] == (None if private else str(socket))
 
     sent = []
@@ -180,15 +189,20 @@ async def test_kas_projection_preserves_direct_private_server(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(runtime_mod, "kiro_agents_dir", lambda: agents)
-    monkeypatch.setattr(runtime_mod, "ensure_agent_materialized", lambda _agent: True)
+    import kiro_crew.config.paths as paths_mod
+
+    monkeypatch.setattr(paths_mod, "kiro_agents_dir", lambda: agents)
+    import kiro_crew.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "ensure_agent_materialized", lambda _agent: True)
     runtime = AcpRuntime(
         work_dir=tmp_path,
         acp_backend=ACP_BACKEND_KAS,
         private_memory=private,
         mcp_gateway_overlay=broker_overlay,
     )
-    projected = await asyncio.wait_for(runtime._kas_custom_agents("kirocrew"), timeout=5)
+    extras = await asyncio.wait_for(runtime._kas_custom_agents("kirocrew"), timeout=5)
+    projected = extras.custom_agents
     assert projected
     server = projected[0].get("mcpServers", {}).get("builder")
     assert (server is not None) is private
@@ -254,11 +268,16 @@ def launch_boundary(monkeypatch):
     spawned = AsyncMock(
         side_effect=AssertionError("A provider process must never start in this test")
     )
+    import kiro_crew.agent as agent_mod
+
+    # The binary search and the agent-spec materialization are stubbed at the
+    # modules that DEFINE them: the runtime's spawn reaches both through its
+    # harness, so a stub on the runtime module would not be the code that runs.
+    monkeypatch.setattr(
+        client_mod, "_resolve_kiro_bin_for_spawn", AsyncMock(return_value=sys.executable)
+    )
+    monkeypatch.setattr(agent_mod, "ensure_agent_materialized", lambda _agent: True)
     for module in (client_mod, runtime_mod):
-        monkeypatch.setattr(
-            module, "_resolve_kiro_bin_for_spawn", AsyncMock(return_value=sys.executable)
-        )
-        monkeypatch.setattr(module, "ensure_agent_materialized", lambda _agent: True)
         monkeypatch.setattr(
             module, "assert_voice_runtime_outside_agent_workspace", lambda _path: None
         )

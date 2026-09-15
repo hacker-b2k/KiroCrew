@@ -1,18 +1,23 @@
 import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import { useNavigate } from 'react-router-dom'
-import { X } from 'lucide-react'
+import { X, LoaderCircle } from 'lucide-react'
 import { SplitGlyph } from './SplitGlyph'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { useModelsDegraded } from '../providers/modelListHealth'
 import ChatMessageList from '../app-sdk/ChatMessageList'
-import { useChatScrollFollow } from '../app-sdk/useChatScrollFollow'
+import type { VirtualTranscriptHandle } from '../app-sdk/ChatMessageList'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
 import ChatInput, { type ComposerBusyMode } from './ChatInput'
 import ErrorNotice from './ErrorNotice'
 import { Btn } from './ui'
 import ChatDropOverlay, { useChatFileDrop } from './ChatDropOverlay'
+import PaneDim from './PaneDim'
+
+/** What the top-left split pane does about the shell's sidebar toggle — see
+ *  ChatPane's `leading` prop. */
+export type PaneLeading = { inset?: boolean; control?: React.ReactNode }
 import PendingQuestionCard from './PendingQuestionCard'
 import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from './QueueStack'
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
@@ -25,12 +30,16 @@ import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
 import { agentOrDefaultLabel } from '../utils/agentLabel'
 import { useRemoteCapabilities } from '../hooks/useRemoteCapabilities'
 import ModelDropdownList from './ModelDropdownList'
+import { ManageModelsFooter } from './ModelEffortDropdown'
+import { settingsPath } from './settingsPath'
 import { SlotProvider } from '../providers/SlotContext'
 import { useProvider } from '../providers'
+import type { ModelInfo } from '../providers/types'
 import { useAgents } from '../hooks/useAgents'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
 import { useAvailableModels } from '../hooks/useAvailableModels'
+import { filterInteractiveModels, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
 import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
 import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
@@ -82,6 +91,7 @@ export default function ChatPane({
   followContentWidth,
   hideEmptyHint,
   openSideChat,
+  leading,
   busyMode = 'split',
 }: {
   slotKey: string
@@ -98,6 +108,13 @@ export default function ChatPane({
    *  the agent picker is not offered at all, instead of offering a control
    *  whose every selection the backend 409s. */
   agentLocked?: boolean
+  /** Split view: this pane owns the surface's top-left corner, where the shell
+   *  keeps the sessions-sidebar toggle. `inset` reserves that toggle's column
+   *  (desktop: the toggle is the shell's absolutely positioned button, and the
+   *  header would otherwise run under it); `control` renders the toggle inline
+   *  (mobile, where the single-chat title row that normally carries it is not
+   *  rendered in split view). Undefined = the header starts at its own inset. */
+  leading?: PaneLeading
   /** Embedded-in-a-page mode (member DM threads): the HOST renders the
    *  identity header, so the pane's own title bar and its card chrome
    *  (border, rounded corners) would duplicate it. Split-view panes keep
@@ -244,15 +261,21 @@ export default function ChatPane({
   const [stopError, setStopError] = useState('')
   const [agentBtnRect, setAgentBtnRect] = useState<DOMRect | null>(null)
   const [modelBtnRect, setModelBtnRect] = useState<DOMRect | null>(null)
-  // Shared stick-to-bottom follow (same FollowController core as the main
-  // chat's virtualizer): RO-driven re-pin on any content growth or collapse,
-  // released only by a genuine user scroll up, re-armed at the bottom.
-  const follow = useChatScrollFollow({ resetKey: slotKey })
+  // The transcript is virtualized (chat-core P5-e): ChatMessageList owns the
+  // scroller and the stick-to-bottom follow through VirtualTranscript. The pane
+  // keeps the element ref for the pinned-prompt hook, a handle for the jump
+  // pill, and the rendered at-bottom state that shows it.
+  const scrollerRef = useRef<HTMLDivElement | null>(null)
+  const listRef = useRef<VirtualTranscriptHandle | null>(null)
+  const [isAtBottom, setIsAtBottom] = useState(true)
+  const scrollToBottom = useCallback(() => { listRef.current?.scrollToBottom() }, [])
   // Pinned-prompt banner — the same hook the main chat's transcript controller
-  // wears (chat-core P5-d). The pane's transcript is unvirtualized, so the
-  // list to index comes from ChatMessageList (`onDisplayItems` turns its row
-  // indexing on) and the jump back is the hook's in-place glide.
-  const pin = usePinnedPrompt({ scrollerRef: follow.scrollerRef })
+  // wears (chat-core P5-d). The list to index comes from ChatMessageList
+  // (`onDisplayItems` turns its row indexing on); with only the viewport
+  // window mounted, a gap at the hand-off line is unmounted spacer, so the
+  // hook must wait for the row (`requiresMountedHandoff`) exactly as the main
+  // chat does.
+  const pin = usePinnedPrompt({ scrollerRef, requiresMountedHandoff: true })
   const { displayItemsRef: pinItemsRef, updatePinnedPrompt, onScrollPin, setPinned, setPinExpanded } = pin
   const onDisplayItems = useCallback((items: DisplayItem[]) => {
     pinItemsRef.current = items
@@ -261,8 +284,6 @@ export default function ChatPane({
     // timing: the rows carrying the new indices are already in the DOM.
     updatePinnedPrompt()
   }, [pinItemsRef, updatePinnedPrompt])
-  const followOnScroll = follow.onScroll
-  const onScroll = useCallback(() => { followOnScroll(); onScrollPin() }, [followOnScroll, onScrollPin])
   // A different session starts collapsed with nothing pinned.
   useEffect(() => { setPinned(null); setPinExpanded(false) }, [slotKey, setPinned, setPinExpanded])
 
@@ -435,8 +456,27 @@ export default function ChatPane({
       .catch(() => setDefaultAgentFailed(true))
   }, [dispatch])
   const agentDD = useFilteredDropdown(installedAgents)
-  const availableModels = useAvailableModels()
-  const modelDD = useFilteredDropdown(availableModels)
+  const localModels = useAvailableModels()
+  const effectiveModels = useMemo<ModelInfo[]>(() => {
+    if (!paneRemoteCrew.isRemote) return localModels
+    return (paneRemoteCrew.capabilities?.models ?? []).map(model => ({
+      name: model.model_name,
+      description: model.description || model.display_name,
+      contextWindow: model.context_window || undefined,
+    }))
+  }, [paneRemoteCrew.isRemote, paneRemoteCrew.capabilities, localModels])
+  const hiddenModelsQ = useModelPickerHiddenModelsQuery()
+  const hiddenModelIds = hiddenModelsQ.data
+  const modelPickerConfigured = useModelPickerConfigured()
+  const availableModels = effectiveModels
+  const modelPickerModels = useMemo(
+    () => filterInteractiveModels(effectiveModels, hiddenModelIds, [
+      paneSlot?.model || '',
+      paneSlot?.served_model || '',
+    ]),
+    [effectiveModels, hiddenModelIds, paneSlot?.model, paneSlot?.served_model],
+  )
+  const modelDD = useFilteredDropdown(modelPickerModels)
   // See ChatPage: display what will actually run, not a pin the account lost
   // access to. The slot's own `model_withheld` verdict answers that when the
   // backend has one; the degraded flag gates only the list-membership fallback —
@@ -484,9 +524,8 @@ export default function ChatPane({
     if (slotDetail?.messages) dispatch(hydrateSlotMessages({ slot: slotKey, messages: slotDetail.messages, hasMore: slotDetail.has_more, bounded: hydrateLimit !== undefined, total: slotDetail.total, running: slotDetail.running }))
   }, [slotDetail, slotKey, dispatch, hydrateLimit])
 
-  // Scroll follow (auto-pin, release, jump pill) is owned by useChatScrollFollow
-  // above — the ResizeObserver on the content wrapper replaces the old
-  // message-hash effect, so growth on EARLIER rows (a tool result updating, a
+  // Scroll follow (auto-pin, release, jump pill) is owned by the virtualizer
+  // inside ChatMessageList — growth on EARLIER rows (a tool result updating, a
   // thinking block expanding) and turn-collapse shrink re-pin too.
 
 
@@ -1162,7 +1201,19 @@ export default function ChatPane({
         } as React.CSSProperties}
       >
         {!frameless && (
-        <div className="relative z-50 flex items-center gap-2 px-3 py-2 border-b border-border bg-card shrink-0">
+        <div data-pane-title-row className={`relative z-50 flex items-center gap-2 pr-3 py-2 border-b border-border bg-card shrink-0 transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)] ${leading?.inset ? 'pl-[49px]' : 'pl-3'}`}>
+          {/* Leading edge (#10585): in split view this pane may stand in for
+              the single-chat title row at the surface's top-left. `inset`
+              clears the shell's stationary sidebar toggle: the pane starts at
+              container x 3 (2px grid inset + 1px border) and the toggle spans
+              container x 8..36 (TOGGLE_RECT), so the hairline sits at
+              container 44 = pane 41 and the title starts at container 52 =
+              pane 49 — the same columns the single-chat row uses (its
+              left-[52px] / pl-[60px] are measured from container x -8).
+              Absolute, so the divider never joins the row's flex layout.
+              `control` renders the toggle inline ahead of the title. */}
+          {leading?.inset && <span aria-hidden="true" data-pane-leading-divider className="absolute left-[41px] top-1/2 -translate-y-1/2 w-px h-5 bg-border" />}
+          {leading?.control}
           <span className={`w-2 h-2 rounded-full shrink-0 ${running ? 'bg-ok animate-pulse' : 'bg-accent'}`} />
           <span className="text-[13px] font-semibold text-text-strong truncate min-w-0">{title}</span>
           {parentKey && (
@@ -1193,6 +1244,11 @@ export default function ChatPane({
         </div>
         )}
 
+        {/* Split view only: `focused` is a boolean from the grid. A pane that
+            owns the whole surface (undefined) is never dimmed. Sits above the
+            title row (z-10) and the message chrome, below the drop overlay
+            (z-[60]) and every shell layer (>= 46). */}
+        {focused !== undefined && <PaneDim dimmed={!focused} />}
         <ChatDropOverlay active={dragOver} />
 
         {/* Zero-height anchor so the top fade overlays the scroller's first
@@ -1230,67 +1286,84 @@ export default function ChatPane({
           )}
         </div>
 
-        {/* stable theming hook 'chat-container' — see website/docs/theming-contract.md */}
-        {/* overflow-x-hidden: `overflow-y-auto` alone leaves overflow-x at
-            `visible`, which CSS then forces to compute to `auto` — so any single
-            over-wide child (a long unbroken path, a wide code block, a widget)
-            gives the WHOLE message list a draggable horizontal scrollbar that
-            sits right above the composer. The conversation should never pan
-            sideways; wide children scroll within themselves. */}
-        <div ref={follow.scrollerRef} onScroll={onScroll} className="chat-container flex-1 overflow-y-auto overflow-x-hidden py-3 min-h-0">
-          <div ref={follow.contentRef}>
-          {slotDetailFailed && (
-            <div className="mx-4 my-2 flex items-start gap-2">
-              {/* No hand-off: the composer draft (`input`) in this pane is unsaved local
-                  state. The retry is the recovery path for the hydration read. */}
-              <ErrorNotice
-                className="flex-1"
-                testId="chat-pane-hydrate-error"
-                message={i18nT('components.chatPane.history_load_failed')}
+        {/* The scroller (theming hook 'chat-container', overflow contract,
+            sentinels/spacers) is ChatMessageList's virtualized mount — see
+            TranscriptScrollShell for the style contract it enforces. */}
+        <ChatMessageList
+          ref={listRef}
+          messages={messages}
+          // The slot's own liveness too, not only this session's stream: a
+          // DM/member pane observing a turn driven elsewhere still follows.
+          running={running || !!paneSlot?.running}
+          renderers={renderers}
+          hideCardOwnedOAuth={connectionsUiOn}
+          onDisplayItems={onDisplayItems}
+          hiddenRow={pinHiddenRow}
+          onQuote={onQuote}
+          onAsk={onAsk}
+          transcript={{
+            sessionId: `pane:${slotKey}`,
+            scrollerRef,
+            onScroll: onScrollPin,
+            onAtBottomChange: setIsAtBottom,
+            scrollerStyle: { paddingTop: 12, paddingBottom: 12, minHeight: 0 },
+            aboveRows: (
+              <>
+                {slotDetailFailed && (
+                  <div className="mx-4 my-2 flex items-start gap-2">
+                    {/* No hand-off: the composer draft (`input`) in this pane is unsaved local
+                        state. The retry is the recovery path for the hydration read. */}
+                    <ErrorNotice
+                      className="flex-1"
+                      testId="chat-pane-hydrate-error"
+                      message={i18nT('components.chatPane.history_load_failed')}
+                    />
+                    <Btn onClick={() => { void refetchSlotDetail() }}>{i18nT('components.chatPane.retry')}</Btn>
+                  </div>
+                )}
+                {messages.length === 0 && !running && !slotDetailFailed && !hideEmptyHint && (
+                  <div className="text-center text-muted text-[13px] py-8">{i18nT('components.chatPane.session_ready_type_a_message_to_start')}</div>
+                )}
+                {/* Suppressed on the active slot: that pane renders the store's full
+                    history, so the bound does not apply and the row would be false. */}
+                {warmHasMore && slotKey !== activeSlot && onOpenFull && (
+                  <button
+                    onClick={() => onOpenFull(slotKey, messages[0]?.ts, messages[0]?.meta?.mid as string | undefined)}
+                    className="block w-full text-center text-accent text-[12px] underline py-2 bg-transparent border-none cursor-pointer hover:text-accent-hover transition-colors"
+                  >
+                    {i18nT('components.chatPane.earlier_messages_open_session')}
+                  </button>
+                )}
+              </>
+            ),
+            belowRows: (
+              /* The same working indicator the full chat page shows (the ghost-pose
+                 carousel, theme-swappable via themeBranding): a running turn in a
+                 pane — a member DM, a split pane — was otherwise invisible between
+                 tool steps. Inside the scroll container, after the last message,
+                 so it reads as "the reply is coming" exactly where the reply will
+                 land. Stop/regenerate chrome stays page-level: the pane derives
+                 the footer's inputs from its own per-slot stream state. */
+              <ChatFooter
+                running={running || !!paneSlot?.running}
+                stopping={streamState === 'stopping' || !!paneSlot?.stopping}
+                state={streamState}
+                lastRole={messages[messages.length - 1]?.role ?? ''}
+                streamTick={
+                  messages[messages.length - 1]?.role === 'streaming'
+                    ? (messages[messages.length - 1]?.content.length ?? 0)
+                    : 0
+                }
               />
-              <Btn onClick={() => { void refetchSlotDetail() }}>{i18nT('components.chatPane.retry')}</Btn>
-            </div>
-          )}
-          {messages.length === 0 && !running && !slotDetailFailed && !hideEmptyHint && (
-            <div className="text-center text-muted text-[13px] py-8">{i18nT('components.chatPane.session_ready_type_a_message_to_start')}</div>
-          )}
-          {/* Suppressed on the active slot: that pane renders the store's full
-              history, so the bound does not apply and the row would be false. */}
-          {warmHasMore && slotKey !== activeSlot && onOpenFull && (
-            <button
-              onClick={() => onOpenFull(slotKey, messages[0]?.ts, messages[0]?.meta?.mid as string | undefined)}
-              className="block w-full text-center text-accent text-[12px] underline py-2 bg-transparent border-none cursor-pointer hover:text-accent-hover transition-colors"
-            >
-              {i18nT('components.chatPane.earlier_messages_open_session')}
-            </button>
-          )}
-          <ChatMessageList messages={messages} running={running} renderers={renderers} hideCardOwnedOAuth={connectionsUiOn} onDisplayItems={onDisplayItems} hiddenRow={pinHiddenRow} onQuote={onQuote} onAsk={onAsk} />
-          {/* The same working indicator the full chat page shows (the ghost-pose
-              carousel, theme-swappable via themeBranding): a running turn in a
-              pane — a member DM, a split pane — was otherwise invisible between
-              tool steps. Inside the scroll container, after the last message,
-              so it reads as "the reply is coming" exactly where the reply will
-              land. Stop/regenerate chrome stays page-level: the pane derives
-              the footer's inputs from its own per-slot stream state. */}
-          <ChatFooter
-            running={running || !!paneSlot?.running}
-            stopping={streamState === 'stopping' || !!paneSlot?.stopping}
-            state={streamState}
-            lastRole={messages[messages.length - 1]?.role ?? ''}
-            streamTick={
-              messages[messages.length - 1]?.role === 'streaming'
-                ? (messages[messages.length - 1]?.content.length ?? 0)
-                : 0
-            }
-          />
-          </div>
-        </div>
+            ),
+          }}
+        />
         {/* Bottom fade overlays the scroller's last 24px above the status bars
             and composer (in-flow height cancelled by its own negative margin). */}
         <EdgeFade side="bottom" />
 
         <div className="relative">
-        <JumpToBottomButton visible={!follow.isAtBottom && messages.length > 0} onClick={follow.scrollToBottom} />
+        <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={scrollToBottom} />
 
         <SubagentProgressBar slot={slotKey} />
 
@@ -1541,9 +1614,42 @@ export default function ChatPane({
                 className={ddInputCls}
               />
             </div>
+            {hiddenModelsQ.isError && (
+              <div className="flex items-center gap-2 px-1.5 py-1">
+                {/* No hand-off: this pane's composer may hold an unsent draft.
+                    Retry keeps the user in the owning chat. */}
+                <ErrorNotice
+                  className="min-w-0 flex-1"
+                  variant="inline"
+                  message={i18nT('pages.settings.chatPanel.failed_to_load_dashboard_config')}
+                />
+                <Btn type="button" className="shrink-0" onClick={() => hiddenModelsQ.refetch()}>
+                  {i18nT('pages.settings.chatPanel.retry')}
+                </Btn>
+              </div>
+            )}
+            {paneRemoteCrew.failed && (
+              <div className="flex items-center gap-2 px-1.5 py-1">
+                {/* No hand-off: this pane's composer may hold an unsent draft.
+                    Retry keeps the user in the owning chat. */}
+                <ErrorNotice
+                  className="min-w-0 flex-1"
+                  variant="inline"
+                  message={i18nT('components.modelEffortDropdown.models_failed')}
+                />
+                <Btn type="button" className="shrink-0" onClick={() => paneRemoteCrew.refetch()} disabled={paneRemoteCrew.retrying}>
+                  {paneRemoteCrew.retrying && <LoaderCircle className="lucide-inline animate-spin" aria-hidden />}
+                  {i18nT('pages.settings.chatPanel.retry')}
+                </Btn>
+              </div>
+            )}
             <div role="listbox" aria-label={i18nT('components.chatPane.model_list')} className="overflow-y-auto max-h-[280px]">
-              <ModelDropdownList models={modelDD.filtered} activeModel={shownModel} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} />
+              <ModelDropdownList models={modelDD.filtered} activeModel={shownModel} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} loading={paneRemoteCrew.modelsPending} failed={paneRemoteCrew.failed} />
             </div>
+            {!modelPickerConfigured && <ManageModelsFooter onManage={() => {
+              modelDD.setOpen(false)
+              navigate(settingsPath({ tab: 'chat', highlight: 'key:dashboard.model_picker_hidden_models' }))
+            }} />}
           </div>,
           document.body,
         )}

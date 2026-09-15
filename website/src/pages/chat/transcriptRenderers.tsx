@@ -38,6 +38,8 @@ import NudgeCard, { nudgeMatchesLoop } from './NudgeCard'
 import RecoveryCard, { resolveInjectCard } from './RecoveryCard'
 import { SystemNoticeRow, isSystemNoticeRow } from './CompactionCard'
 import { ErrorCard, isAuthRequired, isModelUnentitled } from './ErrorCard'
+import NoticeCard from './NoticeCard'
+import { resolveTransientNotice } from './transientNotice'
 import WorkflowRunCard, { extractWorkflowRunId, isWorkflowRunTool } from './WorkflowRunCard'
 import SubagentRunCard, { extractSpawnRunLaunch, isSpawnRunTool } from './SubagentRunCard'
 import WorkflowCompletionCard, { isWorkflowCompletionMessage } from './WorkflowCompletionCard'
@@ -188,6 +190,7 @@ export function createTranscriptRenderers(
           onSessionOpen={o.onSessionOpen}
           sessions={o.sessions}
           activeSession={o.activeSession}
+          messageTs={m.ts}
           disclosureKey={ctx.key}
           onOpenPanel={o.onOpenSubagentPanel}
         />,
@@ -336,6 +339,7 @@ export function createTranscriptRenderers(
           onSessionOpen={o.onSessionOpen}
           sessions={o.sessions}
           activeSession={o.activeSession}
+          messageTs={m.ts}
           disclosureKey={ctx.key}
         />,
         true,
@@ -347,11 +351,19 @@ export function createTranscriptRenderers(
       id: 'error',
       roles: ['error'],
       render: (m, ctx) => {
+        // A transient-5xx notice the gateway is already retrying against is
+        // routine status, not a failure: localized copy on a soft NoticeCard.
+        // Only its terminal shape ("please try again") stays a red ErrorCard,
+        // with the same localized text.
+        const transient = resolveTransientNotice(m, ctx.messages, ctx.index)
+        if (transient?.card === 'notice') {
+          return ctx.row(<NoticeCard content={transient.text} tone={transient.tone} />)
+        }
         const unentitled = isModelUnentitled(m)
         const authRequired = isAuthRequired(m)
         return ctx.row(
           <ErrorCard
-            content={m.content}
+            content={transient ? transient.text : m.content}
             meta={m.meta}
             // A rejection the backend says no retry can fix never offers Continue,
             // even when this row is the newest and the turn was interrupted:

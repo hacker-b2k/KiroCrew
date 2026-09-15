@@ -361,6 +361,36 @@ class TestRelayReplay:
         assert all(c.args[1]["slot"] == slot.key for c in chunk_calls)
 
     @pytest.mark.asyncio
+    async def test_a_second_relayed_turn_continues_the_slot_counter(self, tmp_path):
+        """The numbers come from the slot's own counter, so a second relayed
+        turn is numbered above the first (and above any local turn on the same
+        slot): a client's replay floor from the earlier turn orders every chunk
+        of the later one above it without seeing the boundary."""
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        slot = _remote_slot()
+
+        def seqs() -> list[int]:
+            return [
+                c.args[1]["seq"]
+                for c in state.broadcast_ws.call_args_list
+                if c.args[0] == "chat_chunk"
+            ]
+
+        for text in ("first", "second"):
+            await relay_remote_turn(
+                state,
+                slot,
+                text,
+                chunks=_stream(
+                    _sse({"type": "chunk", "content": text, "cls": "chunk"}),
+                    b"data: [DONE]\n\n",
+                ),
+            )
+        assert seqs() == [1, 2]
+        assert slot._chunk_seq == 2
+
+    @pytest.mark.asyncio
     async def test_a_mirrored_frame_is_rebroadcast_under_the_local_key(self, tmp_path):
         state = _make_state(tmp_path)
         state.broadcast_ws = MagicMock()
@@ -3381,7 +3411,7 @@ class TestRelayCarriesToolRowMeta:
                 "cls": "tool",
                 "meta": {"tool": "fs_read", "call_id": "c1", "mid": "peer-mid"},
             },
-            _ChunkSequencer(),
+            _ChunkSequencer(slot),
         )
         row = slot.messages[-1]
         assert row["meta"]["tool"] == "fs_read"
@@ -3399,6 +3429,35 @@ class TestRelayedSendToBusyPeerSlotIsRefused:
     mirror and its answer never reaches the owner. Refusing makes the owner's
     reader raise and surface a reconnect prompt instead.
     """
+
+    @pytest.mark.asyncio
+    async def test_a_relayed_send_never_recreates_a_missing_peer_slot(self, tmp_path, monkeypatch):
+        """`relay=1` targets an existing peer session; it never creates one.
+
+        The owner can validate a row and lose it before the first relayed turn.
+        Without this guard `api_chat` falls through to `get_or_create_slot`, mints
+        an empty ordinary peer slot under the vanished key, and answers against no
+        inherited history — plausible output with the wrong context.
+        """
+        from aiohttp.test_utils import TestClient, TestServer
+
+        state = _make_state(tmp_path)
+        assert "peer-just-closed" not in state._slots
+
+        def _relay_must_not_create(*_args, **_kwargs):
+            raise AssertionError("relay=1 reached get_or_create_slot")
+
+        monkeypatch.setattr(state, "get_or_create_slot", _relay_must_not_create)
+
+        async with TestClient(TestServer(_send_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/send?relay=1",
+                json={"slot": "peer-just-closed", "message": "relayed"},
+            )
+            assert resp.status == 404
+            assert (await resp.json())["code"] == "slot_not_found"
+
+        assert "peer-just-closed" not in state._slots
 
     @pytest.mark.asyncio
     async def test_a_relayed_send_to_a_busy_local_slot_is_refused(self, tmp_path):

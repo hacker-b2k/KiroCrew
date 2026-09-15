@@ -137,6 +137,9 @@ export interface WorkflowDefinitionWrite {
 export type MonitorWrite = {
   slot_key?: string
   kind?: 'github_pull_request'
+    | 'gitlab_merge_request'
+    | 'azure_devops_pull_request'
+    | 'bitbucket_pull_request'
   objective?: 'review_ready'
   target?: string
   cadence_secs?: number
@@ -252,6 +255,36 @@ export interface ConnectionStatus {
    *  "could not look" rather than "absent". */
   grantIndeterminate?: boolean
   connectedSince?: string
+  /** True for a pre-registered provider whose operator has not entered a usable
+   *  OAuth client; present only when true and never alongside a held grant. */
+  needsClientConfig?: boolean
+}
+
+/** Where a client-record half came from; `null` means not set anywhere. */
+export type ConnectionOAuthClientSource = 'env' | 'config' | 'vault' | 'registry'
+
+/** One pre-registered provider's operator OAuth client, as GET /api/connections/oauth-clients
+ *  reports it. Carries the PUBLIC client id and only a boolean for the secret. */
+export interface ConnectionOAuthClient {
+  slug: string
+  /** The vendor requires a client secret at the token endpoint. */
+  confidential: boolean
+  /** The exact redirect URI to register in the vendor console. */
+  redirect_uri: string
+  /** Path under docs/guides/ of the registration runbook. */
+  registration_guide: string
+  client_id: string | null
+  client_id_source: ConnectionOAuthClientSource | null
+  client_secret_set: boolean
+  client_secret_source: ConnectionOAuthClientSource | null
+  /** A client id is present, plus a secret when `confidential`. */
+  configured: boolean
+}
+
+export interface ConnectionOAuthClientSave {
+  client_id?: string
+  client_secret?: string
+  client_secret_clear?: boolean
 }
 
 /** Authenticated provider-tool verdict returned by POST /api/connections/test. */
@@ -339,6 +372,31 @@ export interface BrowserViewData {
   url: string | null
   port: number | null
   reason: string | null
+}
+
+/** Answer of POST /api/browser/open: the Browser panel's address bar on the
+ * non-native transport, where the gateway host's Playwright CLI browser is the
+ * only thing that can render an external site.
+ *
+ * A launch that FAILED is a 200 with `ok: false`, exactly as a failed view start
+ * comes back as a `stopped` status: `error` is the CLI's own text (a Chromium
+ * sandbox refusal, a missing browser build), rendered verbatim so the panel
+ * explains the cause instead of showing a blank frame. `view` is the post-attempt
+ * status of the `show` dashboard, so the panel can frame it without a second
+ * read. `session` is the CLI session name (`panel-<8hex>`), one per chat slot. */
+export interface BrowserOpenData {
+  ok: boolean
+  /** The CLI session this chat slot's browser lives in (`panel-<8hex>`), shown
+   * in the view's header so the human can tell it from the other sessions in
+   * the framed dashboard's sidebar. */
+  session: string
+  error: string | null
+  /** Whether the framed `show` dashboard attached its viewport to the session.
+   * `false` means the page is open but the reader is looking at the frame's
+   * session grid and has to pick `session` in its sidebar; the panel says so
+   * only in that case. */
+  attached: boolean
+  view: BrowserViewData
 }
 
 /** ADVISORY macOS permission rows. Never a gate — macOS attributes a TCC grant
@@ -1904,6 +1962,17 @@ export interface KiroPrerequisiteStatus {
    */
   missing_agent_specs: string[]
   /**
+   * Why the last version probe did not verify the CLI when neither typed
+   * condition above (sandbox refusal, timeout) explains it — the probe's own
+   * failure text, or the tail of its output on a non-zero exit. Empty when the
+   * probe passed, never ran, or a typed field already carries the cause. Shown
+   * verbatim, untranslated, in the retry screen so it names WHY instead of just
+   * that the check failed.
+   */
+  probe_error?: string
+  /** The failed probe's exit status; absent when it did not exit. */
+  probe_status?: number | null
+  /**
    * Failure text from the repair the Check again button attempts when specs are
    * missing. Empty when none was attempted or it succeeded. Shown verbatim and
    * untranslated: it names the failing install step.
@@ -2246,6 +2315,15 @@ export interface MemberRosterRow {
   /** Epoch seconds of the DM transcript's last write; 0 = never talked. */
   last_active_ts?: number
   last_message?: string
+  /** True when the DM thread's NEWEST event is a Stop press. The server skips
+   *  the stop card's raw JSON from `last_message`, so the preview is the last
+   *  conversational line — which reads as ongoing work on a thread the user has
+   *  stopped. This locale-independent boolean lets the roster render a localized
+   *  "Stopped" chip beside that preview; the word itself is never sent from the
+   *  server, where the client's locale is unknown. Omitted (not `false`) when
+   *  the newest event is not a stop, and absent again once a newer
+   *  conversational row lands. */
+  last_message_stopped?: boolean
   kiro_agent?: string
   workspace?: string
   memory_store?: string
@@ -3038,14 +3116,28 @@ export const api = {
   /**
    * The crew appearance library — the packs a crew can wear.
    *
-   * Owner-gated, same-origin cookie auth. There is deliberately no `detail`
-   * wrapper: that route inlines every file in the pack, so drawing a grid of
-   * thumbnails through it would load N whole packs to show N frames. The picker
-   * reads the per-slot route through an `<img>` instead (`packSlotUrl`), and
-   * `detail` lands here with its first real caller.
+   * Owner-gated, same-origin cookie auth.
    */
   appearances: {
     list: () => fetch('/api/appearances').then(j) as Promise<{ packs?: unknown }>,
+    /**
+     * The whole pack, inlined. Read it through `hooks/usePackDetail` (a React
+     * Query entry, `staleTime: Infinity`) rather than directly: this route
+     * carries every file in the pack, so one read per pack per session is the
+     * budget, and a grid or roster calling it per avatar would load N whole packs
+     * to draw N frames. The crew avatar pays that one read per WORN pack to learn
+     * each slot's format (the per-slot route cannot say it before the request);
+     * `packDetailFrom` then keeps the bytes only for a Lottie slot, so the cache
+     * never pins an svg or a base64 sheet no renderer reads from here. The three
+     * shipped sample bundles are 1-4 KB; a content-free detail variant is the
+     * follow-up if real packs prove otherwise.
+     *
+     * A renderer needs it because the FORMAT lives per slot — the player has to
+     * be chosen before any bytes are requested, which the per-slot route
+     * (`packSlotUrl`) cannot answer.
+     */
+    detail: (id: string) =>
+      fetch('/api/appearances/' + encodeURIComponent(id)).then(j) as Promise<unknown>,
     /** Install an exported pack. The JSON envelope, not multipart: the bundle is
      *  already parsed client-side to reject an obviously wrong pick, so posting
      *  it back as a file would only re-serialize what we hold. */
@@ -3403,6 +3495,18 @@ export const api = {
   // field sends none.
   connectionsDisconnect: (slug: string) =>
     post('/api/connections/disconnect', { slug }).then(j) as Promise<{ ok: boolean; grantRemoved: boolean; grantSurviving: string[]; entryRemoved: boolean; grantSharedWith: string[]; grantCensusIncomplete: boolean; grantCensusUnreadable?: string[] }>,
+  // Operator-registered OAuth clients for providers that refuse dynamic client
+  // registration (Settings → OAuth Apps). The list is readable by any dashboard
+  // user (it is what the gallery's "needs configuration" card is built from and
+  // carries no secret); save and delete are owner-only.
+  connectionsOAuthClients: () =>
+    fetch('/api/connections/oauth-clients').then(j) as Promise<{ schema_version: number; clients: ConnectionOAuthClient[] }>,
+  // Omitted fields are left as they are, so the id can be saved without re-entering
+  // a secret the panel never displays; `client_secret_clear` removes the stored one.
+  connectionsOAuthClientSave: (slug: string, body: ConnectionOAuthClientSave) =>
+    put(`/api/connections/oauth-clients/${encodeURIComponent(slug)}`, body).then(j) as Promise<{ ok: boolean; client: ConnectionOAuthClient | null }>,
+  connectionsOAuthClientDelete: (slug: string) =>
+    del(`/api/connections/oauth-clients/${encodeURIComponent(slug)}`).then(j) as Promise<{ ok: boolean; client: ConnectionOAuthClient | null }>,
   // MCP Gateway (shared pool)
   mcpGatewayStatus: () => fetch('/api/mcp-gateway/status').then(j) as Promise<{ enabled: boolean; stub: string[]; stub_count: number; running: boolean; ping_ok: boolean; supported: boolean }>,
   mcpGatewayEnable: (enabled: boolean) => post('/api/mcp-gateway/enable', { enabled }).then(j) as Promise<{ ok: boolean; enabled: boolean; running: boolean; ping_ok: boolean }>,
@@ -3557,22 +3661,38 @@ export const api = {
    *  for EXECUTION: it lives in this machine's list and history, and its turns run
    *  over there. The backend opens the peer's slot first, so a peer that is
    *  disconnected or on a different version fails the create rather than yielding
-   *  a session that cannot send. */
-  createChatSlot: async (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, clean_mode?: boolean, artifact?: string, folder_id?: string, instance_id?: string) => {
-    const resolvedMemoryMode = memory_mode ?? await resolveDefaultMemoryMode(
-      () => fetch('/api/dashboard/config').then(j),
-    )
+   *  a session that cannot send.
+   *
+   *  `adopt_remote_slot` switches that same `instance_id` branch from MINT to
+   *  ADOPT: instead of the backend minting a fresh peer session to bind, it binds
+   *  the EXISTING one named here — the `key` of a row from
+   *  `GET /api/instances/{id}/chat-slots`. The new local slot is still fresh, so
+   *  the `remote_already_bound` guard does not fire, and the peer's transcript is
+   *  backfilled server-side. Requires `instance_id`; without it the backend
+   *  answers `400 adopt_needs_instance`. */
+  createChatSlot: async (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, artifact?: string, folder_id?: string, instance_id?: string, adopt_remote_slot?: string) => {
+    // ADOPT deliberately resolves NO default memory mode. The adopted slot carries
+    // the PEER session's own `memory_mode` — that mode is the privacy boundary and
+    // the session it belongs to already chose it — so sending this machine's
+    // default would either be ignored or, worse, silently turn an incognito peer
+    // session into a persistent local transcript. An explicit `memory_mode`
+    // argument still wins, because a caller that names one means it.
+    const resolvedMemoryMode = memory_mode ?? (adopt_remote_slot
+      ? undefined
+      : await resolveDefaultMemoryMode(
+        () => fetch('/api/dashboard/config').then(j),
+      ))
     return post('/api/chat/slots', {
       ...(name ? { name } : {}),
       ...(agent ? { agent } : {}),
       ...(model ? { model } : {}),
       ...(mode ? { mode } : {}),
-      memory_mode: resolvedMemoryMode,
+      ...(resolvedMemoryMode ? { memory_mode: resolvedMemoryMode } : {}),
       ...(title ? { title } : {}),
-      ...(clean_mode !== undefined ? { clean_mode } : {}),
       ...(artifact ? { artifact } : {}),
       ...(folder_id ? { folder_id } : {}),
       ...(instance_id ? { instance_id } : {}),
+      ...(adopt_remote_slot ? { adopt_remote_slot } : {}),
     }).then(j) as Promise<ChatSlot>
   },
   /** Inject silent background context into a slot — consumed on the next user
@@ -3653,7 +3773,7 @@ export const api = {
   createChatTag: (name: string, color?: string, status?: boolean) => post('/api/chat/tags', { name, color: color || '', status: !!status }).then(j),
   updateChatTag: (id: string, body: { name?: string; color?: string; order?: number; status?: boolean }) => patch('/api/chat/tags/' + encodeURIComponent(id), body).then(j),
   deleteChatTag: (id: string) => del('/api/chat/tags/' + encodeURIComponent(id)).then(j),
-  setSlotTags: (slot: string, tags: string[]) => fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/tags', { method: 'PUT', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify({ tags }) }).then(j),
+  setSlotTags: (slot: string, tags: string[], baseTagsRevision?: string) => fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/tags', { method: 'PUT', headers: { 'Content-Type': 'application/json', ..._sk }, body: JSON.stringify(baseTagsRevision ? { tags, base_tags_revision: baseTagsRevision } : { tags }) }).then(j),
   dropSlotToColumn: (slot: string, columnId: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/drop', { column_id: columnId }).then(j),
   tagColumns: () => fetch('/api/chat/tag-columns', { headers: { ..._sk } }).then(j),
   createTagColumn: (body: { name?: string; tag_ids?: string[]; mode?: 'any' | 'all' | 'none'; include_untagged?: boolean; source?: 'tags' | 'state'; state_key?: SessionLaneKey }) => post('/api/chat/tag-columns', body).then(j),
@@ -3729,6 +3849,23 @@ export const api = {
    *  roster disables exactly its own control instead of blanking the shelf. */
   instancesCapabilities: (instanceId: string) =>
     fetch('/api/instances/' + encodeURIComponent(instanceId) + '/capabilities').then(j) as Promise<RemoteCrewCapabilities>,
+
+  // A CONNECTED remote instance's LIVE sessions, read through an owner-only,
+  // GET-only hub route. NOT the generic instance proxy, which this first used: the
+  // peer also lists the slots THIS hub drives for its own remote-EXECUTION
+  // bindings (a local session with `executor: 'remote'`), and those must not come
+  // back as peer rows or one conversation renders twice — once as the local row
+  // the user can chat in, once as a read-only row pointing at the instance pane.
+  // Only the gateway can tell them apart, because the correlating `remote_slot`
+  // is deliberately never projected to the browser, so the dedupe lives there.
+  // READ ONLY on purpose: remote rows offer no rename or close, because those are
+  // local-slot operations that cannot reach a session on another machine — so no
+  // peer mutation method is defined here either.
+  // A remote instance's OLDER sessions are deliberately absent: they live under the
+  // peer's /api/sessions, and the prefix row that would admit them would also admit
+  // clear-all, session-restart, a memory read and a token-spending summarize.
+  instanceChatSlots: (id: string) =>
+    fetch('/api/instances/' + encodeURIComponent(id) + '/chat-slots').then(j),
   sessionDetail: (key: string) => fetch('/api/sessions/' + encodeURIComponent(key)).then(j),
   deleteSession: (key: string) => del('/api/sessions/' + encodeURIComponent(key)).then(j),
   clearSessions: () => del('/api/sessions').then(j),
@@ -4356,6 +4493,11 @@ export const api = {
   installBrowserEngine: (engine: string) => post('/api/browser/engine', { engine }).then(j) as Promise<BrowserInstallData>,
   getBrowserView: () => get('/api/browser/view').then(j) as Promise<BrowserViewData>,
   startBrowserView: () => post('/api/browser/view/start', {}).then(j) as Promise<BrowserViewData>,
+  // The address bar's launcher: opens an owner-typed URL in the gateway host's
+  // Playwright CLI browser (starting the view first) and returns the view status
+  // alongside the verdict, so a success frames the view with no follow-up read.
+  openInBrowser: (url: string, sessionKey: string) =>
+    post('/api/browser/open', { url, session_key: sessionKey }).then(j) as Promise<BrowserOpenData>,
   // Computer use (desktop automation). The PUT returns the refreshed snapshot so
   // the panel re-renders from server truth rather than its optimistic guess.
   getComputerUseConfig: () => get('/api/computer-use/config').then(j) as Promise<ComputerUseConfigData>,

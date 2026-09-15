@@ -51,10 +51,12 @@ from kiro_crew.config.loader import (
     KiroCrewAgentConfig,
     KiroCrewConfig,
     WorkspaceConfig,
+    WorkspaceDirUnusable,
     build_provider_factory,
     coerce_dict_section,
     config_local_path,
     config_path,
+    materialize_workspace_dir,
     read_config_for_update,
     read_local_secret,
     update_config_locked,
@@ -89,6 +91,7 @@ from kiro_crew.memory_stores import (
     UnknownMemoryStore,
     archive_member_memory_store,
     memory_store_binding_defect,
+    memory_store_namespace_lock,
     named_store_or_empty,
     persist_member_config,
     provision_member_memory,
@@ -96,6 +99,7 @@ from kiro_crew.memory_stores import (
     rollback_member_memory_archive_if_active,
 )
 from kiro_crew.port_resolution import resolve_client_port_ex
+from kiro_crew.project_scope import scope_selector_is_inadmissible
 from kiro_crew.secrets.migrate import (
     MigrationConflictError,
     format_report,
@@ -143,8 +147,43 @@ def _ws_dir_error(given: str) -> str:
     return _WS_DIR_OUTSIDE_HOME.format(home=config_dir(), given=given)
 
 
-def _ws_dir_resolves_inside_home(ws_dir: str) -> bool:
-    """True when *ws_dir* resolves to a STRICT descendant of the data home.
+def _cli_validated_workspace_dst(ws_dir: str, *, operation: str, name: str) -> Path:
+    """Refuse *ws_dir* unless it is contained in the data home; else return its path.
+
+    The ONE place the CLI turns a workspace ``dir`` string into a directory. The
+    containment check runs first and exits the command on refusal (SEL ``denied``
+    event + the outside-home message); it fails closed on a ``~unknownuser``
+    prefix, so ``expanduser()`` never escapes as a traceback. What it returns is
+    the very ``Path`` object the check resolved and judged -- ``~`` expanded, an
+    absolute dir taken as given, a relative dir joined onto the data home --
+    resolved ONCE there and never again: the create pins this parent chain, so a
+    component swapped for a link after that resolution is refused, not followed,
+    and there is no second resolution for a swap to slip through. Composing or
+    resolving separately at a call site is how earlier revisions crashed on a
+    tilde spelling and re-resolved after validation, so no call site does either.
+    """
+    validated = _ws_dir_resolves_inside_home(ws_dir)
+    if validated is None:
+        sel().log_api_access(
+            caller="cli",
+            operation=operation,
+            outcome="denied",
+            source="cli",
+            resources=name,
+        )
+        print(_ws_dir_error(ws_dir), file=sys.stderr)
+        sys.exit(1)
+    return validated
+
+
+def _ws_dir_resolves_inside_home(ws_dir: str) -> Path | None:
+    """The resolved path when *ws_dir* is a STRICT descendant of the data home, else None.
+
+    The path is resolved exactly ONCE and the resolved object itself is returned,
+    so the caller materializes the very path these checks judged. Resolving a
+    second time after the checks would follow a parent swapped for a link in the
+    meantime, and the pinned create can only refuse a swap that happens AFTER the
+    path it is handed was resolved.
 
     ``expanduser()`` FIRST is what makes this honest: ``config_dir() / "~/x"``
     silently yields ``<home>/~/x`` — contained, but it creates a literal ``~``
@@ -158,13 +197,11 @@ def _ws_dir_resolves_inside_home(ws_dir: str) -> bool:
     form would, so there is nothing to refuse). What is rejected is anything
     resolving OUTSIDE — which is the property the boundary actually protects.
 
-    STRICT descendant, so the root itself is refused HERE. The separate
-    "cannot use config root" checks at each call site compare
-    ``config_dir() / ws_dir`` WITHOUT expanding ``~``, so ``~/.kiro/crew`` becomes
-    ``<home>/~/.kiro/crew`` there — unequal to the root, hence accepted — while
-    the plain absolute form is refused. Deciding it in this one expanded
-    place removes that split: a workspace pointed at the data-home root would put
-    agent-writable memory/lessons on top of ``config.json`` / ``.env``.
+    STRICT descendant, so the root itself is refused HERE, in the one place
+    that expands ``~`` -- the earlier per-call-site root checks compared
+    ``config_dir() / ws_dir`` unexpanded, so ``~/.kiro/crew`` slipped past them.
+    A workspace pointed at the data-home root would put agent-writable
+    memory/lessons on top of ``config.json`` / ``.env``.
 
     Inside the home is NOT automatically safe: the keystone paths live there too
     (``profiles/``, ``security_policy.json``, ``admission_policy.json``,
@@ -178,7 +215,7 @@ def _ws_dir_resolves_inside_home(ws_dir: str) -> bool:
     Fails CLOSED on any path we cannot resolve. ``expanduser()`` raises
     ``RuntimeError`` for a ``~unknownuser/...`` prefix (no such user, so no home
     to expand), and ``resolve()`` can raise ``OSError`` on a pathological path —
-    both must return False and route into the normal refusal, never escape as a
+    both must return None and route into the normal refusal, never escape as a
     traceback. That is the whole point of this PR, so the guard cannot be the one
     thing that crashes.
     """
@@ -187,10 +224,10 @@ def _ws_dir_resolves_inside_home(ws_dir: str) -> bool:
         candidate = (expanded if expanded.is_absolute() else config_dir() / expanded).resolve()
         root = config_dir().resolve()
         if candidate == root or not candidate.is_relative_to(root):
-            return False
-        return not is_sensitive_path(str(candidate))
+            return None
+        return None if is_sensitive_path(str(candidate)) else candidate
     except (RuntimeError, OSError, ValueError):
-        return False
+        return None
 
 
 def _format_schedule(schedule: object) -> str:
@@ -199,9 +236,15 @@ def _format_schedule(schedule: object) -> str:
     if not isinstance(schedule, CronSchedule):
         return str(schedule)
     if schedule.kind == "at" and schedule.at_ts:
-
-        dt = datetime.fromtimestamp(schedule.at_ts)
-        return f"at {dt:%Y-%m-%d %H:%M}"
+        try:
+            dt = datetime.fromtimestamp(schedule.at_ts)
+            return f"at {dt:%Y-%m-%d %H:%M}"
+        except Exception:
+            # Same degrade-on-render posture as cron.format_schedule: an
+            # extreme stored at_ts (beyond year 9999, epoch milliseconds)
+            # must not crash `kirocrew cron list` -- fall through to the
+            # shared renderer, whose own fallback string covers it.
+            pass
     return format_schedule(schedule)
 
 
@@ -409,17 +452,12 @@ def _handle_workspace(args: argparse.Namespace) -> None:
 
             ws_dir = args.dir if args.dir is not None else f"workspace-{args.name}"
             src_path = config_dir() / cfg.workspaces[copy_from].dir
-            dst_path = config_dir() / ws_dir
-            if not _ws_dir_resolves_inside_home(ws_dir):
-                sel().log_api_access(
-                    caller="cli",
-                    operation="workspace.create",
-                    outcome="denied",
-                    source="cli",
-                    resources=args.name,
-                )
-                print(_ws_dir_error(ws_dir), file=sys.stderr)
-                sys.exit(1)
+            # Validated and composed in one step (refuses and exits on a dir
+            # outside the data home): the install and the fallback mkdir below
+            # both land on this path, the one the containment check judged.
+            dst_path = _cli_validated_workspace_dst(
+                ws_dir, operation="workspace.create", name=args.name
+            )
             if not src_path.resolve().is_relative_to(config_dir().resolve()):
                 sel().log_api_access(
                     caller="cli",
@@ -430,9 +468,9 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                 )
                 print("Error: invalid source directory path", file=sys.stderr)
                 sys.exit(1)
-            # Reject config root itself to avoid copying .env / config.json
+            # Reject the config root as a SOURCE (the destination root was refused above).
             cfg_root = config_dir().resolve()
-            if src_path.resolve() == cfg_root or dst_path.resolve() == cfg_root:
+            if src_path.resolve() == cfg_root:
                 sel().log_api_access(
                     caller="cli",
                     operation="workspace.create",
@@ -480,26 +518,14 @@ def _handle_workspace(args: argparse.Namespace) -> None:
         else:
             ws_dir = args.dir if args.dir is not None else f"workspace-{args.name}"
 
-            if not _ws_dir_resolves_inside_home(ws_dir):
-                sel().log_api_access(
-                    caller="cli",
-                    operation="workspace.create",
-                    outcome="denied",
-                    source="cli",
-                    resources=args.name,
-                )
-                print(_ws_dir_error(ws_dir), file=sys.stderr)
-                sys.exit(1)
-            if (config_dir() / ws_dir).resolve() == config_dir().resolve():
-                sel().log_api_access(
-                    caller="cli",
-                    operation="workspace.create",
-                    outcome="denied",
-                    source="cli",
-                    resources=args.name,
-                )
-                print("Error: cannot use config root as workspace directory", file=sys.stderr)
-                sys.exit(1)
+            # Validated and composed in one step (refuses and exits on a dir
+            # outside the data home). Defined for BOTH branches, so the
+            # destination is never an undefined name in the rollback closure
+            # below, and it is the directory the containment check judged --
+            # not ``<home>/~/...``.
+            dst_path = _cli_validated_workspace_dst(
+                ws_dir, operation="workspace.create", name=args.name
+            )
         # Check for directory collision with existing workspaces
         existing_dirs = {ws.dir for ws in cfg.workspaces.values()}
         if ws_dir in existing_dirs:
@@ -535,6 +561,16 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                         "choose another dir or remove it first"
                     ) from exc
                 install_state["installed"] = True
+            # A create with no copy source still needs its directory to EXIST (see
+            # materialize_workspace_dir: the config entry alone is a fleet-wide
+            # private-memory outage). Created through the pinned parent, adopting a
+            # directory already there; deliberately NOT rolled back on a failed
+            # write -- a concurrent create can already have adopted and registered it.
+            else:
+                try:
+                    materialize_workspace_dir(dst_path, display=ws_dir)
+                except WorkspaceDirUnusable as exc:
+                    raise _CliConflict(str(exc)) from exc
             workspaces[args.name] = dataclasses.asdict(WorkspaceConfig(dir=ws_dir))
             return doc
 
@@ -544,7 +580,16 @@ def _handle_workspace(args: argparse.Namespace) -> None:
 
         def _rollback_install() -> None:
             if install_state["installed"]:
-                shutil.rmtree(dst_path, ignore_errors=True)
+                # Same rule as the dashboard handler and as the plain-create
+                # directory: an installed tree is left in place. A concurrent create
+                # can already have adopted and registered it (EEXIST is accepted),
+                # so deleting it would leave that workspace declared with no
+                # directory. Say where it is; a silent orphan reads as a leak.
+                print(
+                    f"Note: leaving '{dst_path}' in place; the workspace was not "
+                    "registered and no entry names it.",
+                    file=sys.stderr,
+                )
             elif staged_path is not None:
                 shutil.rmtree(staged_path, ignore_errors=True)
 
@@ -567,27 +612,12 @@ def _handle_workspace(args: argparse.Namespace) -> None:
             print(f"Error: workspace '{args.name}' not found", file=sys.stderr)
             sys.exit(1)
         if args.dir is not None:
-            resolved = (config_dir() / args.dir).resolve()
-            if not _ws_dir_resolves_inside_home(args.dir):
-                sel().log_api_access(
-                    caller="cli",
-                    operation="workspace.update",
-                    outcome="denied",
-                    source="cli",
-                    resources=args.name,
-                )
-                print(_ws_dir_error(args.dir), file=sys.stderr)
-                sys.exit(1)
-            if resolved == config_dir().resolve():
-                sel().log_api_access(
-                    caller="cli",
-                    operation="workspace.update",
-                    outcome="denied",
-                    source="cli",
-                    resources=args.name,
-                )
-                print("Error: cannot use config root as workspace directory", file=sys.stderr)
-                sys.exit(1)
+            # Validated and composed in one step (refuses and exits on a dir
+            # outside the data home); the locked mutate below checks this same
+            # path, so the update judges the directory the check judged.
+            update_dst = _cli_validated_workspace_dst(
+                args.dir, operation="workspace.update", name=args.name
+            )
             existing_dirs = {ws.dir for n, ws in cfg.workspaces.items() if n != args.name}
             if args.dir in existing_dirs:
                 print(
@@ -610,6 +640,16 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                 if args.dir in used:
                     raise _CliConflict(
                         f"directory '{args.dir}' is already used by another workspace"
+                    )
+                # Same materialize-or-refuse invariant the create path holds: the
+                # V2 private-memory layout resolves EVERY declared workspace
+                # strictly, so rebinding to a path that is not a directory arms a
+                # refusal for every private member. An update names a destination
+                # the owner already chose, so it refuses rather than creating one.
+                if not update_dst.is_dir():
+                    raise _CliConflict(
+                        f"directory '{args.dir}' does not exist or is not a "
+                        "directory; create it first"
                     )
                 entry["dir"] = args.dir
             return doc
@@ -1220,7 +1260,8 @@ def _handle_agent(args: argparse.Namespace) -> None:
                         exc_info=True,
                     )
 
-        _locked_config_write(_mutate_agent_delete, cleanup_failure=_rollback_archive)
+        with memory_store_namespace_lock():
+            _locked_config_write(_mutate_agent_delete, cleanup_failure=_rollback_archive)
         print(f"Deleted agent: {args.name}")
 
     elif action == "reset-model":
@@ -2456,9 +2497,25 @@ def _learn(args: argparse.Namespace) -> None:
                     )
 
         elif action == "remove":
-            if vs.get_lessons() and vs.delete_lesson(args.query):
+            # A lesson's identity is (rule, repo_scope), so a scoped and a
+            # global lesson can share rule text. ``--repo-scope`` (None when
+            # absent) restricts the delete to one scope; omitted, it matches
+            # every scope. Passed to whichever store is live so both callers
+            # -- this CLI and the agent-facing MCP path -- carry the same
+            # discriminator. A selector the write surface would refuse (a
+            # bare "/", an absolute path, a dot segment) is refused up front:
+            # no admissibly stored row carries it, so canonical folding would
+            # land the delete on rows the caller never named.
+            repo_scope = getattr(args, "repo_scope", None)
+            if repo_scope is not None and scope_selector_is_inadmissible(repo_scope):
+                print(
+                    f"--repo-scope does not name a usable scope: {repo_scope!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if vs.get_lessons() and vs.delete_lesson(args.query, repo_scope):
                 print(f"Removed lessons matching: {args.query}")
-            elif jsonl_store.remove(args.query):
+            elif jsonl_store.remove(args.query, repo_scope):
                 print(f"Removed lessons matching: {args.query}")
             else:
                 print(f"No lessons match: {args.query}")

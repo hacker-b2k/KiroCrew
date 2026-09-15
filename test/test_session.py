@@ -923,24 +923,24 @@ class TestCancelRaceCondition:
         mgr = SessionManager(cfg, provider_factory=factory)
         original_lock = mgr._lock
 
-        class CancelOnSecondLock:
-            """First acquire (fast path) passes through; second (registration) cancels."""
+        class CancelOnThirdLock:
+            """Reservation and fast-path locks pass; registration cancels."""
 
             def __init__(self):
                 self._calls = 0
 
             async def __aenter__(self):
                 self._calls += 1
-                if self._calls >= 2:
+                if self._calls == 3:
                     raise asyncio.CancelledError
                 return await original_lock.__aenter__()
 
             async def __aexit__(self, *a):
-                if self._calls < 2:
+                if self._calls != 3:
                     return await original_lock.__aexit__(*a)
 
         with patch.object(SessionManager, "_dispatch_hard_kill") as mock_kill:
-            mgr._lock = CancelOnSecondLock()
+            mgr._lock = CancelOnThirdLock()
             with pytest.raises(asyncio.CancelledError):
                 await mgr.get_or_create("test-cancel-2")
 
@@ -1933,8 +1933,10 @@ class TestResetWithPid:
         mock_client._child_pids = {}
         provider._client = mock_client
 
+        # Await points allow unrelated liveness probes in this process. Keep
+        # every mocked probe successful instead of consuming a finite list.
         with (
-            patch("os.kill", side_effect=[None, None]),
+            patch("os.kill", return_value=None),
             patch("os.killpg") as mock_killpg,
             patch("os.getpgid", return_value=12345),
             patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
@@ -2097,7 +2099,10 @@ class TestCheckContextUsage:
         provider, _, _ = await mgr.get_or_create("k1")
         mgr.release("k1")
         provider.context_usage_pct = lambda: warn_at
-        with caplog.at_level(logging.WARNING, logger="kiro_crew.session"):
+        with (
+            patch("kiro_crew.session.published_autocompact_pct", return_value=90.0),
+            caplog.at_level(logging.WARNING, logger="kiro_crew.session"),
+        ):
             mgr.check_context_usage("k1", provider)
         assert any(
             f"{warn_at:.0f}%" in r.message for r in caplog.records if r.name == "kiro_crew.session"
@@ -2119,7 +2124,10 @@ class TestCheckContextUsage:
         provider, _, _ = await mgr.get_or_create("k1")
         mgr.release("k1")
         provider.context_usage_pct = lambda: below
-        with caplog.at_level(logging.WARNING, logger="kiro_crew.session"):
+        with (
+            patch("kiro_crew.session.published_autocompact_pct", return_value=90.0),
+            caplog.at_level(logging.WARNING, logger="kiro_crew.session"),
+        ):
             mgr.check_context_usage("k1", provider)
         # Scoped to this logger: caplog captures the whole root hierarchy, so an
         # unrelated library record (asyncio's "Task was destroyed but it is
@@ -2219,6 +2227,317 @@ class TestDestroy:
         assert not mgr.has_session("k1")
 
     @pytest.mark.asyncio
+    async def test_conditional_destroy_refusal_leaves_session_and_map(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        generation = mgr.session_generation("k1")
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            destroyed = await mgr.destroy_if("k1", generation, lambda: False)
+
+        assert destroyed is False
+        provider.shutdown.assert_not_awaited()
+        mock_delete.assert_not_called()
+        assert mgr.has_session("k1")
+
+    @pytest.mark.asyncio
+    async def test_conditional_destroy_guard_runs_after_lock_acquisition(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        generation = mgr.session_generation("k1")
+        allowed = True
+        await mgr._lock.acquire()
+        try:
+            destroy_task = asyncio.create_task(mgr.destroy_if("k1", generation, lambda: allowed))
+            await asyncio.sleep(0)
+            allowed = False
+        finally:
+            mgr._lock.release()
+
+        destroyed = await asyncio.wait_for(destroy_task, timeout=1.0)
+
+        assert destroyed is False
+        provider.shutdown.assert_not_awaited()
+        assert mgr.has_session("k1")
+        await mgr.destroy("k1")
+
+    @pytest.mark.asyncio
+    async def test_conditional_destroy_refuses_a_successor_generation(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        original, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        original_generation = mgr.session_generation("k1")
+        await mgr.destroy("k1")
+        successor, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            destroyed = await mgr.destroy_if("k1", original_generation, lambda: True)
+
+        assert destroyed is False
+        original.shutdown.assert_awaited_once()
+        successor.shutdown.assert_not_awaited()
+        mock_delete.assert_not_called()
+        assert mgr.has_session("k1")
+        await mgr.destroy("k1")
+
+    @pytest.mark.asyncio
+    async def test_conditional_destroy_expected_absence_refuses_new_alias(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        thread_ts = "1785370133.085469"
+        canonical = f"slack:{thread_ts}"
+        generation = mgr.session_generation(canonical)
+        assert generation == 0
+        successor, _, _ = await mgr.get_or_create(thread_ts)
+        mgr.release(thread_ts)
+
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            destroyed = await mgr.destroy_if(canonical, generation, lambda: True)
+
+        assert destroyed is False
+        successor.shutdown.assert_not_awaited()
+        mock_delete.assert_not_called()
+        assert mgr.has_session(thread_ts)
+        await mgr.destroy(thread_ts)
+
+    @pytest.mark.asyncio
+    async def test_conditional_destroy_refuses_absent_successor_absent_aba(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        thread_ts = "1785370133.085469"
+        canonical = f"slack:{thread_ts}"
+        stale_absence = mgr.session_generation(canonical)
+
+        await mgr.get_or_create(thread_ts)
+        mgr.release(thread_ts)
+        await mgr.remove(thread_ts)
+        assert not mgr.has_session(thread_ts)
+        assert mgr.session_generation(canonical) > stale_absence
+
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            destroyed = await mgr.destroy_if(canonical, stale_absence, lambda: True)
+
+        assert destroyed is False
+        mock_delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reload_provider_factory_advances_removed_generation(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        stale_generation = mgr.session_generation("k1")
+
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            await mgr.reload_provider_factory()
+            destroyed = await mgr.destroy_if("k1", stale_generation, lambda: True)
+
+        assert mgr.session_generation("k1") > stale_generation
+        assert destroyed is False
+        provider.shutdown.assert_awaited_once()
+        mock_delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_close_all_advances_removed_generation(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        stale_generation = mgr.session_generation("k1")
+
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            await mgr.close_all()
+            destroyed = await mgr.destroy_if("k1", stale_generation, lambda: True)
+
+        assert mgr.session_generation("k1") > stale_generation
+        assert destroyed is False
+        mock_delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_conditional_destroy_can_preserve_autocompact_override(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        mgr.set_autocompact_pct("k1", 55.0)
+        generation = mgr.session_generation("k1")
+
+        destroyed = await mgr.destroy_if(
+            "k1",
+            generation,
+            lambda: True,
+            preserve_autocompact_override=True,
+        )
+
+        assert destroyed is True
+        folded = mgr._fold_key("k1")
+        assert mgr._compaction.state.pct_overrides[folded] == 55.0
+
+        # The public unconditional path retains its historical clear behavior.
+        await mgr.destroy("k1")
+        assert folded not in mgr._compaction.state.pct_overrides
+
+    @pytest.mark.asyncio
+    async def test_conditional_destroy_refuses_an_inflight_alias_allocation(self, cfg):
+        start_entered = asyncio.Event()
+        release_start = asyncio.Event()
+        provider = _mock_provider_factory()(session_key="reserved")
+
+        async def blocked_start():
+            start_entered.set()
+            await release_start.wait()
+
+        provider.start = AsyncMock(side_effect=blocked_start)
+        mgr = SessionManager(cfg, provider_factory=lambda *_args, **_kwargs: provider)
+        thread_ts = "1785370133.085469"
+        canonical = f"slack:{thread_ts}"
+        expected_absence = mgr.session_generation(canonical)
+        assert expected_absence == 0
+
+        allocation = asyncio.create_task(mgr.get_or_create(thread_ts))
+        await asyncio.wait_for(start_entered.wait(), timeout=1.0)
+
+        assert mgr.session_generation(canonical) > expected_absence
+        assert thread_ts in mgr.session_keys()
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            destroyed = await mgr.destroy_if(canonical, expected_absence, lambda: True)
+
+        assert destroyed is False
+        mock_delete.assert_not_called()
+        release_start.set()
+        allocated_provider, _, _ = await asyncio.wait_for(allocation, timeout=1.0)
+        assert allocated_provider is provider
+        mgr.release(thread_ts)
+        await mgr.destroy(thread_ts)
+
+    @pytest.mark.asyncio
+    async def test_failed_allocation_releases_ownership_reservation(self, cfg):
+        provider = _mock_provider_factory()(session_key="reserved")
+        provider.start = AsyncMock(side_effect=RuntimeError("start failed"))
+        mgr = SessionManager(cfg, provider_factory=lambda *_args, **_kwargs: provider)
+        before = mgr.session_generation("failed-key")
+
+        with pytest.raises(RuntimeError, match="start failed"):
+            await mgr.get_or_create("failed-key")
+
+        assert mgr.session_generation("failed-key") > before
+        assert "failed-key" not in mgr.session_keys()
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_allocation_releases_ownership_reservation(self, cfg):
+        start_entered = asyncio.Event()
+        provider = _mock_provider_factory()(session_key="reserved")
+
+        async def blocked_start():
+            start_entered.set()
+            await asyncio.Event().wait()
+
+        provider.start = AsyncMock(side_effect=blocked_start)
+        mgr = SessionManager(cfg, provider_factory=lambda *_args, **_kwargs: provider)
+        before = mgr.session_generation("cancelled-key")
+        allocation = asyncio.create_task(mgr.get_or_create("cancelled-key"))
+        await asyncio.wait_for(start_entered.wait(), timeout=1.0)
+        assert "cancelled-key" in mgr.session_keys()
+
+        allocation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await allocation
+
+        assert mgr.session_generation("cancelled-key") > before
+        assert "cancelled-key" not in mgr.session_keys()
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_successful_reservation_finalizer_has_no_cancellable_await(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        session = mgr._sessions["k1"]
+        impl_entered = asyncio.Event()
+        release_impl = asyncio.Event()
+
+        async def completed_impl(*_args, **_kwargs):
+            await session.semaphore.acquire()
+            impl_entered.set()
+            await release_impl.wait()
+            return provider, False, False
+
+        with patch.object(mgr._allocation_boundary(), "_get_or_create_impl", completed_impl):
+            claim = asyncio.create_task(mgr.get_or_create("k1"))
+            await asyncio.wait_for(impl_entered.wait(), timeout=1.0)
+            release_impl.set()
+            await asyncio.sleep(0)
+
+            assert claim.done()
+            assert claim.cancel() is False
+            claimed_provider, _, _ = claim.result()
+
+        assert claimed_provider is provider
+        assert session.semaphore.locked()
+        assert mgr._allocation_boundary()._allocation_reservations == {}
+        mgr.release("k1")
+        await mgr.destroy("k1")
+
+    @pytest.mark.asyncio
+    async def test_conditional_destroy_refuses_a_busy_current_generation(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        generation = mgr.session_generation("k1")
+
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            destroyed = await mgr.destroy_if("k1", generation, lambda: True)
+
+        assert destroyed is False
+        provider.shutdown.assert_not_awaited()
+        mock_delete.assert_not_called()
+        assert mgr.has_session("k1")
+        mgr.release("k1")
+        await mgr.destroy("k1")
+
+    @pytest.mark.asyncio
+    async def test_destroy_deletes_map_before_provider_shutdown(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        provider, _, _ = await mgr.get_or_create("k1")
+        mgr.release("k1")
+        map_deleted = False
+
+        def delete(*_args, **_kwargs):
+            nonlocal map_deleted
+            map_deleted = True
+
+        async def shutdown():
+            assert map_deleted is True
+
+        provider.shutdown = AsyncMock(side_effect=shutdown)
+        with patch.object(mgr._session_map, "delete", side_effect=delete):
+            await mgr.destroy("k1")
+
+        provider.shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_destroy_deletes_map_before_end_metric_can_yield(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("k1")
+        mgr.release("k1")
+        metric_entered = asyncio.Event()
+        release_metric = asyncio.Event()
+
+        async def delayed_metric(*_args, **_kwargs):
+            metric_entered.set()
+            await release_metric.wait()
+
+        with (
+            patch(
+                "kiro_crew.session_lifecycle.record_session_ended",
+                new=AsyncMock(side_effect=delayed_metric),
+            ),
+            patch.object(mgr._session_map, "delete") as mock_delete,
+        ):
+            destroy = asyncio.create_task(mgr.destroy("k1"))
+            await asyncio.wait_for(metric_entered.wait(), timeout=1.0)
+            mock_delete.assert_called_once_with("k1", reason="session_destroyed")
+            release_metric.set()
+            await asyncio.wait_for(destroy, timeout=1.0)
+
+    @pytest.mark.asyncio
     async def test_destroy_unlinks_temp_files_from_the_session_queue(self, cfg, tmp_path):
         img = tmp_path / "img.png"
         img.write_bytes(b"fake")
@@ -2236,6 +2555,16 @@ class TestDestroy:
         with patch.object(mgr._session_map, "delete") as mock_delete:
             await mgr.destroy("nonexistent")
         mock_delete.assert_called_once_with("nonexistent", reason="session_destroyed")
+
+    @pytest.mark.asyncio
+    async def test_unconditional_destroy_is_not_refused_by_a_reservation(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        mgr._allocation_boundary()._allocation_reservations["k1"] = {object()}
+
+        with patch.object(mgr._session_map, "delete") as mock_delete:
+            await mgr.destroy("k1")
+
+        mock_delete.assert_called_once_with("k1", reason="session_destroyed")
 
     @pytest.mark.asyncio
     async def test_destroy_shutdown_exception_still_deletes_map(self, cfg):
@@ -5100,6 +5429,174 @@ class TestLoadRecoveryHistoryReplay:
         sess = next(iter(mgr._sessions.values()))
         assert sess.provider_switch_replay is False
         await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_replay_marker_survives_reads_until_prompt_acknowledges_it(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=self._factory(True))
+        await mgr.get_or_create("thread1")
+
+        assert mgr.provider_switch_replay_pending("thread1") is True
+        assert mgr.provider_switch_replay_pending("thread1") is True
+        assert mgr.consume_provider_switch_replay("thread1") is True
+        assert mgr.provider_switch_replay_pending("thread1") is False
+        assert mgr.consume_provider_switch_replay("thread1") is False
+        assert mgr.mark_provider_switch_replay("thread1") is True
+        assert mgr.provider_switch_replay_pending("thread1") is True
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_non_acp_provider_switch_replay_settles_without_sid_promotion(self, cfg):
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("thread1")
+        session = next(iter(mgr._sessions.values()))
+        session.provider_switch_replay = True
+
+        assert mgr.commit_provider_switch_replay_sid("thread1") is True
+        assert session.provider_switch_replay is False
+        assert mgr.provider_switch_replay_pending("thread1") is False
+
+        mgr.release("thread1")
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_pending_replay_preserves_prior_sid_until_commit(
+        self, cfg, monkeypatch, tmp_path
+    ):
+        from kiro_crew.acp.types import PROVIDER_LABEL_DEFAULT
+        from kiro_crew.providers.acp import AcpProvider
+
+        shutdown_started = asyncio.Event()
+        release_shutdown = asyncio.Event()
+
+        async def concrete_shutdown():
+            shutdown_started.set()
+            await release_shutdown.wait()
+
+        def factory(session_key=None, agent=None, channel_id=None, **kwargs):
+            provider = object.__new__(AcpProvider)
+            provider._private_memory = False
+            provider._private_memory_session_key = session_key
+            provider._private_memory_prepared = False
+            provider._client = MagicMock()
+            provider._client._session_id = "fresh-replayed-sid"
+            provider._client._work_dir = "/new-workspace"
+            provider._client._pid = None
+            provider._client.backend = ACP_BACKEND_KIRO
+            provider._client.resumed = False
+            provider._client.set_resume_session_id = MagicMock()
+            provider._history_replay_needed = True
+            provider._defer_replay_sid_promotion = True
+            provider.start = AsyncMock()
+            provider.shutdown = AsyncMock(side_effect=concrete_shutdown)
+            provider.context_usage_pct = MagicMock(return_value=0.0)
+            return provider
+
+        native_sessions = tmp_path / "native-sessions"
+        native_sessions.mkdir()
+        (native_sessions / "old-full-history-sid.json").write_text("{}", encoding="utf-8")
+        (native_sessions / "old-full-history-sid.jsonl").write_text(
+            '{"role":"user","content":"prior history"}\n',
+            encoding="utf-8",
+        )
+        (native_sessions / "fresh-replayed-sid.json").write_text("{}", encoding="utf-8")
+        (native_sessions / "fresh-replayed-sid.jsonl").write_text(
+            '{"role":"user","content":"replayed history"}\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "kiro_crew.session_map._kiro_sessions_dir",
+            lambda: native_sessions,
+        )
+
+        mgr = SessionManager(cfg, provider_factory=factory)
+        mgr._session_map.set(
+            "thread1",
+            "old-full-history-sid",
+            provider=PROVIDER_LABEL_DEFAULT,
+            cwd="/old-workspace",
+        )
+
+        await mgr.get_or_create("thread1")
+
+        assert mgr._session_map.get("thread1") == "old-full-history-sid"
+        assert mgr.provider_switch_replay_pending("thread1") is True
+
+        # close_all flushes SessionMap before provider shutdown. Hold it at that
+        # boundary and create a new manager, exactly as an update restart can.
+        close_task = asyncio.create_task(mgr.close_all())
+        await asyncio.wait_for(shutdown_started.wait(), timeout=1.0)
+        resumed_mgr = SessionManager(cfg, provider_factory=factory)
+        assert resumed_mgr._session_map.get("thread1") == "old-full-history-sid"
+        release_shutdown.set()
+        await close_task
+
+        await resumed_mgr.get_or_create("thread1")
+        assert resumed_mgr.provider_switch_replay_pending("thread1") is True
+        assert resumed_mgr._session_map.get("thread1") == "old-full-history-sid"
+        assert resumed_mgr.commit_provider_switch_replay_sid("thread1") is True
+        assert resumed_mgr.provider_switch_replay_pending("thread1") is False
+        assert resumed_mgr._session_map.get("thread1") == "fresh-replayed-sid"
+        await resumed_mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_generic_load_recovery_promotes_fresh_sid_immediately(
+        self, cfg, monkeypatch, tmp_path
+    ):
+        from kiro_crew.acp.types import PROVIDER_LABEL_DEFAULT
+        from kiro_crew.providers.acp import AcpProvider
+
+        def factory(session_key=None, agent=None, channel_id=None, **kwargs):
+            provider = object.__new__(AcpProvider)
+            provider._private_memory = False
+            provider._private_memory_session_key = session_key
+            provider._private_memory_prepared = False
+            provider._client = MagicMock()
+            provider._client._session_id = "fresh-recovery-sid"
+            provider._client._work_dir = "/new-workspace"
+            provider._client._pid = None
+            provider._client.backend = ACP_BACKEND_KIRO
+            provider._client.resumed = False
+            provider._client.set_resume_session_id = MagicMock()
+            provider._history_replay_needed = True
+            provider._defer_replay_sid_promotion = False
+            provider.start = AsyncMock()
+            provider.shutdown = AsyncMock()
+            provider.context_usage_pct = MagicMock(return_value=0.0)
+            return provider
+
+        native_sessions = tmp_path / "native-sessions"
+        native_sessions.mkdir()
+        for sid, content in (
+            ("old-full-history-sid", "prior history"),
+            ("fresh-recovery-sid", "replayed history"),
+        ):
+            (native_sessions / f"{sid}.json").write_text("{}", encoding="utf-8")
+            (native_sessions / f"{sid}.jsonl").write_text(
+                f'{{"role":"user","content":"{content}"}}\n',
+                encoding="utf-8",
+            )
+        monkeypatch.setattr(
+            "kiro_crew.session_map._kiro_sessions_dir",
+            lambda: native_sessions,
+        )
+
+        mgr = SessionManager(cfg, provider_factory=factory)
+        mgr._session_map.set(
+            "thread1",
+            "old-full-history-sid",
+            provider=PROVIDER_LABEL_DEFAULT,
+            cwd="/old-workspace",
+        )
+
+        await mgr.get_or_create("thread1")
+
+        assert mgr.provider_switch_replay_pending("thread1") is True
+        assert mgr._session_map.get("thread1") == "fresh-recovery-sid"
+        await mgr.close_all()
+
+        reloaded_mgr = SessionManager(cfg, provider_factory=factory)
+        assert reloaded_mgr._session_map.get("thread1") == "fresh-recovery-sid"
+        await reloaded_mgr.close_all()
 
 
 class TestIneffectiveCompactionCooldown:

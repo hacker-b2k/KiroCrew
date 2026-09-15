@@ -1390,15 +1390,13 @@ class TestErrorCodes:
     def test_the_ratchet_can_actually_fail(self) -> None:
         """Self-check: a scan matching nothing would pass the assertion above vacuously.
 
-        20, not the 21 this pinned before the owner-denial migration. The
-        non-owner ``403`` is not written out here: its ``{"error":
+        20 = the count pinned after the owner-denial migration. The earlier drop
+        from 21: the non-owner ``403`` is not written out here — its ``{"error":
         "forbidden", "code": "owner_only"}`` body is now produced by
         ``handlers._shared._owner_denial_response``, which the module calls with
         exactly that message and code. The WIRE contract is unchanged -- only the
         literal moved, and it is still coded at its new home, which is why
-        ``test_no_refusal_in_this_module_is_prose_only`` stays empty. The count
-        drops because the scanner is per-file and that site is now in another
-        file.
+        ``test_no_refusal_in_this_module_is_prose_only`` stays empty.
         """
         coded = [f for f in self._findings() if f.bucket == "compliant"]
         assert len(coded) == 20, f"scanner reached {len(coded)} coded sites, expected 20"

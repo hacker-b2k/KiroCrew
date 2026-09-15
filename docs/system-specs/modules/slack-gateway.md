@@ -4,7 +4,18 @@
 
 The Slack integration (`kiro_crew/slack/`) connects KiroCrew to Slack via Socket Mode. DMs are routed through ACP to kiro-cli with real-time streaming and interactive tool approval.
 
+Independently scheduled agent runs admit their exact execution key as durable
+work before provider allocation, publishing its privacy mode in the existing
+protected runtime-policy tree. Single and sequential-agent paths share that
+admission, so first-turn child creation does not require a dashboard slot or a
+previous transcript. A damaged committed mode refuses allocation; a key prefix
+alone never grants a mode. Origin-chat injection keeps the chat's own policy.
+
 Startup wires memory objects behind one gateway-lifetime in-process barrier.
+Both dashboard and API-only servers receive the orchestrator's existing context
+builder. Post-bind workflow initialization uses that same object for essentials
+and store-bound context; it does not construct a second memory stack or add
+pre-bind memory reads.
 After the dashboard binds, one tracked worker activates pending V1 and V2 restores before opening any memory database or
 markdown/FTS store. It clears a previous gateway's cached handles, initializes the
 already-wired Global store and rebuilds FTS before releasing memory access.
@@ -672,6 +683,36 @@ in-flight claim, and calls the Slack/Discord or dashboard adapter only for
 `WAKE_ACTIONABLE`. The adapter receives the already formatted envelope and does
 not add the legacy cycle tag. Every non-actionable, retry, and terminal decision
 dispatches zero turns.
+
+A Slack message routed into a linked dashboard slot retains channel provenance on
+the immediate turn, queue entries, and recovery turns. A monitor directive produced
+there persists `channel` as its creation surface even though its storage binding is
+the linked chat key, so the link cannot confer dashboard owner credentials on its
+provider probes.
+
+Terminal observer notifications are deduplicated for structured monitors within
+one gateway process. The retained monitor record also stores whether the dashboard
+durably appended its terminal notice. Startup schedules every terminal notice without
+that delivery marker as a supervised background task, so notification persistence
+cannot delay gateway readiness. The task persists the marker only after the captured
+notification append future succeeds, giving the persist-then-notify boundary at-least-once crash
+semantics: a crash or append failure can repeat a notice, but cannot suppress the
+only notice permanently. A failed notification creation or append releases the
+process-local deduplication claim, allowing a later observer event to retry without
+requiring a gateway restart. Gated
+legacy loops use only their existing `expired` notification; the following `fired`
+event must not deliver the same terminal notification again.
+Terminal notices identify the watched pull request by its stored target URL,
+including channel-bound watches with no dashboard jump link. The completed body,
+including the retained target, passes through shared URL and credential redaction
+before dashboard notification persistence. The stored stop
+reason distinguishes a merged pull request from one ready for review: only a
+merge says no action is needed. A `pull_request_closed` blocker states that the
+pull request was closed unmerged and offers reopen-or-abandon recovery. Other
+known blockers name the credentials, permission, setup, approval, completion,
+conversation, or saved-record problem; unknown reasons point to retained details
+without guessing that the pull request closed. An unavailable-session notice
+directs the operator to start a new watch from an active conversation.
 
 Slack's structured inline nudge runs through `TurnDriver` with the shared,
 session-bound directive consumer. Genuine core-MCP `monitor_update`,

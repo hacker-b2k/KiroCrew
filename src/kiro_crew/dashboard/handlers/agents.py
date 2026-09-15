@@ -41,6 +41,7 @@ from kiro_crew.agent import (
     install_agent,
     kiro_agents_dir_path,
 )
+from kiro_crew.agent_capabilities import CapabilityError, require_unmanaged_template
 from kiro_crew.agent_discovery import (
     _read_agent_spec,
     clear_list_agents_cache,
@@ -121,6 +122,7 @@ from kiro_crew.memory_stores import (
     UnknownMemoryStore,
     archive_member_memory_store,
     memory_store_binding_defect,
+    memory_store_namespace_lock,
     persist_member_config,
     provision_member_memory,
     require_member_memory_not_archived,
@@ -947,6 +949,20 @@ def _commit_agent_config_locked(
     # decides namespaced names PRESENT in a stale one. Their order is immaterial (see
     # :func:`_drop_unbacked_app_entries`).
     existing = _on_disk_mcp_servers(installed_path)
+    # The GET masks every ``oauth.clientSecret``; an editor round-trips the
+    # marker. Restore it from the SAME on-disk read the merge below uses, so the
+    # value written back is the one this locked unit observed -- a rotation
+    # that landed during the flock wait is what gets kept, never a snapshot
+    # taken in the handler before the lock. A marker with no on-disk value is
+    # dropped rather than written.
+    from kiro_crew.mcp_utils import restore_redacted_oauth_client_secrets
+
+    restored = restore_redacted_oauth_client_secrets(
+        config, {"mcpServers": existing} if isinstance(existing, dict) else {}
+    )
+    if isinstance(restored.get("mcpServers"), dict):
+        # In place: the caller and every step below hold THIS dict.
+        config["mcpServers"] = restored["mcpServers"]
     dropped = _drop_unbacked_app_entries(config, existing)
     if dropped:
         # WARNING, not info: the client submitted these and they are not being
@@ -1020,6 +1036,11 @@ async def api_agent_config(request: web.Request) -> web.Response:
         config = body.get("config")
         if not isinstance(config, dict):
             return web.json_response({"error": "config must be an object"}, status=400)
+        # The GET above masks every ``oauth.clientSecret``. The marker an editor
+        # sends back is restored inside the locked commit unit
+        # (``_commit_agent_config_locked``), adjacent to the on-disk read it
+        # feeds -- not here, where a read would both block the loop and take a
+        # baseline a concurrent rotation could make stale before the lock.
         try:
             # ── THE INVARIANT THIS BRANCH ENFORCES ────────────────────────────
             # Every validation completes BEFORE the first durable write, and the
@@ -1233,7 +1254,12 @@ async def api_agent_config(request: web.Request) -> web.Response:
         data = json.loads(agent_config_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         data = {}
-    return web.json_response(data)
+    # A pre-registered Connections client projects its secret into the installed
+    # spec for kiro-cli; this read is not kiro-cli, and any dashboard subject can
+    # make it. Mask the value (the PUT branch restores the marker from disk).
+    from kiro_crew.mcp_utils import redact_oauth_client_secrets
+
+    return web.json_response(redact_oauth_client_secrets(data))
 
 
 async def api_default_agent(request: web.Request) -> web.Response:
@@ -2204,6 +2230,12 @@ async def api_models(request: web.Request) -> web.Response:
         # cron and the liveness heartbeat on exactly the host where the probe is
         # slowest. Both reads run in the worker, so the mode is resolved there
         # too rather than passed in.
+        #
+        # A remote hub proxying this endpoint budgets its WHOLE cold path (the
+        # sandbox detection above plus the list-models subprocess below) via
+        # DEFAULT_MODELS_CAPABILITY_PROXY_TIMEOUT_SECS in
+        # kiro_crew/instances/constants.py — growing any bound here means
+        # moving that constant with it.
         argv, cleanup = await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(), _wrap_list_models_argv, argv
         )
@@ -2556,6 +2588,12 @@ def _rebind_crew_locked(
                     raise FileNotFoundError(new_target)
         if entry.get("kiro_agent") == new_target:
             return None
+        try:
+            require_unmanaged_template(entry.get("kiro_agent", ""))
+        except CapabilityError as exc:
+            if exc.code == "capabilities_editor_required" and exc.status == 409:
+                raise _StaleBinding() from None
+            raise
         # Checked INSIDE the critical section, like the staleness check: a
         # fork recording lineage after a handler's pre-validation must not
         # slip another crew's private copy into this binding.
@@ -2964,6 +3002,12 @@ async def api_agent_publish(request: web.Request) -> web.Response:
             {"error": f"'{new_name}' is reserved", "code": "template_name_reserved"}, status=400
         )
 
+    from kiro_crew.dashboard.handlers.agent_capabilities import inherited_template_action
+
+    inherited = await inherited_template_action(request, crew, "publish", new_name)
+    if inherited is not None:
+        return inherited
+
     state: DashboardState = request.app["state"]
     async with _get_config_lock():
         agents_dir = kiro_agents_dir_path()
@@ -3167,6 +3211,9 @@ async def api_agent_publish(request: web.Request) -> web.Response:
 
         try:
             await asyncio.to_thread(_rebind_crew_locked, crew, (name, source_name), new_name)
+        except CapabilityError as exc:
+            await asyncio.to_thread(_undo_publish)
+            return web.json_response({"error": exc.code, "code": exc.code}, status=exc.status)
         except _StaleBinding:
             await asyncio.to_thread(_undo_publish)
             return web.json_response(
@@ -3292,6 +3339,15 @@ async def api_agent_detail(request: web.Request) -> web.Response:
         try:
             if data.get("name") == name or f.stem == name:
                 if request.method == "PATCH" and patch_body is not None:
+                    try:
+                        # Either lookup spelling can resolve this same file; a
+                        # hand-edited name cannot hide its enrolled stem.
+                        for identity in dict.fromkeys((f.stem, spec_str(data, "name") or f.stem)):
+                            await asyncio.to_thread(require_unmanaged_template, identity)
+                    except CapabilityError as exc:
+                        return web.json_response(
+                            {"error": exc.code, "code": exc.code}, status=exc.status
+                        )
                     if "skills" in patch_body:
                         raw_skills = patch_body["skills"]
                         if not isinstance(raw_skills, list) or not all(
@@ -3384,36 +3440,6 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                                 state,
                                 _read_session_key(request),
                             )
-                        if "model" in patch_body:
-                            # Stored verbatim (canonical key); translated to a
-                            # provider id at the config.loader factory boundary.
-                            data["model"] = patch_body["model"] or None
-                            if data["model"] is None:
-                                # Cleared/auto: resume tracking the shipped
-                                # default (re-synced by _refresh_dynamic_fields).
-                                # Shared with `kirocrew agent reset-model` so the
-                                # two surfaces cannot disagree on what clearing a
-                                # model means. Offloaded: it writes the sidecar
-                                # under the blocking cross-process lock.
-                                await asyncio.to_thread(clear_model_pin, data, agent_name)
-                            else:
-                                # Explicit pick: freeze it against default bumps.
-                                await asyncio.to_thread(
-                                    agent_state.set_model_managed, agent_name, False
-                                )
-                        # Never persist Kiro Crew bookkeeping into the kiro spec —
-                        # kiro-cli rejects unknown fields and drops the agent. Same
-                        # shared helper as the PUT handler and migrate_agent_specs(),
-                        # so this fourth writer can't drift from the other three.
-                        # The model branch above may have just set the
-                        # sidecar explicitly; the helper only lifts a stale key out
-                        # of `data` when the sidecar is still unset, so it can't
-                        # clobber that just-written value. Offloaded like the PUT
-                        # handler: the helper does synchronous sidecar read/write
-                        # filesystem work that would stall the event loop.
-                        await asyncio.to_thread(
-                            agent_state.lift_and_strip_bookkeeping, data, agent_name
-                        )
 
                         def _locked_overwrite() -> None:
                             # Same spec lock as fork/publish and the background
@@ -3432,6 +3458,20 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                                 )
                                 if fresh is None:
                                     raise FileNotFoundError(f)
+                                # Check the file stem AND its fresh declared name
+                                # before ALL bookkeeping; the earlier name can be
+                                # stale. Keep the spec -> sidecar lock order.
+                                for identity in dict.fromkeys(
+                                    (f.stem, spec_str(fresh, "name") or f.stem)
+                                ):
+                                    require_unmanaged_template(identity)
+                                if "model" in patch_body:
+                                    data["model"] = patch_body["model"] or None
+                                    if data["model"] is None:
+                                        clear_model_pin(data, agent_name)
+                                    else:
+                                        agent_state.set_model_managed(agent_name, False)
+                                agent_state.lift_and_strip_bookkeeping(data, agent_name)
                                 for key, value in data.items():
                                     if key not in before_patch or before_patch[key] != value:
                                         fresh[key] = value
@@ -3447,6 +3487,10 @@ async def api_agent_detail(request: web.Request) -> web.Response:
 
                         try:
                             await asyncio.to_thread(_locked_overwrite)
+                        except CapabilityError as exc:
+                            return web.json_response(
+                                {"error": exc.code, "code": exc.code}, status=exc.status
+                            )
                         except FileNotFoundError:
                             return web.json_response(
                                 {
@@ -3475,9 +3519,14 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                     state,
                     _read_session_key(request),
                 )
+                # The spec is otherwise passed through verbatim, so mask the one
+                # value in it that is a credential (a pre-registered Connections
+                # client's projected secret); this read is not owner-gated.
+                from kiro_crew.mcp_utils import redact_oauth_client_secrets
+
                 return web.json_response(
                     {
-                        **data,
+                        **redact_oauth_client_secrets(data),
                         # The rest of the spec is passed through verbatim, but
                         # these two are CONSUMED as display text by the detail
                         # panel. A foreign spec's structured value rendered as a
@@ -3647,10 +3696,11 @@ def _roster_avatar(value: object) -> dict:
 
     **A shape allowlist, with masking confined to the leaves that can carry user
     text.** ``_safe_avatar`` is the config's own validator, so only
-    ``{"kind": "ghost", "traits": {...}}``, ``{"kind": "image", "v": ...,
-    "file": "<digest>.<ext>"}`` and ``{"kind": "pack", "id": "<pack id>"}`` survive
-    and junk collapses to ``{}``. Within that,
-    ONLY ``traits`` values are masked:
+    ``{"kind": "ghost", "traits": {...}, "motions": {...}, "sounds": {...},
+    "expressions": {...}}``,
+    ``{"kind": "image", "v": ..., "file": "<digest>.<ext>", "sounds": {...}}`` and
+    ``{"kind": "pack", "id": "<pack id>", "sounds": {...}}`` survive and junk
+    collapses to ``{}``. Within that, ONLY ``traits`` values are masked:
 
     - ``kind`` and ``v`` are structural. Mask ``kind`` and the dashboard can no
       longer tell a ghost from an uploaded picture.
@@ -3659,13 +3709,14 @@ def _roster_avatar(value: object) -> dict:
       one: the pin REFUSES a bad value where masking would destroy a good one, and
       a masked ``file`` makes the per-crew avatar endpoint resolve nothing --
       silently breaking the image.
-    - ``traits`` values, and the ``eyes``/``mouth`` values of each
+    - ``traits`` values, and the ``eyes``/``mouth`` values of each ghost
       ``expressions`` state, are the only user-authored strings here, so they go
       through ``_roster_mask`` like any other roster string. The renderer resolves
       an unrecognized trait to absent (``EYES[k] ?? ''``), so a masked trait
       degrades that axis rather than breaking the face.
-    - ``sounds`` values are constrained by ``_safe_sounds`` to a shipped preset
-      name, so they are pinned rather than masked -- the same reason ``file`` is.
+    - ``motions`` and ``sounds`` values are constrained by ``_safe_motions`` and
+      ``_safe_sounds`` to a shipped animation or preset name, so they are pinned
+      rather than masked -- the same reason ``file`` is.
     - ``id`` (on ``kind: "pack"``) is pinned by
       ``appearance_packs.safe_pack_id`` to letters, digits, dash and underscore,
       so it is not arbitrary text either — and masking it would make the pack
@@ -4129,19 +4180,20 @@ async def _do_agents_sync(request: web.Request) -> web.Response:
                             changed = True
                     return doc if changed else None
 
-                try:
-                    update_config_locked(mutate=_mutate)
-                except BaseException:
-                    for store_name, owner in reversed(created_archives):
-                        try:
-                            rollback_member_memory_archive_if_active(store_name, owner)
-                        except Exception:
-                            logger.error(
-                                "failed to roll back member memory retirement for %s",
-                                store_name,
-                                exc_info=True,
-                            )
-                    raise
+                with memory_store_namespace_lock():
+                    try:
+                        update_config_locked(mutate=_mutate)
+                    except BaseException:
+                        for store_name, owner in reversed(created_archives):
+                            try:
+                                rollback_member_memory_archive_if_active(store_name, owner)
+                            except Exception:
+                                logger.error(
+                                    "failed to roll back member memory retirement for %s",
+                                    store_name,
+                                    exc_info=True,
+                                )
+                        raise
                 from kiro_crew.context import release_cached_memory_store
 
                 for store_name, owner in skipped_allocations:
@@ -4535,7 +4587,7 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
     if _raw_avatar not in (None, {}) and not avatar and not _is_ghost_shaped(_raw_avatar):
         return web.json_response(
             {
-                "error": "avatar must be {'kind': 'ghost', 'traits': {...}}, {'kind': 'image'}, {'kind': 'pack', 'id': ...}, or empty",
+                "error": "avatar must be {'kind': 'ghost', 'traits'/'motions'/'sounds': {...}}, {'kind': 'image'}, {'kind': 'pack', 'id': ...}, or empty",
                 "code": "invalid_avatar",
             },
             status=400,
@@ -4776,6 +4828,8 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         try:
             async with _get_config_lock():
                 await asyncio.to_thread(_rebind_crew_locked, name, expected, new_target)
+        except CapabilityError as exc:
+            return web.json_response({"error": exc.code, "code": exc.code}, status=exc.status)
         except _StaleBinding:
             return web.json_response(
                 {
@@ -4856,6 +4910,11 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                     {"error": model_reason, "code": "invalid_model"}, status=400
                 )
         agent = cfg.agents[name]
+        if "kiro_agent" in body and body["kiro_agent"] != agent.kiro_agent:
+            try:
+                await asyncio.to_thread(require_unmanaged_template, agent.kiro_agent)
+            except CapabilityError as exc:
+                return web.json_response({"error": exc.code, "code": exc.code}, status=exc.status)
         prior_memory_store = agent.memory_store
         if "memory_store" in body and body["memory_store"] != prior_memory_store:
             return web.json_response(
@@ -4950,12 +5009,13 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             if _raw_av not in (None, {}) and not _av and not _is_ghost_shaped(_raw_av):
                 return web.json_response(
                     {
-                        "error": "avatar must be {'kind': 'ghost', 'traits': {...}}, {'kind': 'image'}, {'kind': 'pack', 'id': ...}, or empty",
+                        "error": "avatar must be {'kind': 'ghost', 'traits'/'motions'/'sounds': {...}}, {'kind': 'image'}, {'kind': 'pack', 'id': ...}, or empty",
                         "code": "invalid_avatar",
                     },
                     status=400,
                 )
             _av = _carry_pack_through_faceless_save(agent.avatar, _raw_av, _av)
+            _av = _carry_motions_through_motionless_save(agent.avatar, _raw_av, _av)
             if _av.get("kind") == "image":
                 # THE commit point for pictures, under this same config lock.
                 # `promote` is a wire-only directive (never persisted — the
@@ -5018,10 +5078,11 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                         status=400,
                     )
                 # Rebuilt, not mutated, so the record carries exactly the
-                # committed stamp and pin. The per-state keys are validated
-                # input rather than commit output, so they have to be carried
-                # across explicitly -- otherwise saving a sound on a crew that
-                # wears a picture reports success and stores nothing.
+                # committed stamp and pin. The cue is validated INPUT rather than
+                # commit output, so it has to be carried across explicitly --
+                # otherwise saving a sound on a crew that wears a picture reports
+                # success and stores nothing. `motions` is not carried: the
+                # validator drops it on this tier, so there is never one here.
                 _av = {
                     "kind": "image",
                     "v": stamp,
@@ -5132,6 +5193,7 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
         created_archive = False
         retired_store = ""
 
+        @memory_store_namespace_lock()
         def _delete_member() -> tuple[str, bool]:
             nonlocal created_archive, retired_store
 
@@ -5230,9 +5292,11 @@ def _carry_pack_through_faceless_save(stored: dict, raw: object, validated: dict
     submits ``{}`` or a faceless ``{"kind": "ghost", "sounds": ...}``. Taken at
     face value that is "reset", and the pack the user chose through the API is
     gone with no click that meant it. Until the picker can show a pack, a save
-    that names no face therefore keeps the pack it found, and the reactions the
-    save DID carry ride onto it -- so editing a sound on a pack-wearing crew
-    stores the sound and keeps the pack.
+    that names no face therefore keeps the pack it found, and the cue the save
+    DID carry rides onto it -- so editing a sound on a pack-wearing crew stores
+    the sound and keeps the pack. ``motions`` never rides along: the validator
+    drops it on this tier, so a faceless ghost save carries none by the time this
+    is reached.
 
     Deliberately narrow:
 
@@ -5247,10 +5311,43 @@ def _carry_pack_through_faceless_save(stored: dict, raw: object, validated: dict
         return validated
     kind = validated.get("kind")
     if kind is None or (kind == "ghost" and "traits" not in validated):
-        kept = {"kind": "pack", "id": stored["id"]}
+        kept: dict = {"kind": "pack", "id": stored["id"]}
         kept.update({k: v for k, v in validated.items() if k in ("expressions", "sounds")})
         return kept
     return validated
+
+
+def _carry_motions_through_motionless_save(stored: dict, raw: object, validated: dict) -> dict:
+    """Keep a ghost's stored ``motions`` when a ghost save says nothing about them.
+
+    ``motions`` is the one reaction key the shipped crew editor does not know:
+    it rebuilds a ghost draft from the axes it can draw (``traits``,
+    ``expressions``, ``sounds``) and submits exactly those, so a ghost that was
+    given motions through the API would lose them on the next unrelated save --
+    a model change, a colour -- with no click that meant it. The same shape as
+    :func:`_carry_pack_through_faceless_save`, and for the same reason: a save
+    from a client that cannot see a value is not a decision about it.
+
+    The rule is the tri-state ``save_pack`` already applies to a pack's cues.
+    A payload with NO ``motions`` key leaves the stored ones alone; a payload
+    that names the key -- ``{}`` included -- is the caller's statement and
+    replaces them. So a client that knows the key can still clear it, and one
+    that does not cannot destroy it.
+
+    Deliberately narrow: only when the stored record AND the validated save are
+    both ghosts. A tier change (picture, pack) is a real face replacing the old
+    one and ``motions`` is the ghost's alone; a reset (``None``, ``{}``, or the
+    validator's all-empty collapse) means reset. Both keep their existing
+    semantics untouched.
+    """
+    if stored.get("kind") != "ghost" or validated.get("kind") != "ghost":
+        return validated
+    kept = stored.get("motions")
+    if not isinstance(kept, dict) or not kept:
+        return validated
+    if not isinstance(raw, dict) or "motions" in raw:
+        return validated
+    return {**validated, "motions": kept}
 
 
 def _is_ghost_shaped(value: object) -> bool:
@@ -5714,23 +5811,6 @@ async def api_kirocrew_agent_avatar_upload(request: web.Request) -> web.Response
     return web.json_response({"ok": True, "staged": True, "token": _staging_token(bytes(data))})
 
 
-# ── Conductor skill regeneration ────────────────────────────────────
-
-
-def _regen_conductor() -> None:
-    """Regenerate conductor skill after metadata or agent roster changes."""
-    try:
-        cfg = KiroCrewConfig.load()
-        if not cfg.agent.conductor_skill:
-            return
-        from kiro_crew.conductor_skill import generate_conductor_skill  # noqa: F811
-        from kiro_crew.skills import SkillsLoader  # noqa: F811
-
-        generate_conductor_skill(SkillsLoader())
-    except Exception:
-        logger.exception("Failed to regenerate conductor skill")
-
-
 async def api_agent_reset(request: web.Request) -> web.Response:
     """POST /api/agents/detail/{name}/reset — discard a crew's private copy.
 
@@ -5752,6 +5832,12 @@ async def api_agent_reset(request: web.Request) -> web.Response:
     crew = body.get("crew") if isinstance(body, dict) else None
     if not isinstance(crew, str) or not crew:
         return web.json_response({"error": "crew is required", "code": "crew_required"}, status=400)
+
+    from kiro_crew.dashboard.handlers.agent_capabilities import inherited_template_action
+
+    inherited = await inherited_template_action(request, crew, "reset")
+    if inherited is not None:
+        return inherited
 
     state: DashboardState = request.app["state"]
     async with _get_config_lock():
@@ -5796,6 +5882,8 @@ async def api_agent_reset(request: web.Request) -> web.Response:
         origin_path = _path
         try:
             await asyncio.to_thread(_rebind_crew_locked, crew, (name,), origin_name, origin_path)
+        except CapabilityError as exc:
+            return web.json_response({"error": exc.code, "code": exc.code}, status=exc.status)
         except FileNotFoundError:
             # The origin vanished between validation and the rebind's critical
             # section (a cross-process delete): rebinding would leave the crew

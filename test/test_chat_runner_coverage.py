@@ -145,6 +145,8 @@ def _runner_state(tmp_path, *, hook_store=None, context_builder=None):
     client._client = client
     client.exit_code = None
     state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+    state.sessions.consume_replay_suppression = MagicMock(return_value=False)
+    state.sessions.consume_needs_reinjection = MagicMock(return_value=False)
     state._hook_store = hook_store or MagicMock(fire=AsyncMock(return_value=[]))
     if context_builder is not None:
         state.context_builder = context_builder
@@ -2438,7 +2440,9 @@ class TestScheduleEagerSpawn:
 
 class TestCapArmedPrefetches:
     @pytest.mark.asyncio
-    async def test_eviction_failure_still_drops_the_registry_entry(self, tmp_path):
+    async def test_eviction_failure_keeps_the_registry_entry(self, tmp_path):
+        """A removal that raises leaves its entry registered: the process is
+        still live, so it still counts, and the next eviction retries it."""
         state = _state(tmp_path)
         state.sessions.remove_if_unclaimed = AsyncMock(side_effect=RuntimeError("shutdown hung"))
         chat_runner._armed_prefetches.clear()
@@ -2446,8 +2450,15 @@ class TestCapArmedPrefetches:
             for i in range(chat_runner._RESUME_PREFETCH_MAX_LIVE + 1):
                 await chat_runner._cap_armed_prefetches(state.sessions, f"key-{i}")
 
-            assert len(chat_runner._armed_prefetches) == chat_runner._RESUME_PREFETCH_MAX_LIVE
+            assert len(chat_runner._armed_prefetches) == chat_runner._RESUME_PREFETCH_MAX_LIVE + 1
+            assert "key-0" in chat_runner._armed_prefetches
+            # Only the oldest is attempted per pass; a failure stops the pass.
+            assert state.sessions.remove_if_unclaimed.await_count == 1
+
+            state.sessions.remove_if_unclaimed = AsyncMock(return_value=True)
+            await chat_runner._cap_armed_prefetches(state.sessions, "newest")
             assert "key-0" not in chat_runner._armed_prefetches
+            assert len(chat_runner._armed_prefetches) == chat_runner._RESUME_PREFETCH_MAX_LIVE
         finally:
             chat_runner._armed_prefetches.clear()
 
@@ -4556,13 +4567,7 @@ class TestAppAgentDispatchGuard:
 
 
 class TestPromptSubmitTranscriptRead:
-    """The re-injection probe's transcript read must not run on the loop.
-
-    ``_run_chat`` compares the in-memory message count against the on-disk one to
-    decide whether a reset session needs its history re-injected. That disk count
-    comes from ``read_messages``, which parses the whole transcript -- 100-300 ms
-    on a large store, on the hottest path there is.
-    """
+    """The canonical replay's transcript read must not run on the loop."""
 
     @pytest.mark.asyncio
     async def test_disk_count_read_runs_off_the_loop_thread(self, tmp_path, monkeypatch):
@@ -4573,13 +4578,13 @@ class TestPromptSubmitTranscriptRead:
         # branch holding the read is skipped and the test would pass vacuously.
         slot.append("user", "an earlier turn", "msg msg-u")
         seen: list[int] = []
-        real_read = ConversationLog.read_messages
+        real_read = ConversationLog.read_messages_chained
 
         def recording(self, key):  # noqa: ANN001 -- test double
             seen.append(threading.get_ident())
             return real_read(self, key)
 
-        monkeypatch.setattr(ConversationLog, "read_messages", recording)
+        monkeypatch.setattr(ConversationLog, "read_messages_chained", recording)
 
         await _drive(state, slot, "hello")
 

@@ -33,7 +33,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, Check, ChevronRight, Circle, Clock, ExternalLink, Goal, MessageCircleQuestionMark, Pencil, Route, Star, UserPlus, Users, Webhook, Zap } from 'lucide-react'
+import { ArrowLeft, Check, ChevronRight, Circle, Clock, ExternalLink, Goal, MessageCircleQuestionMark, Pencil, Route, Square, Star, UserPlus, Users, Webhook, Zap } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { useTranslation } from 'react-i18next'
 import { api, type MemberRosterRow, type WebhookTokenEntry } from '../../api/client'
@@ -61,6 +61,7 @@ import { usePersistedString } from '../../hooks/usePersistedString'
 import { findReport, type ErrorReport } from '../../utils/errorReport'
 import { useAppDispatch, useAppSelector } from '../../store'
 import { markSlotRead } from '../../store/dashboardSlice'
+import { emitSlotRead } from '../../lib/slotReadRelay'
 import CrewAvatar from '../../components/CrewAvatar'
 import CrewStateAvatar from '../../components/CrewStateAvatar'
 import ChatPane from '../../components/ChatPane'
@@ -1023,9 +1024,39 @@ export default function MembersPage() {
   const activeSlotUnread = useAppSelector(
     (s) => !!activeSlot && s.dashboard.unreadSlots.includes(activeSlot),
   )
+  const activeSlotLastTs = useAppSelector(
+    (s) => (activeSlot ? s.dashboard.slots.find(sl => sl.key === activeSlot)?.last_ts : undefined),
+  )
+  // Reactive document visibility AND focus, so the read effect below re-runs
+  // when the user returns to a hidden tab or focuses the window — a plain
+  // document.hidden read would leave the effect settled and the reveal
+  // unnoticed, and Page Visibility alone calls occluded/unfocused windows
+  // "visible", which would let a parked window mark threads read.
+  const [pageVisible, setPageVisible] = useState(() => !document.hidden && document.hasFocus())
   useEffect(() => {
-    if (activeSlot && activeSlotUnread) dispatch(markSlotRead(activeSlot))
-  }, [activeSlot, activeSlotUnread, dispatch])
+    const onVis = () => setPageVisible(!document.hidden && document.hasFocus())
+    document.addEventListener('visibilitychange', onVis)
+    window.addEventListener('focus', onVis)
+    window.addEventListener('blur', onVis)
+    return () => {
+      document.removeEventListener('visibilitychange', onVis)
+      window.removeEventListener('focus', onVis)
+      window.removeEventListener('blur', onVis)
+    }
+  }, [])
+  useEffect(() => {
+    // Viewing the thread is the read — but only a VISIBLE view is a view. A
+    // hidden member tab neither clears its own badge nor relays one; on
+    // reveal this effect re-runs via pageVisible and does both. The relay is
+    // NOT gated on this window's own badge: this window may have read the
+    // thread earlier (locally clean) while another window's badge is still
+    // lit, and a visible view here retires that too. Throttled per slot by
+    // the relay module; watermarked at the slot's newest known message ts.
+    if (activeSlot && pageVisible) {
+      if (activeSlotUnread) dispatch(markSlotRead(activeSlot))
+      emitSlotRead(activeSlot, activeSlotLastTs)
+    }
+  }, [activeSlot, activeSlotUnread, pageVisible, activeSlotLastTs, dispatch])
 
   // Per-row unread marker: the rail badge says "1", this says WHICH member.
   // Keyed the same way isRunning resolves a member's slot (thread-endpoint
@@ -1662,9 +1693,28 @@ export default function MembersPage() {
                   <span className={`block ${ROW_TITLE_CLS} font-semibold text-text truncate`}>{m.name}</span>
                   {/* Last-message preview, like a session row — presence
                       already rides the avatar dot, so a textual Idle/Working
-                      label said nothing the dot did not. */}
-                  <span className={`block ${ROW_STATUS_CLS} text-muted truncate`}>
-                    {m.last_message || '\u00a0'}
+                      label says nothing the dot does not. A "Stopped" chip
+                      leads the preview when the thread's NEWEST event is a
+                      Stop press: the server skips the stop card's JSON, so the
+                      preview is the last conversational line, which reads as
+                      ongoing work on a thread the user has stopped — the chip
+                      is the honest marker over it. It is localized HERE, not
+                      sent as a word from the server, whose preview is computed
+                      without the client's locale. The chip is `shrink-0` so
+                      the preview, not the label, is what truncates. The server
+                      flag is false once a newer real message lands, so the chip
+                      cannot outlive the stop. */}
+                  <span className={`flex items-center gap-1 ${ROW_STATUS_CLS} text-muted min-w-0`}>
+                    {m.last_message_stopped && (
+                      <span
+                        className="inline-flex items-center gap-0.5 shrink-0 font-medium text-danger"
+                        data-testid="member-stopped-indicator"
+                      >
+                        <Square size={9} fill="currentColor" className="lucide-inline" aria-hidden="true" />
+                        {t('pages.membersPage.stopped_indicator')}
+                      </span>
+                    )}
+                    <span className="block truncate min-w-0">{m.last_message || '\u00a0'}</span>
                   </span>
                 </span>
                 {/* Unread marker on the row's right edge — the IM convention

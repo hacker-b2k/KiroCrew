@@ -1,7 +1,9 @@
 """V2 keeps actual essential sources complete through every provider lifecycle."""
 
 import json
+import os
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -27,6 +29,17 @@ from kiro_crew.skills import SkillsLoader
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
+    home = tmp_path / "host-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("KIRO_HOME", str(home / ".kiro"))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    # The host floor pins these hooks separately from the lazy KIRO_HOME path.
+    # Keep template readers on the same test-owned root as template writers.
+    agents = home / ".kiro" / "agents"
+    monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents)
+    monkeypatch.setattr("kiro_crew.agent_discovery._KIRO_AGENTS_DIR", agents)
     cfg = KiroCrewConfig.load()
     cfg.agents["writer"] = KiroCrewAgentConfig(
         kiro_agent="writer-template", description="A careful bilingual writer"
@@ -46,6 +59,11 @@ def env(tmp_path, monkeypatch):
         ),
         encoding="utf-8",
     )
+    for template in ("critic-runtime", "task-template"):
+        (project / ".kiro" / "agents" / f"{template}.json").write_text(
+            json.dumps({"name": template, "prompt": "Execution task instructions."}),
+            encoding="utf-8",
+        )
     for path, body in {
         "AGENTS.md": "Project rules: run the review checks.",
         "SOUL.md": "Project Soul: write with empathy.",
@@ -359,6 +377,64 @@ def test_literal_steering_prefix_does_not_enumerate_unrelated_project_root(env, 
     assert env.project / ".kiro/steering/always.md" in paths
 
 
+@requires_symlinks
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows refuses a linked ANCESTOR by design (validate_file_path's "
+    "linked-ancestor gate), so a symlinked declared root is correctly rejected there; "
+    "the $HOME-symlink layout this admits is a POSIX arrangement.",
+)
+def test_matches_admits_a_declared_root_reached_through_a_symlink(env, tmp_path):
+    """A root whose own spelling contains a link must still admit its documents.
+
+    ``validate_file_path`` resolves, so an unresolved root matched nothing and was
+    additionally refused as a linked directory on its first visit. That is the
+    ordinary ``$HOME`` layout on hosts where ``/home/<user>`` links elsewhere,
+    where it refused EVERY essential source for every private member.
+    """
+    from kiro_crew import member_essential_context as essentials
+
+    linked_root = tmp_path / "linked-root"
+    linked_root.symlink_to(env.project, target_is_directory=True)
+    paths = essentials._matches(linked_root, ".kiro/steering/**/*.md")
+    assert any(path.name == "always.md" for path in paths)
+
+
+@requires_symlinks
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows refuses a linked ANCESTOR by design (validate_file_path's "
+    "linked-ancestor gate), so a symlinked declared root is correctly rejected there; "
+    "the $HOME-symlink layout this admits is a POSIX arrangement.",
+)
+def test_read_admits_a_document_under_a_symlinked_root(env, tmp_path):
+    """The containment check compares real paths, so either spelling admits."""
+    from kiro_crew import member_essential_context as essentials
+
+    linked_root = tmp_path / "linked-root"
+    linked_root.symlink_to(env.project, target_is_directory=True)
+    assert "Project rules" in essentials._read(linked_root / "AGENTS.md", linked_root)
+
+
+@requires_symlinks
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows refuses a linked ANCESTOR by design (validate_file_path's "
+    "linked-ancestor gate), so a symlinked declared root is correctly rejected there; "
+    "the $HOME-symlink layout this admits is a POSIX arrangement.",
+)
+def test_symlinked_root_still_refuses_a_document_outside_it(env, tmp_path):
+    """Normalizing the root's spelling must not widen what the root contains."""
+    from kiro_crew import member_essential_context as essentials
+
+    outside = tmp_path / "outside.md"
+    outside.write_text("OUTSIDE_SECRET", encoding="utf-8")
+    linked_root = tmp_path / "linked-root"
+    linked_root.symlink_to(env.project, target_is_directory=True)
+    with pytest.raises(MemberEssentialContextError, match="outside the admitted document root"):
+        essentials._read(outside, linked_root)
+
+
 def test_owner_cleared_empty_anchors_are_valid_but_missing_source_refuses(env):
     env.memory._preferences_file.write_text("", encoding="utf-8")
     env.memory._projects_file.write_text("", encoding="utf-8")
@@ -433,3 +509,250 @@ def test_linked_directory_is_refused_before_enumerating_outside_sources(env, tmp
         env.builder.build_message(
             "Continue", False, memory_store=env.store, project=str(env.project)
         )
+
+
+def test_refused_workspace_root_is_never_resolved(env, monkeypatch, tmp_path):
+    """A root ``validate_file_path`` refuses (a UNC share on Windows) is not probed.
+
+    ``realpath`` on such a root IS the outbound SMB probe, so the isolation
+    check must compare it lexically instead of resolving it.
+    """
+    from kiro_crew import member_essential_context as mec
+
+    refused = Path("//share-host/ws-share/workspace")
+    real_validate = mec.validate_file_path
+    monkeypatch.setattr(
+        mec,
+        "validate_file_path",
+        lambda raw: None if "share-host" in raw else real_validate(raw),
+    )
+    monkeypatch.setattr(
+        mec.KiroCrewConfig,
+        "load",
+        classmethod(lambda cls: SimpleNamespace(workspaces={"shared": None})),
+    )
+    monkeypatch.setattr(mec, "workspace_dir_for", lambda name: refused)
+    real_realpath = os.path.realpath
+    resolved: list[str] = []
+
+    def recording_realpath(p, *a, **k):
+        resolved.append(str(p))
+        return real_realpath(p, *a, **k)
+
+    monkeypatch.setattr(os.path, "realpath", recording_realpath)
+
+    mec._refuse_managed_source(tmp_path / "project" / "guide.md")
+
+    assert not any("share-host" in p for p in resolved), resolved
+    assert mec._comparable_root(refused) == Path(os.path.abspath(refused))
+
+
+@pytest.mark.parametrize("source", ["package", "development", "user-override"])
+@pytest.mark.parametrize(
+    "fresh, options",
+    [
+        (True, {}),
+        (False, {}),
+        (False, {"needs_reinjection": True}),
+        (True, {"resumed": True}),
+        (True, {"minimal_context": True}),
+    ],
+)
+def test_inherited_product_prompt_uses_session_start_not_essentials(
+    env, tmp_path, monkeypatch, source, fresh, options
+):
+    from kiro_crew import agent
+    from kiro_crew.config import config_dir
+
+    package = tmp_path / "installed-package" / "config"
+    development = tmp_path / "checkout"
+    monkeypatch.setattr(agent, "_BUNDLED_CFG_DIR", package)
+    monkeypatch.setattr(agent, "_project_dir", lambda: development)
+    paths = {
+        "package": package / "prompt.md",
+        "development": development / "agents" / "prompt.md",
+        "user-override": config_dir() / "prompt.md",
+    }
+    prompt_path = paths[source]
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text("PRODUCT_PROMPT_AT_SESSION_START", encoding="utf-8")
+    assert agent._prompt_path() == prompt_path
+    spec = env.project / ".kiro" / "agents" / "writer-template.json"
+    spec.write_text(
+        json.dumps({"name": "writer-template", "prompt": f"file://{prompt_path}"}),
+        encoding="utf-8",
+    )
+
+    message, _ = env.builder.build_message(
+        "Continue", fresh, memory_store=env.store, project=str(env.project), **options
+    )
+
+    assert message.count("[V2 ESSENTIAL CONTEXT") == 1
+    assert "You are writer." in message and "Do not publish drafts." in message
+    assert "Preference anchor" in message and "Project rules" in message
+    assert f"[Essential source: {prompt_path}]" not in message
+    if fresh and not options.get("resumed"):
+        assert message.count("PRODUCT_PROMPT_AT_SESSION_START") == 1
+    env.forbidden.assert_not_called()
+
+
+@pytest.mark.parametrize("template", ["writer-template", "kirocrew"])
+@pytest.mark.parametrize("source", ["inline", "relative", "absolute"])
+def test_custom_persona_is_not_classified_by_template_name(env, template, source):
+    cfg = KiroCrewConfig.load()
+    cfg.agents["writer"].kiro_agent = template
+    cfg.save()
+    persona = env.project / "prompt.md"
+    persona.write_text("CUSTOM_OWNER_PERSONA", encoding="utf-8")
+    prompts = {
+        "inline": "CUSTOM_OWNER_PERSONA",
+        "relative": "file://prompt.md",
+        "absolute": f"file://{persona}",
+    }
+    spec = env.project / ".kiro" / "agents" / f"{template}.json"
+    spec.write_text(json.dumps({"name": template, "prompt": prompts[source]}), encoding="utf-8")
+
+    message, _ = env.builder.build_message(
+        "Continue", False, agent="task-template", memory_store=env.store, project=str(env.project)
+    )
+
+    assert "CUSTOM_OWNER_PERSONA" in message
+    assert "Do not publish drafts." in message
+
+
+@pytest.mark.parametrize("template", ["writer-template", "kirocrew"])
+def test_unmanaged_prompt_outside_root_is_not_exempted_by_name(env, tmp_path, template):
+    cfg = KiroCrewConfig.load()
+    cfg.agents["writer"].kiro_agent = template
+    cfg.save()
+    persona = tmp_path / "prompt.md"
+    persona.write_text("OUTSIDE_PERSONA", encoding="utf-8")
+    spec = env.project / ".kiro" / "agents" / f"{template}.json"
+    spec.write_text(json.dumps({"name": template, "prompt": f"file://{persona}"}), encoding="utf-8")
+
+    with pytest.raises(MemberEssentialContextError, match="outside the admitted document root"):
+        env.builder.build_message(
+            "Continue", False, memory_store=env.store, project=str(env.project)
+        )
+
+
+def test_managed_source_resolves_each_declared_root_once_per_call(tmp_path, monkeypatch):
+    from collections import Counter
+
+    from kiro_crew import member_essential_context as mec
+    from kiro_crew.config.loader import WorkspaceConfig
+
+    cfg = KiroCrewConfig.load()
+    cfg.workspaces["second"] = WorkspaceConfig(dir=str(tmp_path / "second"))
+    cfg.save()
+    original = mec._comparable_root
+    calls = []
+
+    def resolve(root):
+        calls.append(root)
+        return original(root)
+
+    monkeypatch.setattr(mec, "_comparable_root", resolve)
+    mec._refuse_managed_source(mec.config_dir() / "workspace" / "document.txt")
+    first = Counter(calls)
+    assert len(first) >= 4
+    assert set(first.values()) == {1}, first
+    calls.clear()
+    mec._refuse_managed_source(mec.config_dir() / "workspace" / "document.txt")
+    assert Counter(calls) == first, "Every new call must revalidate all roots"
+
+
+@pytest.mark.parametrize("root_index", [0, 1, 2])
+@pytest.mark.parametrize(
+    "leaf",
+    [
+        "members",
+        "member-rules",
+        "member-memory-bindings",
+        "backups",
+        "trust",
+        "memory_stores",
+        "lessons",
+    ],
+)
+def test_managed_source_keeps_every_admin_root_protected(tmp_path, monkeypatch, root_index, leaf):
+    from kiro_crew import member_essential_context as mec
+
+    home = tmp_path / "host"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    roots = [mec.config_dir(), home / ".kiro/crew", home / ".kirocrew"]
+    with pytest.raises(MemberEssentialContextError, match="managed memory/member state"):
+        mec._refuse_managed_source(roots[root_index] / leaf / "record.txt")
+
+
+def test_managed_source_rechecks_workspace_configuration_between_calls(tmp_path):
+    from kiro_crew import member_essential_context as mec
+    from kiro_crew.config.loader import WorkspaceConfig
+
+    candidate = mec.config_dir() / "custom-project" / "guide.txt"
+    cfg = KiroCrewConfig.load()
+    cfg.workspaces["custom"] = WorkspaceConfig(dir=str(candidate.parent))
+    cfg.save()
+    mec._refuse_managed_source(candidate)
+    del cfg.workspaces["custom"]
+    cfg.save()
+    with pytest.raises(MemberEssentialContextError, match="managed memory/member state"):
+        mec._refuse_managed_source(candidate)
+
+
+@pytest.mark.parametrize("placement", ["ancestor", "equal", "protected-child"])
+def test_workspace_overlap_does_not_admit_admin_state(tmp_path, placement):
+    from kiro_crew import member_essential_context as mec
+    from kiro_crew.config.loader import WorkspaceConfig
+
+    admin = mec.config_dir()
+    workspace = {
+        "ancestor": admin.parent,
+        "equal": admin,
+        "protected-child": admin / "member-rules",
+    }[placement]
+    cfg = KiroCrewConfig.load()
+    cfg.workspaces["overlap"] = WorkspaceConfig(dir=str(workspace))
+    cfg.save()
+    with pytest.raises(MemberEssentialContextError, match="managed memory/member state"):
+        mec._refuse_managed_source(admin / "member-rules" / "rule.txt")
+
+
+@requires_symlinks
+@pytest.mark.skipif(
+    os.name == "nt", reason="Windows rejects linked ancestors at the existing path gate"
+)
+def test_managed_source_rechecks_admin_symlink_target_between_calls(tmp_path, monkeypatch):
+    from kiro_crew import member_essential_context as mec
+
+    home = tmp_path / "host"
+    (home / ".kiro").mkdir(parents=True)
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    alias = home / ".kiro" / "crew"
+    alias.symlink_to(first, target_is_directory=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    with pytest.raises(MemberEssentialContextError, match="managed memory/member state"):
+        mec._refuse_managed_source(first / "members" / "record.txt")
+    mec._refuse_managed_source(second / "members" / "record.txt")
+    alias.unlink()
+    alias.symlink_to(second, target_is_directory=True)
+    with pytest.raises(MemberEssentialContextError, match="managed memory/member state"):
+        mec._refuse_managed_source(second / "members" / "record.txt")
+
+
+def test_managed_source_never_resolves_unvalidated_candidate(tmp_path, monkeypatch):
+    from kiro_crew import member_essential_context as mec
+
+    candidate = Path("//untrusted-candidate/guide.txt")
+    original = os.path.realpath
+
+    def resolve(path, *args, **kwargs):
+        assert "untrusted-candidate" not in str(path)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", resolve)
+    mec._refuse_managed_source(candidate)

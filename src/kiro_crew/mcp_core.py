@@ -1596,6 +1596,23 @@ def _http_error_body(exc: urllib.error.HTTPError) -> dict:
             "the instance you meant) and retry; the gateway's security event log "
             "records both credential fingerprints for the mismatch."
         )
+    elif code == "caller_record_missing":
+        message = (
+            "this session's cron or subagent record no longer exists; start a new "
+            "session before retrying the tool."
+        )
+    elif code == "unix_peer_unverified":
+        message = (
+            "the gateway could not verify this Unix-socket caller as the same local "
+            "user. Restart the gateway and start a new session; if the error persists, "
+            "make sure the client and gateway run as the same OS user."
+        )
+    elif code == "peer_session_mismatch":
+        message = (
+            "this Unix-socket caller is bound to a different session than the "
+            "X-Session-Key it declared. Restart the affected session, or start a new "
+            "one, before retrying the tool."
+        )
     out: dict = {"error": message}
     if counted:
         out["counted"] = True
@@ -1604,7 +1621,7 @@ def _http_error_body(exc: urllib.error.HTTPError) -> dict:
     return out
 
 
-def _get(path: str, session_key: str | None = None) -> dict:
+def _get(path: str, session_key: str | None = None, *, timeout: float = 10) -> dict:
     """GET a loopback gateway path with the internal-secret handshake.
 
     ``session_key`` exists so a caller that has ALREADY verified its identity can
@@ -1616,6 +1633,11 @@ def _get(path: str, session_key: str | None = None) -> dict:
     whatever the lenient walk answers at request time, which need not be the same
     session. Passing the verified key makes the value that was checked the value
     that is used. It is still validated by ``_session_key_header_error``.
+
+    ``timeout`` defaults to the 10s a telemetry read needs. A route that does real
+    work behind the GET raises it — the Dev Fleet pod reads spawn a
+    ``python -m kiro_crew pod`` subprocess in the gateway, so they pay a cold
+    interpreter start that 10s cannot cover on a loaded host.
     """
     headers = {"X-Internal-Secret": _internal_secret(), **_caller_header()}
     sk = _resolve_session_key() if session_key is None else session_key
@@ -1624,7 +1646,7 @@ def _get(path: str, session_key: str | None = None) -> dict:
         return {"error": _sk_err}
     if sk:
         headers["X-Session-Key"] = sk
-    return _send(path, headers=headers, timeout=10)
+    return _send(path, headers=headers, timeout=timeout)
 
 
 def _patch(path: str, body: dict | None = None, *, session_key: str | None = None) -> dict:

@@ -1139,6 +1139,14 @@ LEARN_REMOVE_SCHEMA = ToolSchema(
     tool_name="learn_remove",
     fields=[
         FieldSpec("query", str, required=True, max_len=MAX_SHORT_STRING),
+        # Same shape as learn_add's repo_scope: the delete selector names the
+        # same stored identity the write path created, so the two share one
+        # pattern. The pattern check skips an empty string, which is the
+        # explicit selector for the unscoped (global) rows; an absent field
+        # leaves scope out of the match entirely. A nonempty value the scope
+        # gate could never satisfy (a bare "/", a dot segment) is refused here
+        # so a delete cannot silently land on rows it never named.
+        FieldSpec("repo_scope", str, max_len=MAX_SHORT_STRING, pattern=SCOPE_FRAGMENT_RE),
     ],
 )
 
@@ -1244,16 +1252,16 @@ MONITOR_STOP_SCHEMA = ToolSchema(
 # monitor_start creates an AutoNudge loop bound to the calling session (the
 # agent-facing "babysit this PR" primitive). message caps match the REST
 # endpoint's 8000-char limit; interval bounds mirror autonudge's
-# _MIN_IDLE_SECS/_MAX_IDLE_SECS clamp. max_runtime_secs is the wall-clock
-# budget (0 = unlimited); the 7-day ceiling keeps a typo like 6e9 from arming
-# an effectively-unbounded loop while still covering week-long babysits.
+# _MIN_IDLE_SECS/_MAX_IDLE_SECS clamp. Both caps must be positive; the 7-day
+# runtime ceiling keeps a typo like 6e9 from arming an effectively unbounded
+# loop while still covering week-long babysits.
 MONITOR_START_SCHEMA = ToolSchema(
     tool_name="monitor_start",
     fields=[
         FieldSpec("message", str, required=True, max_len=8000),
         FieldSpec("interval_secs", int, min_val=15, max_val=86400),
-        FieldSpec("max_cycles", int, min_val=0, max_val=1000),
-        FieldSpec("max_runtime_secs", int, min_val=0, max_val=604800),
+        FieldSpec("max_cycles", int, min_val=1, max_val=1000),
+        FieldSpec("max_runtime_secs", int, min_val=1, max_val=604800),
         # Opt-OUT of observation gating. Absent means gated, matching the tool's
         # default, so a caller written before this field existed keeps the
         # default behaviour rather than silently escaping it.
@@ -1275,8 +1283,8 @@ MONITOR_UPDATE_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("message", str, max_len=8000),
         FieldSpec("interval_secs", int, min_val=15, max_val=86400),
-        FieldSpec("max_cycles", int, min_val=0, max_val=1000),
-        FieldSpec("max_runtime_secs", int, min_val=0, max_val=604800),
+        FieldSpec("max_cycles", int, min_val=1, max_val=1000),
+        FieldSpec("max_runtime_secs", int, min_val=1, max_val=604800),
         FieldSpec("target", str, max_len=MAX_SHORT_STRING),
         FieldSpec("objective", str, allowed=publicly_armable_objectives()),
         FieldSpec("max_agent_turns", int, min_val=1, max_val=MAX_MONITOR_AGENT_TURNS),
@@ -1995,6 +2003,12 @@ CHAT_FOLDER_MOVE_SCHEMA = ToolSchema(
     fields=[
         FieldSpec("folder", str, required=True, max_len=_ARTIFACT_FOLDER_REF_MAX),
         FieldSpec("new_parent", str, max_len=_ARTIFACT_FOLDER_REF_MAX),
+        # Sibling anchors for the folder's POSITION among its siblings. Mutually
+        # exclusive, and refused unless the anchor already sits directly under
+        # the destination -- the handler owns both rules, since neither is
+        # expressible as a field constraint.
+        FieldSpec("before", str, max_len=_ARTIFACT_FOLDER_REF_MAX),
+        FieldSpec("after", str, max_len=_ARTIFACT_FOLDER_REF_MAX),
     ],
 )
 
@@ -2004,6 +2018,16 @@ CHAT_FOLDER_MOVE_SESSION_SCHEMA = ToolSchema(
         # A session reference is a slot key, a ``dashboard:`` session key, or an
         # exact session title — none share a charset, so only bound the length.
         FieldSpec("session", str, required=True, max_len=512),
+        FieldSpec("folder", str, max_len=_ARTIFACT_FOLDER_REF_MAX),
+    ],
+)
+
+CHAT_FOLDER_FILE_SELF_SCHEMA = ToolSchema(
+    tool_name="chat_folder_file_self",
+    fields=[
+        # No ``session`` field on purpose: the target is the caller's own slot,
+        # resolved server-side from the verified identity. The folder reference
+        # takes the same id-or-path shape as ``chat_folder_move_session.folder``.
         FieldSpec("folder", str, max_len=_ARTIFACT_FOLDER_REF_MAX),
     ],
 )
@@ -2106,6 +2130,32 @@ OPS_MISSION_CONTROL_API_SCHEMA = ToolSchema(
     ],
     custom_validator=_validate_omc_api,
 )
+
+# Dev Fleet pod lifecycle (agent surface). A pod name is a git worktree basename,
+# so it reaches `git worktree list` matching and a filesystem path before
+# `rt.validate_name` -- the real authority -- ever sees it. Bounded here so an
+# unbounded string is refused at the tool boundary rather than carried further.
+_POD_WORKTREE_MAX_LEN = 200
+
+POD_UP_SCHEMA = ToolSchema(
+    tool_name="pod_up",
+    fields=[FieldSpec("worktree", str, required=True, max_len=_POD_WORKTREE_MAX_LEN)],
+)
+
+POD_DOWN_SCHEMA = ToolSchema(
+    tool_name="pod_down",
+    fields=[FieldSpec("worktree", str, required=True, max_len=_POD_WORKTREE_MAX_LEN)],
+)
+
+POD_STATUS_SCHEMA = ToolSchema(
+    tool_name="pod_status",
+    fields=[FieldSpec("worktree", str, required=True, max_len=_POD_WORKTREE_MAX_LEN)],
+)
+
+# `pod_ls` takes nothing. It is registered anyway: a tool ABSENT from
+# MCP_CORE_SCHEMAS has its arguments passed through raw, so an empty schema is
+# what makes an unexpected argument an "Error:" string instead of unvalidated input.
+POD_LS_SCHEMA = ToolSchema(tool_name="pod_ls", fields=[])
 
 ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA = ToolSchema(
     tool_name="issue_radar_record_investigation",
@@ -2567,7 +2617,22 @@ HOOK_UPDATE_SCHEMA = ToolSchema(
 #: the caller appears to name) has a ``:`` in the body and is still refused.
 #: A drive-relative path (``C:x``) is likewise refused -- it resolves against a
 #: per-drive working directory the caller cannot see.
-_FS_PATH_PATTERN = re.compile(r"^(?:[~/]|[A-Za-z]:[\\/]|\\\\)[-\w.@~/\\ ]+$")
+#:
+#: The body is a DENYLIST, not an allowlist of punctuation. Every filesystem
+#: this gate fronts accepts any byte but the separator and NUL in a name, so an
+#: enumerated allowlist refuses legal files -- ``Notes (draft).md``,
+#: ``Q1 2026 #2.md``, ``50% done.md``, ``report [final].md`` -- and returns
+#: HTTP 400 for each. Only two classes are hazards in the path *string* itself
+#: and both stay refused: a control character, which truncates at NUL, splits a
+#: log line at CR/LF, and injects a terminal escape at ESC or at the 8-bit C1
+#: forms a UTF-8 terminal decodes the same way (U+0085 NEL, U+009B CSI); and
+#: ``:`` in the body, for the alternate-data-stream reason above. The deny range
+#: therefore spans C0, DEL and C1 -- no filesystem name legitimately carries a
+#: control character, so the wider range costs nothing. Nothing else is excluded,
+#: because nothing downstream interprets the string: every subprocess in the
+#: file handlers is ``exec``-form argv with no shell, and the required absolute
+#: prefix means the path can never be read as a leading-dash option.
+_FS_PATH_PATTERN = re.compile(r"^(?:[~/]|[A-Za-z]:[\\/]|\\\\)[^\x00-\x1f\x7f-\x9f:]+$")
 
 FILE_READ_SCHEMA = ToolSchema(
     tool_name="file_read",
@@ -2984,6 +3049,10 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "deploy_artifact": DEPLOY_ARTIFACT_SCHEMA,
     "issue_radar_record_investigation": ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA,
     "ops_mission_control_api": OPS_MISSION_CONTROL_API_SCHEMA,
+    "pod_up": POD_UP_SCHEMA,
+    "pod_down": POD_DOWN_SCHEMA,
+    "pod_status": POD_STATUS_SCHEMA,
+    "pod_ls": POD_LS_SCHEMA,
     # Registered even though ``issue_radar_crew_read`` takes no arguments: an
     # unregistered tool's args pass through raw, and the empty-field schema is
     # also what makes an unknown arg an "Error:" string instead of a stdio-loop
@@ -3146,6 +3215,7 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "chat_folder_create": CHAT_FOLDER_CREATE_SCHEMA,
     "chat_folder_move": CHAT_FOLDER_MOVE_SCHEMA,
     "chat_folder_move_session": CHAT_FOLDER_MOVE_SESSION_SCHEMA,
+    "chat_folder_file_self": CHAT_FOLDER_FILE_SELF_SCHEMA,
 }
 
 # ── Tool Schemas (MCP Work ledger — server ``kirocrew-work``) ──

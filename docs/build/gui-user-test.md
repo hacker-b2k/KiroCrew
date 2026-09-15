@@ -29,6 +29,7 @@ while the code holding credentials is not. `pr-readiness.yml` does not read this
 | `test/gui_user/x11.py` | Screenshots (Pillow `ImageGrab`) and input (`xdotool`); coordinate scaling, key aliases and argv building are pure and unit-tested. |
 | `test/gui_user/scenarios.py` + `scenarios/*.yaml` | The scenario DSL (including the `FEATURES` registry) and the shipped scenarios. |
 | `test/gui_user/report.py` | Renders `summary.json` into `verdict.md`, the PR comment and the nightly issue, all grouped by feature; renders `features.md` from the scenario directory. |
+| [`test/gui_user/FEATURES.md`](../../test/gui_user/FEATURES.md) + `features.json` | The scenario backlog: every user-visible feature as one record (feature slug, user story, start URL, seed, runnable tier, priority). `features.json` is the source of truth; `FEATURES.md` is rendered from it by `features_catalog.py` (`--write` / `--check`), which also validates every record and refuses cross-slug duplicates. |
 
 The unit tests under `test/gui_user/` run in the ordinary Backend Tests shards; they
 need no display and never call Bedrock.
@@ -125,13 +126,17 @@ scenario yet. The workflow uploads `results/features.md` with the artifact and a
 it to the run's step summary, so "what does the product do, and is it healthy" is
 answered from any run page without opening the YAML.
 
-- `feature` is a slug from the closed registry `scenarios.FEATURES` (`chat`, `sidebar`,
-  `members`, `settings`, `apps`, `schedule`, `knowledge`, `artifacts`, `files`,
-  `browser-panel`, `voice`, `notifications`, `onboarding`, `search`, `developer`). A closed
-  list, not a free-form slug, so a typo cannot split one feature into two report groups.
-  To add a product area, add `slug: "Human title"` to `FEATURES` in the order you want
-  it reported and mention it in the list above; a scenario naming an unknown feature
-  is rejected at load time.
+- `feature` is a slug from the closed registry `scenarios.FEATURES`, one per product
+  area, in report order: `chat`, `side-panel`, `terminal`, `sidebar`, `navigation`,
+  `topbar`, `search`, `members`, `capabilities`, `connections`, `memory`, `knowledge`,
+  `artifacts`, `files`, `browser-panel`, `apps`, `task-runner`, `worlds`, `dev-fleet`,
+  `schedule`, `api`, `webhooks`, `channels`, `voice`, `notifications`, `computer-use`,
+  `instances`, `remote-instances`, `popout`, `auth`, `onboarding`, `settings`, `themes`,
+  `security`, `developer`. A closed list, not a free-form slug, so a typo cannot split
+  one feature into two report groups. To add a product area, add `slug: "Human title"`
+  to `FEATURES` in the order you want it reported, mirror it in
+  `features_catalog.FEATURE_TITLES` (a unit test holds the two equal) and mention it in
+  the list above; a scenario naming an unknown feature is rejected at load time.
 - `user_story` is one sentence of at most 300 characters, in the user's voice: `As a
   <who>, I want <what>, so that <why>`, or a plain use case when the persona adds
   nothing. Say what the user is trying to achieve, not which control they press --
@@ -202,10 +207,15 @@ owning server is not a virtual one.
 - A 1280x800 screenshot is about 1 365 input tokens (width x height / 750). With three
   screenshots kept, a step costs roughly 6-8k input and ~150 output tokens; a
   10-step scenario on a Sonnet-class model is about $0.25-0.40 and two to four
-  minutes. The nightly tier (three scenarios, one retry each in the worst case) is
-  about $1-2.50; the PR smoke pair about $0.60. The run stops at `--budget-usd`
-  (dispatch default $3, nightly $4, PR $2) and marks the remaining scenarios
-  `SKIPPED`.
+  minutes. Budget the nightly tier (every shipped scenario, one retry each in the
+  worst case) at about $0.50 per scenario and the smoke tier at about $0.35. The run
+  stops at `--budget-usd` (dispatch default $5 -- the smoke tier is seven scenarios,
+  about $2.50 with one retry apiece, so the default has to clear that; nightly $8)
+  and marks the remaining
+  scenarios `SKIPPED`; the job's 90-minute timeout is the backstop for a hung target,
+  not the budget. Keep the nightly bill under $10: when a new batch would push past
+  it, move the lowest-value scenarios to a cheaper cadence (a `weekly` tier is a
+  schema + workflow change) rather than raising the budget.
 - Pixel tests are stochastic. One retry absorbs a mis-click; a scenario that flips
   night to night is a scenario problem (vague step, timing) before it is a product
   problem. Read `steps.jsonl` and the numbered screenshots: they show exactly where

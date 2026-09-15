@@ -47,6 +47,7 @@ from kiro_crew.atomic_write import refuse_linked_parent
 from kiro_crew.config.paths import config_dir, kiro_agents_dir
 from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
 from kiro_crew.identity_stores import AUTH_SQLITE_DB, AUTH_SQLITE_SIDECAR_SUFFIXES
+from kiro_crew.memory_stores import EXECUTION_LOGS_DIR_NAME, MEMORY_STORES_DIR_NAME
 from kiro_crew.pinned_fs import fd_real_path
 from kiro_crew.platform import current_context
 
@@ -65,6 +66,20 @@ logger = logging.getLogger(__name__)
 # Launcher scripts and seatbelt profiles are read exactly once at child exec.
 # Any file older than this threshold is garbage regardless of PID liveness.
 _LAUNCHER_MAX_AGE_SECONDS = 3600
+
+#: Run-directory artifact families the sweep reclaims, by filename prefix ->
+#: accepted suffixes. Every family tags the writing process's PID right after the
+#: prefix. ``kirocrew_sandbox_``: per-spawn launchers and Seatbelt profiles,
+#: consumed once at exec. ``kirocrew_pi_gate_``: the pi tool-gate launcher and
+#: the sealed extension copy (``acp/client.py``), written once per gateway
+#: process and reused by its later spawns.
+_SANDBOX_ARTIFACT_PREFIX = "kirocrew_sandbox_"
+_RUN_DIR_ARTIFACTS: dict[str, tuple[str, ...]] = {
+    _SANDBOX_ARTIFACT_PREFIX: (".sb", ".py"),
+    # ``.tmp`` is the mkstemp stage both pi artifacts are written under before
+    # the rename; a crash between the two leaves it behind under the same PID.
+    "kirocrew_pi_gate_": (".sh", ".cmd", ".ts", ".tmp"),
+}
 
 # Bind-mount SOURCES staged by the namespace launcher (empty dirs/files bound
 # over credential paths, plus the SSH shadow dir). The kernel pins a source for
@@ -366,6 +381,12 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # READONLY note above says a kernel write denial is what holds regardless of
     # how a command spells the way there.
     "file_delivery_consent.json",
+    # The browser launcher and its vendored Node package tree. Agent browser
+    # commands must read and execute this directory, while a write would choose
+    # the binary the unsandboxed gateway executes during startup reclamation or
+    # an owner address-bar launch. The gateway installer runs outside the agent
+    # sandbox, so it can still replace the managed copy.
+    "playwright-cli",
     # The app dev-mode AUTHORIZATION record (operator grants binding each dev
     # app to its resolved ui root — see apps/dev_mode.py). Sealing it makes
     # "operator, not agent" kernel-enforced: a sandboxed process cannot mint,
@@ -692,6 +713,9 @@ def carveout_shadowed_by_foreign_mask(path: str, mode: str = "standard") -> bool
 #:    * ``member-memory-bindings`` — an empty dir identifies no runs; its
 #:      directory bind shows records the gateway publishes later without
 #:      granting agent processes the ability to create or replace one;
+#:    * ``playwright-cli`` — an empty dir means the launcher is absent,
+#:      exactly as a missing dir does; its directory bind shows a later gateway
+#:      install while withholding every agent-side write;
 #:    * ``computer_use.json`` — ``computer_use.enable_state.load_state`` reads ``{}``
 #:      as DISABLED, which is what an absent keystone means;
 #:    * ``oauth_endpoints.json`` — ``security._validate_operator_oauth_entries``
@@ -737,7 +761,16 @@ def carveout_shadowed_by_foreign_mask(path: str, mode: str = "standard") -> bool
 #: this list closes: a mask needs the opposite treatment (an empty bind OVER the
 #: name), and ``_CREW_HIDDEN_LEAVES`` has no reader to prove an empty document is
 #: absent-equivalent, so each leaf needs its own argument.
-_CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = ("profiles", "member-memory-bindings")
+_CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = (
+    "profiles",
+    "member-memory-bindings",
+    "playwright-cli",
+)
+#: Read-only directory leaves whose NAME must remain the mounted name. A resolving
+#: symlink is unsafe here: the mount follows its target and leaves the lexical name
+#: replaceable, which would let an agent choose the executable the gateway runs.
+_CREW_NOFOLLOW_READONLY_DIR_LEAVES: tuple[str, ...] = ("playwright-cli",)
+assert set(_CREW_NOFOLLOW_READONLY_DIR_LEAVES) <= set(_CREW_PRECREATE_READONLY_DIR_LEAVES)
 _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
     "computer_use.json",
     "oauth_endpoints.json",
@@ -978,10 +1011,10 @@ def _warn_if_alias_backed(target: str) -> None:
 def _refuse_if_dangling_symlink(target: str) -> None:
     """Refuse the spawn when *target* is a symlink that resolves to nothing.
 
-    A RESOLVING symlink is left alone deliberately: it reads as present, so the launcher
-    seals the inode it resolves to. The residual exposure there — the link NAME stays
-    replaceable in a writable parent — is pre-existing for every ceiling, not specific to
-    one this function materialises, and closing it needs the data-home root sealed.
+    A RESOLVING symlink is left to the caller. Most legacy ceilings report that
+    alias and seal its referent; a strict directory such as the gateway launcher
+    follows this check with :func:`_refuse_if_symlink_leaf` because its lexical name
+    selects executable code and must remain the mounted name.
     """
     if not os.path.islink(target) or os.path.exists(target):
         return
@@ -997,20 +1030,15 @@ def _refuse_if_dangling_symlink(target: str) -> None:
 
 
 def _refuse_if_symlink_leaf(target: str) -> None:
-    """Refuse the spawn when a HIDDEN-dir leaf is itself a symlink or junction.
+    """Refuse when a masked or strict read-only directory leaf is a link.
 
     Stronger than :func:`_refuse_if_dangling_symlink`, which refuses only a link that
     resolves to nothing. A leaf that RESOLVES -- a link pointing at a real directory --
     is the attacker's entry here: ``os.path.isdir`` follows it and reports a directory,
-    so the mask loop binds over the link's TARGET, not the leaf name. The leaf name
+    so the mask or seal binds over the link's TARGET, not the leaf name. The leaf name
     lives in the writable data home, so a sandboxed process can unlink it and drop an
-    agent-controlled directory in its place, and the pre-created staging directory the
-    preview CLI writes into is then one the agent owns. Unlike a ceiling -- where a
-    resolving link is a pre-existing property closable only by sealing the data-home
-    root -- these leaves are ones this module CREATES, so refusing a link at the name is
-    in scope and costs nothing legitimate: the gateway makes the staging leaf a plain
-    directory, never a link. Refused, not removed, for the same reason as the dangling
-    case: ``lstat`` then ``unlink`` is not atomic.
+    agent-controlled directory in its place. Refused, not removed, because ``lstat``
+    then ``unlink`` is not atomic.
     """
     try:
         info = os.lstat(target)
@@ -1147,9 +1175,11 @@ def _materialize_sealable_ceilings() -> list[str]:
     * a **creation failure** other than ``EEXIST`` — a read-only mount, or a filesystem
       with no hardlink support.
 
-    ``EEXIST`` is the one benign outcome, in both loops: the racing spawn that got there
-    first, or the operator's real document. Either way the path now exists, so the
-    launcher seals it and there is nothing to report.
+    ``EEXIST`` is benign for ordinary ceilings: another spawn or the operator won
+    the race and the launcher seals the winner. Strict executable directories have
+    a higher bar. Their winner is re-checked with ``lstat`` and must be a real
+    directory, because a symlink would move the mount off the name the gateway later
+    resolves.
 
     Never TRUNCATES and never REMOVES: an existing ceiling is left byte-for-byte alone,
     so this can only ever add the absent default.
@@ -1158,11 +1188,17 @@ def _materialize_sealable_ceilings() -> list[str]:
     dir_targets, file_targets = _sealable_absent_ceilings()
 
     for target in dir_targets:
+        strict_nofollow = os.path.basename(target) in _CREW_NOFOLLOW_READONLY_DIR_LEAVES
         _refuse_if_dangling_symlink(target)
+        if strict_nofollow:
+            _refuse_if_symlink_leaf(target)
         if os.path.exists(target):
-            # Present, so the launcher will seal it -- but say so when the seal is
-            # reachable around rather than through this path.
-            _warn_if_alias_backed(target)
+            if strict_nofollow:
+                _require_real_dir_nofollow(target)
+            else:
+                # Present, so the launcher will seal it -- but say so when the seal is
+                # reachable around rather than through this path.
+                _warn_if_alias_backed(target)
             continue
         if not os.path.isdir(os.path.dirname(target)):
             continue
@@ -1170,6 +1206,10 @@ def _materialize_sealable_ceilings() -> list[str]:
             # 0o700 needs no reassertion: a umask can only clear bits, never add them.
             os.mkdir(target, 0o700)
         except FileExistsError:
+            if strict_nofollow:
+                # A competing creator may have planted a link after the check above.
+                # Re-check the winner without following it before trusting the name.
+                _require_real_dir_nofollow(target)
             continue
         except OSError as exc:
             _warn_unsealed_ceiling(target, exc)
@@ -2020,14 +2060,13 @@ def _path_identity(path: str) -> tuple[int, int] | None:
     traverse, a race that unlinks mid-walk) degrades to the spelling answer
     instead of raising into the caller's spawn path.
 
-    ``os.lstat``, never ``stat``: these paths arrive from CONFIG TEXT, and the
-    final component is where a planted symlink could point at a remote or
-    stalling target -- following it would turn a local containment question into
-    off-host I/O. Nothing is lost by refusing to follow,
-    because symlink resolution already happened upstream: the caller compares
-    the ``realpath`` spelling as well, and a link INTO the sealed parent is
-    caught there with every component resolved.
+    ``os.lstat`` keeps the identity walk on the component named by the
+    spelling being checked. The canonical spelling was already resolved with
+    ``realpath(strict=True)``, so following each component again would add no
+    information and would make the lexical alias walk perform a second path
+    resolution.
     """
+
     try:
         info = os.lstat(path)
     except OSError:
@@ -2078,6 +2117,25 @@ def _identity_within_sealed_parent(path: str, parent: str) -> bool:
         current = next_up
 
 
+#: Temp keys a child's ``tempfile``/``mktemp`` consults, in
+#: POSIX-then-Windows order. Spec keys are matched case-insensitively.
+CANONICAL_TEMP_KEYS = ("TMPDIR", "TMP", "TEMP")
+
+
+#: Operator-facing reason per refusal cause. ``check-failed`` belongs to the
+#: shared env wrapper below; the path classifier itself returns only the first
+#: two causes.
+DECLARED_TEMP_REFUSAL_REASONS = {
+    "sealed": ("it is inside the sandbox-sealed runtime parent, where the server " "cannot write"),
+    "unclassifiable": (
+        "it is relative and the daemon and child use different working directories, or its "
+        "canonical form cannot be established (a symlink cycle or a component that cannot "
+        "be traversed), so containment cannot be verified"
+    ),
+    "check-failed": "the seal check itself failed, so containment cannot be verified",
+}
+
+
 #: Why a spec-declared temp path is refused. ``sealed`` is a path inside
 #: ``<data home>/run``; ``unclassifiable`` is a path whose canonical form cannot
 #: be established (a symlink cycle, a component that cannot be traversed), so
@@ -2103,7 +2161,13 @@ def classify_declared_temp_path(path: str) -> "DeclaredTempRefusal | None":
     ``run``. A caller that gets a refusal cause must therefore stop honoring the
     path, not try to open it.
 
-    Windows: nothing to refuse, so ``None`` for every path. Kiro Crew has no
+    Relative declarations are ``"unclassifiable"`` because the daemon and the
+    spawned child do not share a required working directory. The classifier
+    would resolve one against the daemon's cwd while ``spawn_backend`` runs the
+    child under ``work_dir``. Refusing the spelling is the only way to keep one
+    decision valid at every spawn boundary.
+
+    Windows: nothing else to refuse, so ``None`` for every absolute path. Kiro Crew has no
     native Windows sandbox backend (see the delegation note in
     :func:`wrap_argv`): a probe child there is either not spawned at all or runs
     unsandboxed with a writable ``run``, so a declared temp under it is
@@ -2123,6 +2187,8 @@ def classify_declared_temp_path(path: str) -> "DeclaredTempRefusal | None":
     """
     if not path:
         return None
+    if not os.path.isabs(path):
+        return "unclassifiable"
     if sys.platform == "win32":
         return None
     # realpath resolves the ORIGINAL spelling, BEFORE any lexical pass. Order is
@@ -2155,6 +2221,118 @@ def classify_declared_temp_path(path: str) -> "DeclaredTempRefusal | None":
             if _path_within(spelling, parent) or _identity_within_sealed_parent(spelling, parent):
                 return "sealed"
     return None
+
+
+def classify_declared_temp_env(
+    env: "Mapping[str, object]",
+    declared_temp_keys: "Sequence[str] | None" = None,
+    *,
+    classifier: "Callable[[str], DeclaredTempRefusal | None] | None" = None,
+) -> tuple[tuple[str, ...], dict[str, tuple[str, str]], str]:
+    """Classify the temp declaration in *env* once for every MCP spawn path.
+
+    The first item is the accepted canonical key set in lookup order. The
+    second maps each refused key to ``(declared path, cause)``. The third names
+    a classifier failure for the WARNING. One refused key drops the whole temp
+    declaration because ``tempfile`` may consult a sibling first.
+
+    When *declared_temp_keys* is ``None``, every temp key in *env* is declared.
+    A caller whose environment mixes operator and ambient values passes the
+    operator-owned key names explicitly. Path inspection blocks, so async
+    callers run this function through :func:`asyncio.to_thread`.
+    """
+    if declared_temp_keys is None:
+        declared_upper = {
+            key.upper()
+            for key in env
+            if isinstance(key, str) and key.upper() in CANONICAL_TEMP_KEYS
+        }
+    else:
+        declared_upper = {
+            key.upper()
+            for key in declared_temp_keys
+            if isinstance(key, str) and key.upper() in CANONICAL_TEMP_KEYS
+        }
+    accepted = tuple(key for key in CANONICAL_TEMP_KEYS if key in declared_upper)
+    declared_values = {
+        key.upper(): value
+        for key, value in env.items()
+        if isinstance(key, str) and key.upper() in declared_upper and isinstance(value, str)
+    }
+    if not declared_values:
+        return accepted, {}, ""
+
+    check = classifier or classify_declared_temp_path
+    try:
+        refused: dict[str, tuple[str, str]] = {
+            key: (path, cause)
+            for key, path in declared_values.items()
+            if (cause := check(path)) is not None
+        }
+    except Exception as exc:
+        failure = f"{type(exc).__name__}: {exc}"
+        return (
+            (),
+            {key: (path, "check-failed") for key, path in declared_values.items()},
+            failure,
+        )
+    if refused:
+        return (), refused, ""
+    return accepted, {}, ""
+
+
+def _repr_declared_temp_log_value(
+    value: str,
+    redactor: "Callable[[str], str] | None",
+) -> str:
+    """Return one redacted, control-character-safe log field."""
+    display = value
+    if redactor is not None:
+        try:
+            display = redactor(value)
+        except Exception:
+            display = "<redaction failed>"
+    return repr(display)
+
+
+def declared_temp_refusal_reasons(
+    refused: "Mapping[str, tuple[str, str]]",
+    failure: str = "",
+    *,
+    redactor: "Callable[[str], str] | None" = None,
+) -> list[str]:
+    """Render one operator-facing reason per distinct refusal cause."""
+    reasons: list[str] = []
+    for _key, (_path, cause) in sorted(refused.items()):
+        reason = DECLARED_TEMP_REFUSAL_REASONS[cause]
+        if cause == "check-failed" and failure:
+            reason = f"{reason} ({_repr_declared_temp_log_value(failure, redactor)})"
+        if reason not in reasons:
+            reasons.append(reason)
+    return reasons
+
+
+def format_declared_temp_refusals(
+    refused: "Mapping[str, tuple[str, str]]",
+    *,
+    hidden_keys: "Sequence[str]" = (),
+    redactor: "Callable[[str], str] | None" = None,
+) -> str:
+    """Render refused key/path fields as one credential-safe log line.
+
+    ``repr`` keeps control characters inside the field instead of letting a
+    declared path forge another log record. Keys in *hidden_keys* came from a
+    resolved ``secret://`` value, so their path is never rendered at all.
+    """
+    hidden_upper = {key.upper() for key in hidden_keys}
+    fields: list[str] = []
+    for key, (path, _cause) in sorted(refused.items()):
+        if key.upper() in hidden_upper:
+            display = repr("<resolved secret>")
+        else:
+            display = _repr_declared_temp_log_value(path, redactor)
+        fields.append(f"{key}={display}")
+    return ", ".join(fields)
 
 
 _VOICE_GUARD_REMEDY = "Pick a project subdirectory that does not contain the Kiro Crew data home."
@@ -2763,6 +2941,9 @@ _AGENT_DENIED_ENV_KEYS: list[str] = [
     "FEISHU_APP_SECRET",
     "JIRA_API_TOKEN",
     "JIRA_TOKEN_",
+    "AZURE_DEVOPS_EXT_PAT",
+    "BITBUCKET_EMAIL",
+    "BITBUCKET_API_TOKEN",
     "KIROCREW_OWNER_ID",
     # The central-governance fetch configuration — see
     # ``platform/policy_distribution.py``. The URL is listed as well as the header,
@@ -4167,6 +4348,22 @@ def _validate_private_mcp_gateway_socket(
             )
 
 
+def _private_memory_scan_failure(
+    operation: Literal["root_iterdir", "entry_stat", "entry_iterdir"],
+    tree: Literal["root_tmp", "sessions", "snapshots", "memory"],
+    exc: OSError,
+) -> RuntimeError:
+    """Describe a failed scan without copying exception text or filesystem names."""
+    fields = [f"operation={operation}", f"tree={tree}"]
+    for name in ("errno", "winerror"):
+        value = getattr(exc, name, None)
+        if type(value) is int and 0 <= value <= 0xFFFFFFFF:
+            fields.append(f"{name}={value}")
+    return RuntimeError(
+        "memory_unavailable: cannot verify protected memory hardlinks (" + " ".join(fields) + ")"
+    )
+
+
 def _validate_private_memory_hardlinks(layout: _PrivateMemoryLayout | None = None) -> None:
     """A path mask cannot hide another name for the same protected inode."""
     remaining = 100_000
@@ -4189,23 +4386,36 @@ def _validate_private_memory_hardlinks(layout: _PrivateMemoryLayout | None = Non
                     "create or correct it, then start the private member again"
                 )
             continue
-        for entry in root.iterdir():
-            name = entry.name
-            if (
-                name in ("memory", "backups")
-                or name.startswith(("memory.", "memory_", "lessons.", ".memory", ".lessons"))
-                or name.endswith(".tmp")
-                or (root_name in layout.homes and name in ("snapshots", "sessions"))
-            ):
-                pending.append(entry)
+        try:
+            for entry in root.iterdir():
+                name = entry.name
+                if (
+                    name in ("memory", "backups")
+                    or name.startswith(("memory.", "memory_", "lessons.", ".memory", ".lessons"))
+                    or name.endswith(".tmp")
+                    or (root_name in layout.homes and name in ("snapshots", "sessions"))
+                ):
+                    tree: Literal["root_tmp", "sessions", "snapshots", "memory"] = "memory"
+                    if name == "sessions":
+                        tree = "sessions"
+                    elif name == "snapshots":
+                        tree = "snapshots"
+                    elif name.endswith(".tmp"):
+                        tree = "root_tmp"
+                    pending.append((entry, tree))
+        except OSError as exc:
+            raise _private_memory_scan_failure("root_iterdir", "memory", exc) from exc
     while pending:
-        path = pending.pop()
+        path, tree = pending.pop()
         remaining -= 1
         if remaining < 0:
             raise RuntimeError(
                 "memory_unavailable: private memory hardlink verification exceeded its file limit"
             )
-        info = path.stat()
+        try:
+            info = path.stat()
+        except OSError as exc:
+            raise _private_memory_scan_failure("entry_stat", tree, exc) from exc
         inode = (info.st_dev, info.st_ino)
         if inode in visited:
             continue
@@ -4216,7 +4426,10 @@ def _validate_private_memory_hardlinks(layout: _PrivateMemoryLayout | None = Non
                 "remove the extra link before starting this private member"
             )
         if stat.S_ISDIR(info.st_mode):
-            pending.extend(path.iterdir())
+            try:
+                pending.extend((entry, tree) for entry in path.iterdir())
+            except OSError as exc:
+                raise _private_memory_scan_failure("entry_iterdir", tree, exc) from exc
 
 
 def _prepare_private_log_dir(layout: _PrivateMemoryLayout | None = None) -> str:
@@ -4225,7 +4438,7 @@ def _prepare_private_log_dir(layout: _PrivateMemoryLayout | None = None) -> str:
     except OSError as exc:
         raise RuntimeError("memory_unavailable: cannot verify protected memory hardlinks") from exc
     home = config_dir().resolve()
-    root = home / "memory_stores" / ".execution-logs"
+    root = home / MEMORY_STORES_DIR_NAME / EXECUTION_LOGS_DIR_NAME
     if root.resolve() != root:
         raise RuntimeError("Private execution log directory is redirected")
     platform_compat.make_owner_only_dir(root)
@@ -4396,7 +4609,7 @@ def _private_memory_seatbelt_rules(
             rules.append(f"(deny network-outbound (remote unix-socket {predicate}))")
         # Task text in a diagnostic belongs only to its execution. The path
         # hint does not grant access; these OS predicates are the authority.
-        log_root = json.dumps(home + "/memory_stores/.execution-logs")
+        log_root = json.dumps(f"{home}/{MEMORY_STORES_DIR_NAME}/{EXECUTION_LOGS_DIR_NAME}")
         exception = f" (require-not (subpath {json.dumps(log_directory)}))" if log_directory else ""
         for operation in ("file-read*", "file-write*", "file-link"):
             rules.append(f"(deny {operation} (require-all (subpath {log_root}){exception}))")
@@ -6388,21 +6601,22 @@ def cleanup_stale_sandbox_profiles(*, data_home: Path, legacy_dir: str | None = 
     # ── Sweep <config_dir>/run/ (PID + age) ──
     if os.path.isdir(run_dir):
         for entry in os.listdir(run_dir):
-            if not entry.startswith("kirocrew_sandbox_"):
+            prefix = next((p for p in _RUN_DIR_ARTIFACTS if entry.startswith(p)), None)
+            if prefix is None:
                 continue
-            if entry.endswith(".sb"):
-                suffix = ".sb"
-            elif entry.endswith(".py"):
-                suffix = ".py"
-            else:
+            suffix = next((x for x in _RUN_DIR_ARTIFACTS[prefix] if entry.endswith(x)), None)
+            if suffix is None:
                 continue
             filepath = os.path.join(run_dir, entry)
-            # Age check first — handles the spawner-PID design flaw
+            # Age check first — handles the spawner-PID design flaw. Not for the
+            # pi gate artifacts: those are written once per gateway process and
+            # REUSED by every later spawn of that process, so their age says
+            # nothing, and the PID in their name is the owner's own.
             try:
                 mtime = os.stat(filepath).st_mtime
             except OSError:
                 continue
-            if (now - mtime) > _LAUNCHER_MAX_AGE_SECONDS:
+            if prefix == _SANDBOX_ARTIFACT_PREFIX and (now - mtime) > _LAUNCHER_MAX_AGE_SECONDS:
                 try:
                     os.remove(filepath)
                     removed += 1
@@ -6410,7 +6624,7 @@ def cleanup_stale_sandbox_profiles(*, data_home: Path, legacy_dir: str | None = 
                     pass
                 continue
             # Fresh file — fall back to PID liveness check
-            middle = entry[len("kirocrew_sandbox_") : -len(suffix)]
+            middle = entry[len(prefix) : -len(suffix)]
             pid = _parse_pid_segment(middle.split("_", 1)[0])
             if pid is None:
                 continue

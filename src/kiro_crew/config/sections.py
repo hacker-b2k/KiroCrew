@@ -108,6 +108,13 @@ DEFAULT_POOL_SIZE = 0
 DEFAULT_MAX_PARALLEL_STEPS = (
     0  # 0 = auto: derive from agent.subagent_auto_max via compute_max_subagents
 )
+# Per-session process-tree RSS ceiling (MiB) the cleanup watchdog recycles an
+# idle session at. Non-zero by default so a runaway session tree is bounded
+# out of the box: fleet gateways were observed at several hundred MB with
+# nothing bounding them. 1536 leaves a healthy kiro-cli plus its MCP servers
+# (typically 300-600 MiB) a wide margin while still catching a leak before
+# it takes the host with it. 0 disables.
+DEFAULT_WATCHDOG_RSS_MAX_MB = 1536
 
 
 def normalize_agent_model(model: object) -> str:
@@ -499,24 +506,38 @@ _AVATAR_FILE_PIN_RE = _re.compile(r"^[0-9a-f]{16}\.(?:png|jpg|webp)$")
 #: on one of these exactly; any other key is dropped, so a version-skewed or
 #: typo'd state name cannot smuggle an unbounded key set into config.json.
 _AVATAR_STATES = ("working", "done", "error")
-#: The only trait axes a per-state expression may move. The identity axes
-#: (brows/accessory/prop/tile/blush/flip) are deliberately excluded: a crew
-#: must stay recognisable as itself while its expression changes.
-_AVATAR_EXPRESSION_AXES = ("eyes", "mouth")
+#: Built-in reaction motions a GHOST may play, per state. The vocabulary is
+#: pinned here rather than left open like a trait value because a motion is a
+#: named animation the frontend implements: an unknown name has no rendering to
+#: resolve to, so it carries nothing and is dropped. ``"none"`` is a real value
+#: (explicit stillness), distinct from an absent state, so one state can opt out
+#: of a motion the others use. ``working`` has no entry -- the ghost's working
+#: animation is its idle breathing, and a reaction fires on a transition.
+_AVATAR_MOTIONS: dict[str, tuple[str, ...]] = {
+    "done": ("none", "bounce", "nod", "sparkle"),
+    "error": ("none", "shake", "cross-eyes", "droop"),
+}
 #: Preset cue names a per-state sound may select. `"none"` is a real value
 #: (explicit silence), distinct from an absent state (the default, also
 #: silent) -- so a crew can opt one state out of a fleet-wide cue.
 _AVATAR_SOUNDS = ("none", "chime", "ding", "blip", "pop", "pulse")
 
 
-def _safe_expressions(value: object) -> dict:
-    """Return validated per-state expression overrides, or ``{}``.
+#: The only trait axes a per-state ghost expression may move. The identity axes
+#: (brows/accessory/prop/tile/blush/flip) are excluded: a crew must stay
+#: recognisable as itself while its expression changes.
+_AVATAR_EXPRESSION_AXES = ("eyes", "mouth")
 
-    Same forgiveness as the trait coercer: junk is dropped silently rather
-    than refused, because config.json is hand-editable and a malformed
-    expression must never cost the crew its otherwise-valid avatar. A state
-    whose axes all drop out is omitted, so the record never stores an empty
-    per-state dict.
+
+def _safe_expressions(value: object) -> dict:
+    """Return validated per-state ghost eyes/mouth picks, or ``{}``.
+
+    The key ``motions`` supersedes, kept round-tripping for exactly as long as the
+    shipped renderer still draws it: the frontend writes and paints a ghost's
+    per-state eyes/mouth today, so a validator that dropped the key would erase a
+    visible choice on an unrelated save with no way back. The sibling frontend
+    change that removes the picker is where this retires. Same forgiveness as the
+    trait coercer -- junk is dropped, never refused.
     """
     if not isinstance(value, dict):
         return {}
@@ -528,13 +549,31 @@ def _safe_expressions(value: object) -> dict:
         axes = {}
         for axis in _AVATAR_EXPRESSION_AXES:
             v = raw.get(axis)
-            # An empty string is "absent", which is what omitting the axis
-            # already means -- storing it would be a second spelling of the
-            # same state.
             if isinstance(v, str) and v:
                 axes[axis] = v[:_AVATAR_TRAIT_MAX_LEN]
         if axes:
             out[state] = axes
+    return out
+
+
+def _safe_motions(value: object) -> dict:
+    """Return validated per-state ghost motions, or ``{}``.
+
+    Same forgiveness as the trait coercer: junk is dropped silently rather than
+    refused, because config.json is hand-editable and a malformed motion must
+    never cost the crew its otherwise-valid avatar. Only the states
+    :data:`_AVATAR_MOTIONS` names carry a motion, and only a value from that
+    state's own tuple survives -- ``{"done": "shake"}`` is dropped, because
+    ``shake`` is the error vocabulary and a bounce-on-error is a different
+    reaction than the author wrote.
+    """
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, str] = {}
+    for state, allowed in _AVATAR_MOTIONS.items():
+        v = value.get(state)
+        if isinstance(v, str) and v in allowed:
+            out[state] = v
     return out
 
 
@@ -558,25 +597,33 @@ def _safe_sounds(value: object) -> dict:
 def _safe_avatar(value: object) -> dict:
     """Return a validated per-crew avatar override, or ``{}`` on junk.
 
-    Accepted shapes:
+    Each tier owns its own source of motion and sound, so what a record may
+    carry depends on its ``kind``:
 
-    - ``{"kind": "ghost", "traits": {...}}`` — pins the ghost face
-      trait-by-trait instead of deriving it from the crew name. ``traits`` may
-      be absent (or empty) when the override carries only ``expressions`` /
-      ``sounds``: that spelling means "name-derived face, plus these
-      per-state overrides", and the record omits the key entirely rather than
-      storing ``{}``.
-    - ``{"kind": "image"}`` (optional int ``v``, optional ``file``) — the crew
-      wears an uploaded picture, served from ``GET /api/agents/{name}/avatar``.
-      The file itself lives under the data home's agent-fenced
-      ``run/avatars/`` dir; the config
-      field only marks the choice. ``v`` is the upload's cache-busting stamp
-      (file mtime, nanoseconds): the frontend appends it as ``?v=`` so a
-      replaced picture is re-fetched without waiting out the browser cache.
-      ``file`` pins the exact committed file — a ``<digest>.<ext>`` suffix
-      under the crew's stem. Every install lands at a digest-named path, so a
-      replacement never overwrites the committed file before the config save
-      commits it, and serving resolves only the pinned file.
+    - ``{"kind": "ghost", "traits"?: {...}, "motions"?: {...}, "sounds"?: {...},
+      "expressions"?: {...}}`` — the built-in face. ``traits`` pins it trait-by-trait instead of deriving
+      it from the crew name, and may be absent (or empty) when the override
+      carries only reactions: that spelling means "name-derived face, plus these
+      per-state reactions", and the record omits the key entirely rather than
+      storing ``{}``. ``motions`` picks a built-in reaction animation per state
+      from :data:`_AVATAR_MOTIONS`; ``sounds`` picks a synthesized preset cue per
+      state from :data:`_AVATAR_SOUNDS`; ``expressions`` (a per-state eyes/mouth
+      pick, which ``motions`` supersedes) still round-trips because the shipped
+      renderer still draws it -- see :func:`_safe_expressions`.
+    - ``{"kind": "image"}`` (optional int ``v``, optional ``file``, optional
+      ``sounds``) — the crew wears an uploaded picture, served from
+      ``GET /api/agents/{name}/avatar``. A picture has no animation to play, so it
+      carries no ``motions``; it does still carry a cue, because the shipped
+      renderer plays a crew's cue whatever face it wears, and dropping the key
+      here would silence a crew on an unrelated save with no way to restore it.
+      The file itself lives under the data home's agent-fenced ``run/avatars/``
+      dir; the config field only marks the choice. ``v`` is the upload's cache-busting stamp (file
+      mtime, nanoseconds): the frontend appends it as ``?v=`` so a replaced
+      picture is re-fetched without waiting out the browser cache. ``file`` pins
+      the exact committed file — a ``<digest>.<ext>`` suffix under the crew's
+      stem. Every install lands at a digest-named path, so a replacement never
+      overwrites the committed file before the config save commits it, and
+      serving resolves only the pinned file.
     - ``{"kind": "pack", "id": "<pack id>"}`` — the crew wears an appearance
       pack from the crew library (``GET /api/appearances``). ``id`` is
       validated by :func:`kiro_crew.appearance_packs.safe_pack_id`, the same
@@ -585,42 +632,50 @@ def _safe_avatar(value: object) -> dict:
       ``{}``: an unrenderable pack reference is worse than the default face.
       Whether the pack still EXISTS is deliberately not checked — config load
       must not touch the disk — so a dangling id renders as the name-derived
-      ghost on the client.
+      ghost on the client. A pack carries its own per-state art
+      (``GET /api/appearances/{id}/slot/{slot}``) and its own per-state audio
+      (``GET /api/appearances/{id}/sound/{state}``), so it needs no ``motions``
+      here. It keeps accepting ``sounds`` for now, for the same reason the picture
+      tier does: the shipped renderer plays a crew-record cue on every tier, so
+      retiring the key before that renderer stops reading it would take away a
+      sound the user chose. Once the pack's own audio is what plays, the crew
+      record has no cue to hold and the key retires with that change.
+
+    ``<state>`` is one of ``working``, ``done``, ``error``. A key is omitted
+    from the record when validation leaves it empty, so a stored avatar never
+    carries ``{}`` for one, and a key illegal on this tier is DROPPED rather
+    than refused — the same forgiveness every other field here has, because a
+    hand-written or version-skewed record must not cost the crew its face. Two
+    keys are deliberately NOT retired that way even though ``motions`` supersedes
+    one of them: ``sounds`` is audible on every tier today, and a ghost's
+    ``expressions`` is drawn today, and a value a user can see or hear is not
+    dropped ahead of the renderer that shows it. ``expressions`` round-trips on
+    picture and pack too, even though neither has a face to move: the shipped
+    builder still SUBMITS it there, and a crew that switches from ghost to
+    picture and back would otherwise lose the picks in between. Only ``motions``
+    is tier-gated, because nothing has ever written it outside the ghost.
 
     Empty means "no override" — the frontend keeps rendering the name-seeded
     face. config.json is hand-editable (and agent-writable), so junk collapses
     to ``{}`` rather than crashing the load.
-
-    All three kinds may also carry two optional per-state keys, validated and
-    round-tripped through the endpoints and config persistence (a string axis is
-    normalized by the same 32-char truncation a trait gets, so a longer value
-    comes back shortened rather than verbatim):
-
-    - ``expressions: {"<state>": {"eyes"?: str, "mouth"?: str}}`` — the face
-      moves those two axes while the agent is in that state. Only ``eyes`` and
-      ``mouth`` are accepted, so the identity axes stay put and the crew
-      remains recognisable as itself. Legal on ``kind: "image"`` too — stored,
-      and ignored by the picture renderer.
-    - ``sounds: {"<state>": "none"|"chime"|"ding"|"blip"|"pop"|"pulse"}`` — a
-      shipped cue preset per state. ``"none"`` is explicit silence, kept
-      distinct from an absent state so one state can opt out of a cue the
-      others use.
-
-    ``<state>`` is one of ``working``, ``done``, ``error``. Either key is
-    omitted from the record when validation leaves it empty, so a stored
-    avatar never carries ``{}`` for one.
 
     Trait *values* are deliberately not checked against the frontend's trait
     vocabulary: the renderer resolves an unknown option to "absent"
     (``EYES[k] ?? ''``), and keeping the vocabulary in one place (the style
     module) means a new hat needs no backend release. ``tile`` is the one
     exception — it is interpolated into SVG markup, so it is pinned to a hex
-    color by the same validator session_color uses.
+    color by the same validator session_color uses. A motion or cue name is
+    pinned, because unlike a trait it names an animation or a synthesizer
+    preset rather than an option a renderer can resolve to nothing.
     """
     if not isinstance(value, dict):
         return {}
-    expressions = _safe_expressions(value.get("expressions"))
+    # Legal on every tier: the shipped renderer reads a crew-record cue
+    # kind-agnostically, so this is the one reaction key that is not the ghost's
+    # alone. `motions` IS ghost-only -- a picture has no face to move and a pack
+    # animates from its own files.
     sounds = _safe_sounds(value.get("sounds"))
+    expressions = _safe_expressions(value.get("expressions"))
     if value.get("kind") == "image":
         out: dict[str, object] = {"kind": "image"}
         v = value.get("v")
@@ -643,10 +698,6 @@ def _safe_avatar(value: object) -> dict:
             return {}
         pack: dict[str, object] = {"kind": "pack", "id": ident}
         if expressions:
-            # Accepted for symmetry with the other two kinds and round-tripped
-            # faithfully, but a pack renderer IGNORES it: the art is the pack's
-            # own files, not a trait-composed ghost, so there is no eyes/mouth
-            # axis to move. `sounds` behaves exactly as it does elsewhere.
             pack["expressions"] = expressions
         if sounds:
             pack["sounds"] = sounds
@@ -676,6 +727,9 @@ def _safe_avatar(value: object) -> dict:
     ghost: dict[str, object] = {"kind": "ghost"}
     if traits:
         ghost["traits"] = traits
+    motions = _safe_motions(value.get("motions"))
+    if motions:
+        ghost["motions"] = motions
     if expressions:
         ghost["expressions"] = expressions
     if sounds:
@@ -1054,13 +1108,6 @@ class AgentConfig:
         metadata=_meta(
             "Bot Name",
             "Custom name the bot identifies as in conversations. Leave empty for default.",
-        ),
-    )
-    conductor_skill: bool = field(
-        default=False,
-        metadata=_meta(
-            "Conductor Skill",
-            "Enable agent delegation — loads conductor skill with agent roster.",
         ),
     )
     tool_search: bool = field(
@@ -1508,11 +1555,11 @@ class SessionConfig:
         ),
     )
     watchdog_rss_max_mb: int = field(
-        default=0,
+        default=DEFAULT_WATCHDOG_RSS_MAX_MB,
         metadata=_meta(
             "Watchdog RSS Limit (MiB)",
             "Recycle a session when its process tree resident memory exceeds "
-            "this many MiB. 0 disables (default). Busy sessions (turn in "
+            "this many MiB (default 1536). 0 disables. Busy sessions (turn in "
             "flight) are never recycled.",
         ),
     )
@@ -1733,11 +1780,36 @@ class MemoryConfig:
         default="",
         metadata=_meta(
             "Embedding Model ID",
-            "Optional stable identifier for a custom model's vector space. Defaults to "
-            "'custom:<filename>:<size>', which changes when a different model file is "
-            "used. Set this explicitly if you swap between models of identical byte size, "
-            "which the default derivation cannot distinguish.",
+            "Optional label for a custom model. The vector-space identity is "
+            "'<label>:sha256:<digest>' of the model file's bytes, so different models "
+            "of identical name and size are always told apart; this key cannot pin or "
+            "override that identity. Applying a model from the dashboard writes the "
+            "resulting id together with embed_model_stamp.",
             restart=True,
+        ),
+    )
+    embed_model_stamp: list[int] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Embedding Model File Stamp",
+            "Managed file identity for verified custom weights: device, inode, byte size, "
+            "modification nanoseconds and change nanoseconds. An empty list means unverified.",
+        ),
+    )
+    embed_rebuild_generation: str = field(
+        default="",
+        metadata=_meta(
+            "Embedding Rebuild Generation",
+            "Managed explicit-apply request identity. Stores acknowledge it only after "
+            "invalidating their previous vectors; empty preserves ordinary upgrade behavior.",
+        ),
+    )
+    embed_model_legacy_ids: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Embedding Model Legacy IDs",
+            "Managed compatibility labels mapped to embed_model_id and embed_model_stamp. "
+            "Preserves matching stored vectors across restarts; cleared when the model identity changes.",
         ),
     )
     semantic_confidence_threshold: float = field(
@@ -2524,6 +2596,47 @@ class JiraAuthEntry:
     )
 
 
+@dataclass
+class LinkPatternRule:
+    """One text-to-link rewrite rule for chat transcripts.
+
+    Rendering-only: the dashboard rewrites matching plain text into links at
+    display time; stored messages are never modified. The pattern is compiled
+    by the BROWSER (JavaScript regex dialect), so the backend validates only
+    shape and size, never regex semantics.
+    """
+
+    pattern: str = field(
+        default="",
+        metadata=_meta(
+            "Pattern",
+            "JavaScript regular expression matched against transcript text "
+            "(e.g. '\\\\bPROJ-\\\\d+\\\\b'). A rule that matches the empty string is "
+            "ignored.",
+        ),
+    )
+    url: str = field(
+        default="",
+        metadata=_meta(
+            "URL Template",
+            "Link target for each match: an absolute http(s) URL in which "
+            "'{match}' inserts the matched text, percent-encoded (e.g. "
+            "'https://tracker.example.com/browse/{match}'). The renderer "
+            "additionally requires the placeholder outside the host and "
+            "refuses userinfo.",
+        ),
+    )
+
+
+# dashboard.link_patterns -- bounds on operator-supplied transcript link rules.
+# The count cap bounds per-message scan work (each rule is one regex pass over
+# every rendered markdown block); the length caps bound pathological patterns
+# and keep the config API payload small.
+LINK_PATTERNS_MAX = 50
+LINK_PATTERN_PATTERN_MAX_LEN = 300
+LINK_PATTERN_URL_MAX_LEN = 2000
+
+
 # dashboard.loop_stall_exit_after_secs -- event-loop silence tolerated before
 # the gateway dumps all thread stacks and hard-exits. ``None`` is the
 # serializable "automatic" sentinel: launch class selects the desktop or
@@ -2769,13 +2882,11 @@ class DashboardConfig:
             "filler, keep code/errors verbatim); 'ultra' writes for an ADHD "
             "reader — the answer lands in a 3-sentence opening, and any detail "
             "after it must be scannable bullets rather than prose; "
-            "'answer_only' drops explanation altogether — the answer or "
-            "artifact alone, with at most one sentence of context, and detail "
-            "only when the user asks for it, when the decision is "
-            "consequential enough (security, exposure, data loss, spend, "
-            "anything hard to undo) that they cannot choose correctly without "
-            "the reasoning, or as the undo path that rides along with a "
-            "destructive command. At every level security warnings and "
+            "'answer_only' drops explanation altogether — the answer alone, drawn "
+            "as a picture when it has a shape, in sentences of at most twelve "
+            "plain words; detail only when the user asks for it, plus one undo "
+            "line for a destructive command and one risk line for anything "
+            "touching security, data or spend. At every level security warnings and "
             "irreversible-action confirmations always appear but stay brief, "
             "and ordered multi-step instructions stay complete.",
             enum=["default", "concise", "ultra", "answer_only"],
@@ -2838,6 +2949,26 @@ class DashboardConfig:
         metadata=_meta(
             "Quick Send",
             "Click a suggested reply to send it instantly. Shift+Click to select multiple.",
+        ),
+    )
+    model_picker_configured: bool = field(
+        default=False,
+        metadata=_meta(
+            "Model Picker Visibility Saved",
+            "Internal marker set after the user saves the interactive model "
+            "picker visibility list. It lets the dashboard distinguish a "
+            "never-configured picker from one intentionally saved with no "
+            "hidden models.",
+        ),
+    )
+    model_picker_hidden_models: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Selectable Models",
+            "Model IDs hidden from the interactive chat model picker. Empty shows "
+            "every advertised model; 'auto' is always shown. This preference does "
+            "not change entitlement, provider model discovery, defaults, role "
+            "models, fallback models, bulk switching, or app-specific model lists.",
         ),
     )
     session_grid: bool = field(
@@ -3073,6 +3204,14 @@ class DashboardConfig:
             "yet. Instance-wide kill switch.",
         ),
     )
+    feature_videos_cache_max_mb: float = field(
+        default=500.0,
+        metadata=_meta(
+            "Feature Videos Cache Size (MB)",
+            "Disk budget for downloaded clips. Whole release folders are evicted "
+            "oldest-first to fit; the running release is never evicted. 0 = no cap.",
+        ),
+    )
     folder_suggestions_enabled: bool = field(
         default=True,
         metadata=_meta(
@@ -3153,6 +3292,19 @@ class DashboardConfig:
             "token (Basic auth); Jira Server/Data Center uses a Personal "
             "Access Token (Bearer). When no entry matches the issue host, the "
             "panel falls back to the link-out 'Open in Jira' behavior.",
+        ),
+    )
+    link_patterns: list[LinkPatternRule] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Transcript Link Patterns",
+            "Rewrite matching plain text in chat transcripts into clickable "
+            "links at display time (e.g. ticket ids like PROJ-123 to your "
+            "tracker). Each rule pairs a JavaScript regex with an absolute "
+            "http(s) URL template in which '{match}' inserts the matched "
+            "text, percent-encoded. Rendering-only: stored messages never change. Text "
+            "inside code blocks, existing links, and raw HTML is not rewritten; "
+            "an inline code span whose whole text matches becomes a link chip.",
         ),
     )
 
@@ -5824,6 +5976,92 @@ def _coerce_jira_hosts(raw: object) -> list[str]:
             continue
         out.append(host)
     return out
+
+
+def _coerce_link_patterns(raw: object) -> list[LinkPatternRule]:
+    """Coerce the transcript link rules, skipping malformed entries.
+
+    Same fail-open-per-entry discipline as the host allowlists: a hand-edited
+    bad entry is dropped rather than failing the whole config load. Regex
+    VALIDITY is deliberately not checked here -- the pattern is compiled by the
+    browser in the JavaScript dialect, and Python's ``re`` accepts/rejects a
+    different language; the frontend skips rules that fail to compile.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[LinkPatternRule] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if len(out) >= LINK_PATTERNS_MAX:
+            break
+        if not isinstance(entry, dict):
+            continue
+        pattern = entry.get("pattern")
+        url = entry.get("url")
+        if not isinstance(pattern, str) or not isinstance(url, str):
+            continue
+        # Whitespace in a regex is load-bearing (`PROJ-\d+ ` and `PROJ-\d+`
+        # match different text), so the pattern is stored EXACTLY as authored;
+        # strip() decides only whether it is blank. URLs are the opposite:
+        # the validator below refuses whitespace in the authority and the
+        # template is expanded, not matched, so edge-trimming cannot change
+        # meaning.
+        url = url.strip()
+        if not pattern.strip() or len(pattern) > LINK_PATTERN_PATTERN_MAX_LEN:
+            continue
+        if len(url) > LINK_PATTERN_URL_MAX_LEN:
+            continue
+        # http(s) only: the rewrite mints anchors into every transcript, so a
+        # javascript:/file: template must never survive to the renderer even
+        # though the frontend re-checks. link_pattern_url_ok also mirrors the
+        # renderer's origin-stability rule (no userinfo, no '{match}' in the
+        # authority) so what the config stores is what actually renders.
+        if not link_pattern_url_ok(url):
+            continue
+        # First-wins on duplicate patterns. The settings PUT rejects
+        # duplicates outright, so this only meets hand-edited config files —
+        # where dropping the shadowed twin beats dropping the whole list.
+        if pattern in seen:
+            continue
+        seen.add(pattern)
+        out.append(LinkPatternRule(pattern=pattern, url=url))
+    return out
+
+
+def link_pattern_url_ok(url: str) -> bool:
+    """True when *url* is a link-pattern template the renderer will accept.
+
+    Mirrors the frontend's ``normaliseHref``: beyond the http(s) + ``{match}``
+    floor, the renderer substitutes two DIFFERENT canary tokens and requires
+    the same origin both times, which rejects a ``{match}`` sitting in the
+    authority (where the token could steer the host) and any userinfo (which
+    ``safeHttpUrl`` refuses outright). Enforcing the same rules here keeps the
+    save honest: without them a template like ``https://{match}.example/x`` or
+    ``https://u:p@host/{match}`` stores fine, renders nothing, and shows no
+    warning anywhere.
+    """
+    # Scheme case-insensitively, like the browser's URL parser the editor
+    # validates with: `HTTPS://x/{match}` must not pass the inline check and
+    # then die at the PUT with no warning. urlsplit below lowercases the
+    # scheme itself, so the origin comparison already agrees.
+    if not url.lower().startswith(("https://", "http://")) or "{match}" not in url:
+        return False
+    try:
+        origins = set()
+        for canary in ("aaa", "bbb"):
+            parts = _urlsplit(url.replace("{match}", canary))
+            # Userinfo never survives the renderer's safeHttpUrl, and the
+            # browser's URL parser refuses whitespace in the authority that
+            # Python's urlsplit tolerates — either way the rule would store
+            # fine and silently never linkify.
+            if "@" in parts.netloc or not parts.hostname:
+                return False
+            if any(ch.isspace() for ch in parts.netloc):
+                return False
+            origins.add((parts.scheme, parts.hostname, parts.port))
+        return len(origins) == 1
+    except ValueError:
+        return False
 
 
 def _coerce_int(raw: object, default: int) -> int:

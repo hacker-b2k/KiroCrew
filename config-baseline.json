@@ -40,7 +40,6 @@
         "yolo_duration": "6h",
         "notify_override_expiry": true,
         "bot_name": "",
-        "conductor_skill": false,
         "tool_search": true,
         "tool_search_min_pct": 5,
         "tool_search_min_tokens": 50000,
@@ -544,20 +543,6 @@
       "defaultValue": ""
     },
     {
-      "path": "agent.conductor_skill",
-      "kind": "core",
-      "type": "boolean",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "Conductor Skill",
-      "help": "Enable agent delegation — loads conductor skill with agent roster.",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": false
-    },
-    {
       "path": "agent.tool_search",
       "kind": "core",
       "type": "boolean",
@@ -1055,7 +1040,7 @@
         "pool_ttl_secs": 1800,
         "eager_spawn": true,
         "archive_retention_days": 30,
-        "watchdog_rss_max_mb": 0
+        "watchdog_rss_max_mb": 1536
       }
     },
     {
@@ -1194,10 +1179,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Watchdog RSS Limit (MiB)",
-      "help": "Recycle a session when its process tree resident memory exceeds this many MiB. 0 disables (default). Busy sessions (turn in flight) are never recycled.",
+      "help": "Recycle a session when its process tree resident memory exceeds this many MiB (default 1536). 0 disables. Busy sessions (turn in flight) are never recycled.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 0
+      "defaultValue": 1536
     },
     {
       "path": "taskrunner",
@@ -1476,6 +1461,9 @@
         "embed_model_url": "",
         "embed_model_path": "",
         "embed_model_id": "",
+        "embed_model_stamp": [],
+        "embed_rebuild_generation": "",
+        "embed_model_legacy_ids": [],
         "semantic_confidence_threshold": 0.8,
         "episodic_dedup_threshold": 0.88,
         "episodic_max_results": 8,
@@ -1601,11 +1589,81 @@
       "sensitive": false,
       "tags": [],
       "label": "Embedding Model ID",
-      "help": "Optional stable identifier for a custom model's vector space. Defaults to 'custom:<filename>:<size>', which changes when a different model file is used. Set this explicitly if you swap between models of identical byte size, which the default derivation cannot distinguish.",
+      "help": "Optional label for a custom model. The vector-space identity is '<label>:sha256:<digest>' of the model file's bytes, so different models of identical name and size are always told apart; this key cannot pin or override that identity. Applying a model from the dashboard writes the resulting id together with embed_model_stamp.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": "",
       "requiresRestart": true
+    },
+    {
+      "path": "memory.embed_model_stamp",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Embedding Model File Stamp",
+      "help": "Managed file identity for verified custom weights: device, inode, byte size, modification nanoseconds and change nanoseconds. An empty list means unverified.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "memory.embed_model_stamp.*",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "memory.embed_rebuild_generation",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Embedding Rebuild Generation",
+      "help": "Managed explicit-apply request identity. Stores acknowledge it only after invalidating their previous vectors; empty preserves ordinary upgrade behavior.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "memory.embed_model_legacy_ids",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Embedding Model Legacy IDs",
+      "help": "Managed compatibility labels mapped to embed_model_id and embed_model_stamp. Preserves matching stored vectors across restarts; cleared when the model identity changes.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "memory.embed_model_legacy_ids.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
     },
     {
       "path": "memory.semantic_confidence_threshold",
@@ -6004,6 +6062,8 @@
         "auto_open_browser": true,
         "prevent_sleep": false,
         "quick_send": false,
+        "model_picker_configured": false,
+        "model_picker_hidden_models": [],
         "session_grid": false,
         "mcp_app_panel": false,
         "auto_open_git_panel": false,
@@ -6026,6 +6086,7 @@
         "user_technical_level": "",
         "tips_enabled": true,
         "feature_videos_enabled": false,
+        "feature_videos_cache_max_mb": 500.0,
         "folder_suggestions_enabled": true,
         "tips_cadence_hours": 6.0,
         "tips_snooze_hours": 48.0,
@@ -6034,7 +6095,8 @@
         "tips_explore_ratio": 0.2,
         "gitlab_hosts": [],
         "jira_hosts": [],
-        "jira_auth": []
+        "jira_auth": [],
+        "link_patterns": []
       }
     },
     {
@@ -6435,7 +6497,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Response Verbosity",
-      "help": "Controls how terse the agent's prose is. 'default' is normal; 'concise' injects brevity guidelines (lead with the answer, cut filler, keep code/errors verbatim); 'ultra' writes for an ADHD reader — the answer lands in a 3-sentence opening, and any detail after it must be scannable bullets rather than prose; 'answer_only' drops explanation altogether — the answer or artifact alone, with at most one sentence of context, and detail only when the user asks for it, when the decision is consequential enough (security, exposure, data loss, spend, anything hard to undo) that they cannot choose correctly without the reasoning, or as the undo path that rides along with a destructive command. At every level security warnings and irreversible-action confirmations always appear but stay brief, and ordered multi-step instructions stay complete.",
+      "help": "Controls how terse the agent's prose is. 'default' is normal; 'concise' injects brevity guidelines (lead with the answer, cut filler, keep code/errors verbatim); 'ultra' writes for an ADHD reader — the answer lands in a 3-sentence opening, and any detail after it must be scannable bullets rather than prose; 'answer_only' drops explanation altogether — the answer alone, drawn as a picture when it has a shape, in sentences of at most twelve plain words; detail only when the user asks for it, plus one undo line for a destructive command and one risk line for anything touching security, data or spend. At every level security warnings and irreversible-action confirmations always appear but stay brief, and ordered multi-step instructions stay complete.",
       "hasChildren": false,
       "enumValues": [
         "default",
@@ -6529,6 +6591,48 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false
+    },
+    {
+      "path": "dashboard.model_picker_configured",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Model Picker Visibility Saved",
+      "help": "Internal marker set after the user saves the interactive model picker visibility list. It lets the dashboard distinguish a never-configured picker from one intentionally saved with no hidden models.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
+      "path": "dashboard.model_picker_hidden_models",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Selectable Models",
+      "help": "Model IDs hidden from the interactive chat model picker. Empty shows every advertised model; 'auto' is always shown. This preference does not change entitlement, provider model discovery, defaults, role models, fallback models, bulk switching, or app-specific model lists.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "dashboard.model_picker_hidden_models.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
     },
     {
       "path": "dashboard.session_grid",
@@ -6860,6 +6964,20 @@
       "defaultValue": false
     },
     {
+      "path": "dashboard.feature_videos_cache_max_mb",
+      "kind": "core",
+      "type": "number",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Feature Videos Cache Size (MB)",
+      "help": "Disk budget for downloaded clips. Whole release folders are evicted oldest-first to fit; the running release is never evicted. 0 = no cap.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 500.0
+    },
+    {
       "path": "dashboard.folder_suggestions_enabled",
       "kind": "core",
       "type": "boolean",
@@ -7051,6 +7169,62 @@
       "tags": [],
       "label": "Email",
       "help": "Atlassian account email for Cloud instances (used in Basic auth header). Leave empty for Server/DC instances that use a PAT.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "dashboard.link_patterns",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Transcript Link Patterns",
+      "help": "Rewrite matching plain text in chat transcripts into clickable links at display time (e.g. ticket ids like PROJ-123 to your tracker). Each rule pairs a JavaScript regex with an absolute http(s) URL template in which '{match}' inserts the matched text, percent-encoded. Rendering-only: stored messages never change. Text inside code blocks, existing links, and raw HTML is not rewritten; an inline code span whose whole text matches becomes a link chip.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "dashboard.link_patterns.*",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "dashboard.link_patterns.*.pattern",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Pattern",
+      "help": "JavaScript regular expression matched against transcript text (e.g. '\\\\bPROJ-\\\\d+\\\\b'). A rule that matches the empty string is ignored.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "dashboard.link_patterns.*.url",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "URL Template",
+      "help": "Link target for each match: an absolute http(s) URL in which '{match}' inserts the matched text, percent-encoded (e.g. 'https://tracker.example.com/browse/{match}'). The renderer additionally requires the placeholder outside the host and refuses userinfo.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""

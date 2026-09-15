@@ -12,6 +12,7 @@ paths that were gone.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -24,6 +25,17 @@ from kiro_crew.config.paths import kiro_agents_dir, kiro_home
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src" / "kiro_crew"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_default_home(monkeypatch, tmp_path):
+    """Unpinning KIROCREW_HOME must remain safe even when SEL initializes cold."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    return home
 
 
 # --------------------------------------------------------------------------
@@ -317,6 +329,38 @@ def test_global_kiro_home_in_a_worktree_still_declines(monkeypatch, tmp_path):
     assert (
         agent._decline_shared_agent_home() is not None
     ), "a globally exported KIRO_HOME bypassed the guard"
+
+
+def test_cold_sel_decline_keeps_default_home_synthetic(
+    monkeypatch, tmp_path, _isolate_default_home
+):
+    """Exercise key creation through the real writer after the override is removed."""
+    from kiro_crew import agent
+    from kiro_crew.config import paths
+    from kiro_crew.sel import SecurityEventLog
+
+    _no_overrides(monkeypatch)
+    monkeypatch.setattr(SecurityEventLog, "_instance", None)
+    audit_root = tmp_path / "cold-audit"
+    assert not audit_root.exists()
+    assert paths._resolved_home is None
+    # The real synchronous mode avoids leaving a new daemon writer behind.
+    audit = SecurityEventLog(base_dir=audit_root, sync=True)
+    home = _isolate_default_home
+    assert paths._resolved_home == home / ".kiro" / "crew"
+    assert (home / paths.RECOVERY_BREADCRUMB_NAME).is_file()
+
+    wt = _make_linked_worktree(tmp_path)
+    monkeypatch.setattr(agent, "__file__", str(wt / "src" / "kiro_crew" / "agent.py"))
+    shared = tmp_path / "shared-agents"
+    _pretend_target_is_shared(monkeypatch, agent, shared)
+    assert agent._decline_shared_agent_home() == shared / agent.AGENT_FILENAME
+    assert not shared.exists()
+    events = audit.recent()
+    assert len(events) == 1
+    assert events[0]["operation"] == "agent_home_write"
+    assert events[0]["outcome"] == "denied"
+    assert audit.verify_integrity() == (1, 1)
 
 
 def test_declines_from_a_clone_under_the_temp_dir(monkeypatch, tmp_path):
@@ -728,7 +772,21 @@ _LITERAL_RE = re.compile(r'"\.kiro"\s*/\s*"agents"' r"|[\"']\.kiro/agents")
 # for that entry, so it cannot reintroduce the reader/writer split-brain this
 # guard exists to catch; ``TestKiroAgentsDirWriteProtection`` pins the literal to
 # ``kiro_agents_dir()`` so drift still fails loudly.
-_ALLOWED = {"config/paths.py", "security/paths.py"}
+# string it refuses to ship in a curated bundle. It only matches path components
+# and never reads or writes the agents dir, and the packager runs in a standalone
+# deployment venv where ``config.paths`` is not importable, so it cannot route
+# through ``kiro_agents_dir()`` even in principle.
+_ALLOWED = {
+    "config/paths.py",
+    "security/paths.py",
+    # A third case, and a different kind. The AWS Control crew container runs as its
+    # own process inside a Linux image where ``kiro_crew`` is not importable, so
+    # ``supervisor/bundle.py`` re-implements this resolver rather than calling it.
+    # The exempt file is that module's own TEST, which asserts what the
+    # re-implementation returns against a tmp_path: it neither reads nor writes the
+    # owner's home.
+    "apps/builtins/aws_control/crew/runtime/container_tests/test_supervisor_bundle.py",
+}
 
 
 def test_no_new_hardcoded_global_agents_dir():
@@ -757,11 +815,17 @@ def test_no_new_hardcoded_global_agents_dir():
     ), "hard-coded global agents dir — use kiro_agents_dir() instead:\n" + "\n".join(offenders)
 
 
-def test_repo_has_no_python_syntax_regression():
-    """Cheap compile-all so a rewrite typo fails here rather than at import."""
+def test_repo_has_no_python_syntax_regression(tmp_path):
+    """Cheap compile-all so a rewrite typo fails here rather than at import.
+
+    Bytecode goes to a tmp cache prefix so the checkout stays clean.
+    """
+    env = {**os.environ, "PYTHONPYCACHEPREFIX": str(tmp_path / "pycache")}
     proc = subprocess.run(
         [sys.executable, "-m", "compileall", "-q", str(SRC)],
         capture_output=True,
         text=True,
+        env=env,
+        cwd=str(tmp_path),
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr

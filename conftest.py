@@ -116,8 +116,11 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import warnings
 
+import _pytest.outcomes
+import _pytest.runner
 import pytest
 
 # ── ACP frame recorder switch (rootdir floor) ───────────────────────────────
@@ -410,7 +413,7 @@ _ROOT_HAS_REAL_SYMLINKS = _root_can_create_real_symlink()
 #: * ``sudo`` — a privilege prefix, not an action. Whether the spawn mutates
 #:   anything is decided by the command it wraps, and ``sudo systemctl restart``
 #:   is already caught on ``systemctl``.
-_SERVICE_MANAGERS = frozenset({"systemctl", "launchctl"})
+_SERVICE_MANAGERS = frozenset({"systemctl", "launchctl", "schtasks", "schtasks.exe"})
 
 #: Subcommands of the managers above that CHANGE host service state.
 #:
@@ -457,6 +460,13 @@ _MUTATING_VERBS = frozenset(
         "setenv",
         "unsetenv",
         "attach",
+        # schtasks (Windows Task Scheduler). Verbs are `/Create`-style switches
+        # and case-insensitive on the command line, so they are matched lowercased.
+        "/create",
+        "/delete",
+        "/run",
+        "/end",
+        "/change",
     }
 )
 
@@ -475,7 +485,38 @@ _ALWAYS_REFUSED = frozenset({"apparmor_parser"})
 #: service on whoever runs the suite. Same shape as ``_ALLOWED`` in
 #: ``test/test_spawn_preexec_guard.py``: an entry needs a comment saying why the
 #: host mutation is acceptable.
-_HOST_SERVICE_EXEC_ALLOWED_MODULES: frozenset[str] = frozenset()
+#:
+#: The two entries below are the real-service end-to-end suites, and they are the
+#: reason the guard also recognises the pod CLI (see ``_POD_MUTATING_VERBS``): a
+#: test that drives ``kirocrew pod up`` through a CHILD interpreter reaches
+#: ``systemctl start`` / ``launchctl bootstrap`` / ``schtasks /Create`` one
+#: process removed, where the in-process manager check cannot see it. Both
+#: suites self-skip unless an operator sets their own opt-in variable
+#: (``KIROCREW_E2E_SCENARIOS`` / ``KIROCREW_E2E_POD_WINDOWS``), run against a
+#: hermetic plane (their own root, env dir, port base and unit prefix), and tear
+#: down every pod, the plane root and the plane's template unit in ``finally``.
+_HOST_SERVICE_EXEC_ALLOWED_MODULES: frozenset[str] = frozenset(
+    {
+        # The pod scenario suite (nightly ``pod-scenarios``): boots one real pod
+        # per session on the ``kirocrew-e2e-pod`` plane and reclaims it.
+        "e2e.scenarios.test_cron_fire",
+        "e2e.scenarios.test_service_install_dry_run",
+        "e2e.scenarios.test_settings_save",
+        "e2e.scenarios.test_subagent_spawn",
+        "e2e.scenarios.test_wheel_install",
+        # The Windows pod boot canary: one real Task Scheduler task on a
+        # per-run plane, removed by ``pod down`` before the test returns.
+        "test_pod_windows_boot",
+    }
+)
+
+#: ``kirocrew pod`` verbs that create, start, stop or delete a host service
+#: definition (a systemd unit, a launchd agent, a Task Scheduler task). The pod
+#: CLI is how a test reaches a service manager without naming one, so a spawn of
+#: ``kirocrew pod <verb>`` or ``python -m kiro_crew pod <verb>`` is refused for
+#: every module not listed above. Read-only verbs (``ls``, ``status``, ``api``,
+#: ``logs``) stay allowed.
+_POD_MUTATING_VERBS = frozenset({"up", "down", "install", "prune", "restart"})
 
 
 def _tokens(argv: object, *, shell: bool = False) -> list[str]:
@@ -519,8 +560,35 @@ def _refusal_reason(argv: object, *, shell: bool = False) -> str | None:
         if name not in _SERVICE_MANAGERS:
             continue
         for candidate in tokens[index + 1 :]:
-            if _basename(candidate) in _MUTATING_VERBS:
+            # `schtasks` verbs are `/Create`-style switches: `_basename` would
+            # strip the slash, so the raw token is compared lowercased as well.
+            if _basename(candidate) in _MUTATING_VERBS or candidate.lower() in _MUTATING_VERBS:
                 return f"{name} {candidate!r} changes host service state"
+    pod_reason = _pod_cli_refusal(tokens)
+    if pod_reason:
+        return pod_reason
+    return None
+
+
+def _pod_cli_refusal(tokens: list[str]) -> str | None:
+    """Name the ``kirocrew pod`` mutation in *tokens*, or ``None``.
+
+    Matches the console script (``kirocrew``, ``kirocrew.exe``) and the module
+    form (``python -m kiro_crew``), then requires the literal ``pod`` subcommand
+    followed by a verb from :data:`_POD_MUTATING_VERBS`. Anything looser would
+    refuse a test that merely passes ``"pod"`` as an argument to something else.
+    """
+    for index, token in enumerate(tokens):
+        name = _basename(token)
+        if name in {"kirocrew", "kirocrew.exe"}:
+            rest = tokens[index + 1 :]
+        elif token == "-m" and index + 1 < len(tokens) and tokens[index + 1] == "kiro_crew":
+            rest = tokens[index + 2 :]
+        else:
+            continue
+        if len(rest) >= 2 and rest[0] == "pod" and rest[1] in _POD_MUTATING_VERBS:
+            return f"kirocrew pod {rest[1]!r} changes host service state"
+        return None
     return None
 
 
@@ -878,9 +946,9 @@ def _no_credential_env_residue():
     shape. Two linear environment scans per test also catch a dynamic key that
     did not exist at setup, without masking an unrelated environment change.
     """
-    from kiro_crew.config.loader import _CREDENTIAL_KEYS, _JIRA_TOKEN_RE
+    from kiro_crew.config.loader import _JIRA_TOKEN_RE, CREDENTIAL_KEYS
 
-    fixed = frozenset(_CREDENTIAL_KEYS)
+    fixed = frozenset(CREDENTIAL_KEYS)
 
     def _is_credential(key: str) -> bool:
         return key in fixed or _JIRA_TOKEN_RE.match(key) is not None
@@ -1520,6 +1588,133 @@ def _join_test_loop_executor(item) -> None:
         return
 
 
+# Durations and phases pytest_runtest_logreport has already seen for the item whose
+# runtest protocol is in flight, keyed by node id. The escape guard uses both to
+# preserve one report per phase and to charge only time no logged report covers.
+_escape_logged_reports: dict[str, tuple[float, set[str]]] = {}
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_logreport(report):
+    """Track logged phases and durations for the in-flight escape guard."""
+    logged = _escape_logged_reports.get(report.nodeid)
+    if logged is not None:
+        duration, phases = logged
+        _escape_logged_reports[report.nodeid] = (
+            duration + max(report.duration, 0.0),
+            phases | {report.when},
+        )
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_makereport(item, call):
+    """Stop the item timeout before teardown report processing begins.
+
+    All three timed phases are finished once teardown's ``CallInfo`` completes.
+    Report serialization and ``logfinish`` must not be interrupted by that timer:
+    those hooks run outside every ``CallInfo``, where an alarm would escape the
+    protocol instead of becoming a normal test report.
+    """
+    if call.when == "teardown" and hasattr(item.ihook, "pytest_timeout_cancel_timer"):
+        item.ihook.pytest_timeout_cancel_timer(item=item)
+
+
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    """Turn a ``Failed`` that escapes the runtest protocol into that test's failure.
+
+    Every ``pytest.fail`` raised inside setup, call or teardown is caught by
+    ``CallInfo.from_call`` and becomes a report. The one that is NOT is
+    pytest-timeout's: with ``timeout_func_only`` off, its SIGALRM handler can fire
+    anywhere in the protocol -- while pytest is rendering a failure report, between
+    phases -- and ``pytest.fail("Timeout >120.0s")`` then propagates out of
+    ``pytest_runtest_protocol`` with no report logged. Under xdist that is fatal
+    to the whole session, not the test: ``xdist.remote`` sends
+    ``runtest_protocol_complete`` only when this hook RETURNS, so the controller
+    either takes the worker's traceback as an INTERNALERROR or, when the worker
+    goes on to finish, trips ``dsession.worker_workerfinished``'s
+    ``assert not crashitem`` for the still-assigned item. Either way one slow
+    test on an overloaded runner erases the shard's results.
+
+    Outermost wrapper (``tryfirst``), so it sees what every inner wrapper --
+    pytest-timeout's own included, which has already cancelled its timer by the
+    time the outcome reaches here -- let through. Only ``Failed`` is repaired: an
+    ``Exit`` escaping here is ``pytest.exit`` doing its job.
+
+    The invariant is one report per phase. The earliest of setup and call without a
+    logged report carries the escape, and teardown always runs unless it already
+    logged. This leaves three branches: no call report synthesizes the earliest
+    missing setup/call report, a call report without teardown puts the escape on the
+    teardown report, and a logged teardown emits nothing extra.
+
+    The teardown ``makereport`` hook disarms pytest-timeout before teardown report
+    logging starts. All timed phases are complete there, so serialization and
+    ``logfinish`` cannot create another timer escape. A logged teardown therefore
+    reached the controller before branch three can be entered. An alarm in the setup
+    or call logreport chain after this tracker runs but before xdist sends the report
+    can still leave that original phase absent on the controller. The synthesized
+    failure or teardown error makes that item fail loudly rather than pass green.
+
+    ``_escape_logged_reports`` records phases and durations at the start of each
+    logreport chain. ``pytest-split`` sums report durations by node id, so a
+    synthesized report owns only protocol time not charged to a logged phase. A
+    normal call keeps its elapsed time, while the replacement teardown owns only
+    teardown time. The hook then returns normally so xdist completes the item.
+
+    Teardown is required because live fixtures left on ``SetupState`` break the next
+    item on the worker. A clean teardown receives the escaped failure. Its own error
+    wins when teardown fails. Control-flow exceptions keep pytest's normal reraise
+    and interactive handling.
+    """
+    protocol_start_perf = time.perf_counter()
+    _escape_logged_reports[item.nodeid] = (0.0, set())
+    try:
+        outcome = yield
+    finally:
+        already_logged, logged_phases = _escape_logged_reports.pop(item.nodeid, (0.0, set()))
+    protocol_stop = time.time()
+    protocol_duration = time.perf_counter() - protocol_start_perf
+    excinfo = outcome.excinfo
+    if excinfo is None or not isinstance(excinfo[1], _pytest.outcomes.Failed):
+        return
+    escaped = excinfo[1]
+    if "call" not in logged_phases:
+        carrier = next(phase for phase in ("setup", "call") if phase not in logged_phases)
+
+        def _reraise():
+            raise escaped
+
+        call = _pytest.runner.CallInfo.from_call(_reraise, carrier)
+        call.duration = max(protocol_duration - already_logged, 0.0)
+        call.stop = protocol_stop
+        call.start = protocol_stop - call.duration
+        report = item.ihook.pytest_runtest_makereport(item=item, call=call)
+        item.ihook.pytest_runtest_logreport(report=report)
+        _pytest.runner.call_and_report(item, "teardown", log=True, nextitem=nextitem)
+    elif "teardown" not in logged_phases:
+        call = _pytest.runner.CallInfo.from_call(
+            lambda: item.ihook.pytest_runtest_teardown(item=item, nextitem=nextitem),
+            "teardown",
+            reraise=_pytest.runner.get_reraise_exceptions(item.config),
+        )
+        if call.excinfo is None:
+            call = _pytest.runner.CallInfo(
+                None,
+                pytest.ExceptionInfo.from_exc_info(excinfo),
+                start=call.start,
+                stop=call.stop,
+                duration=call.duration,
+                when="teardown",
+                _ispytest=True,
+            )
+        report = item.ihook.pytest_runtest_makereport(item=item, call=call)
+        item.ihook.pytest_runtest_logreport(report=report)
+        if _pytest.runner.check_interactive_exception(call, report):
+            item.ihook.pytest_exception_interact(node=item, call=call, report=report)
+    item.ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
+    outcome.force_result(True)
+
+
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)
 def pytest_runtest_teardown(item, nextitem):
     """Put the process working directory back, BEFORE any fixture teardown runs.
@@ -1973,8 +2168,35 @@ def pytest_runtest_setup(item):
 # ── tracked Windows gaps apply to every testpath ──────────────────────
 
 
+#: Ceiling on a test node id. pytest exports the running item's node id as the
+#: ``PYTEST_CURRENT_TEST`` environment variable on every setup/call/teardown, and
+#: Windows caps one environment variable at 32767 characters -- ``os.environ``
+#: raises ``ValueError`` above that, so the item ERRORS at setup on Windows while
+#: passing everywhere else. A parametrized case whose value is a large payload (a
+#: 700 KB base64 audio blob, once) is how that happens; every report line for the
+#: item then carries the blob too, and the Windows shard ran to its 40-minute cap
+#: with its log dropped. The margin below the OS limit leaves room for pytest's
+#: `` (setup)`` suffix and an xdist group tag. Collection fails with the offending
+#: id named, which is the message the shard log never got to show.
+MAX_NODEID_CHARS = 30000
+
+
+def _refuse_oversized_nodeids(items) -> None:
+    oversized = [item for item in items if len(item.nodeid) > MAX_NODEID_CHARS]
+    if not oversized:
+        return
+    worst = max(oversized, key=lambda item: len(item.nodeid))
+    raise pytest.UsageError(
+        f"{len(oversized)} test node id(s) exceed {MAX_NODEID_CHARS} characters "
+        f"(longest: {len(worst.nodeid)}, {worst.nodeid[:160]!r}...). Windows caps an "
+        "environment variable at 32767 characters and pytest exports the node id as "
+        "PYTEST_CURRENT_TEST, so these error at setup there. Give the parametrize "
+        "an explicit ids= list instead of letting the payload become the id."
+    )
+
+
 def pytest_collection_modifyitems(config, items):
-    """Apply exact capability skips, then Windows' tracked known-gap skips.
+    """Apply exact capability skips, then the tracked known-gap skips for this OS.
 
     Real-symlink tests are listed individually rather than intercepting
     ``os.symlink`` globally.  A global interception also catches production
@@ -1982,22 +2204,25 @@ def pytest_collection_modifyitems(config, items):
     a junction, silently dropping the Windows behavior those tests exist to
     cover.  Exact collection markers leave every non-link path untouched.
 
-    The list lives in ``test/windows-expected-failures.txt`` -- one unparametrized node
-    id per line, captured from the first Windows CI runs. It is a burn-down backlog:
-    fixed tests get their line deleted, and anything NOT on the list still fails the
-    job, so the Windows line holds for the tests that pass today.
+    The lists live in ``test/windows-expected-failures.txt`` and
+    ``test/macos-expected-failures.txt`` -- one unparametrized node id per line,
+    captured from the first CI runs on that OS. Each is a burn-down backlog: fixed
+    tests get their line deleted, and anything NOT on the list still fails the
+    job, so the line holds for the tests that pass today. Both go through the same
+    ``_apply_tracked_gap_list`` matcher; do not add a third mechanism.
 
-    Lives HERE rather than in ``test/conftest.py`` because the list already names node
+    Lives HERE rather than in ``test/conftest.py`` because the lists already name node
     ids under ``src/kiro_crew/apps/builtins/auto_improvement/tests/``, and a hook rooted
     at ``test/`` is never registered when only in-package tests are collected -- which is
     exactly what CI's reduced-scope Windows job does when a diff touches no path under
     ``test/``. Those entries are also absent from ``BACKEND_DESELECTS``, so they were
     collected unskipped and the shard went red for a gap that was already tracked.
 
-    The list file itself stays under ``test/``, read by path from here. Node ids are
+    The list files themselves stay under ``test/``, read by path from here. Node ids are
     always spelled with ``/`` even on Windows, so the in-package entries need no
     translation.
     """
+    _refuse_oversized_nodeids(items)
     if not _ROOT_HAS_REAL_SYMLINKS:
         listfile = _REPO_ROOT / "test" / "requires-real-symlinks.txt"
         try:
@@ -2016,24 +2241,93 @@ def pytest_collection_modifyitems(config, items):
             if _base_nodeid(item.nodeid) in requires_real_symlink:
                 item.add_marker(marker)
 
-    if not platform_compat_or_none() or not platform_compat_or_none().IS_WINDOWS:
+    pc = platform_compat_or_none()
+    if pc is None:
         return
-    listfile = _REPO_ROOT / "test" / "windows-expected-failures.txt"
+    if pc.IS_WINDOWS:
+        _apply_tracked_gap_list(items, "windows-expected-failures.txt", "Windows")
+    elif pc.IS_MACOS:
+        _apply_tracked_gap_list(items, "macos-expected-failures.txt", "macOS")
+
+
+def _apply_tracked_gap_list(items, listname: str, platform_label: str) -> None:
+    """Mark every collected item named in ``test/<listname>`` as a STRICT xfail.
+
+    ONE mechanism serves both OS gap lists. macOS reuses it rather than growing a
+    second matcher, so the node-id spelling rule (``_base_nodeid``: no ``[params]``,
+    no ``@group``) and the burn-down semantics -- anything NOT listed still fails
+    the job -- are identical on both platforms by construction.
+
+    **``xfail(strict=True)``, not ``skip``, because these files call themselves a
+    burn-down backlog and say "fix the test and DELETE the line".** A skip does not
+    execute the test, so nothing can ever report that a gap CLOSED: the list could
+    only ever grow, and 241 node ids were retired rather than tracked. Under a
+    strict xfail a listed test that still fails is green (the gap is known), and one
+    that starts PASSING fails the job with XPASS -- which is precisely the signal
+    that the line should be deleted, delivered by the same run that earned it.
+
+    Safe for the entries whose failure is intended platform behaviour rather than a
+    gap: those still FAIL on the platform they are listed for, so they xfail green
+    exactly as before. They only never burn down, which is an honesty problem with
+    the list's framing (see the frame-recorder group in
+    ``macos-expected-failures.txt``) and not a mis-fire of this mechanism.
+
+    **A listed test that HANGS must not be in this list, and the platform is why.**
+    Executing rather than skipping costs CI minutes, which is fine; what is not
+    fine is a hang. On Windows there is no ``SIGALRM``, so pytest-timeout cannot
+    interrupt the test -- it kills the process, which is why the Windows shards pass
+    ``--max-worker-restart=0``. MEASURED: one listed entry
+    (``test_config_loader.py::TestAgentWorkspaceBindingsProperties::test_workspace_path_resolution``)
+    hangs on a native Windows host, and running the list killed the session at 22%
+    with no summary line printed at all. A hanging test therefore cannot be tracked
+    here; it needs an explicit ``skipif`` at the test, with the reason, so nothing
+    about it is silent.
+
+    **An entry MAY name one parametrization, and that is what makes strict xfail
+    expressible at all.** Stripping ``[params]`` from every entry (see
+    :func:`_base_nodeid` for why the strip exists) means one line covers every
+    parametrization of a test -- which is right when they all fail, and impossible
+    when they do not: ``test_seed_audit_uses_rail_tag_not_raw_path`` has two params
+    that fail on Windows and one that passes, so a single base entry would either
+    un-track the two or red the job forever on the one. So a line WITHOUT ``[`` is
+    matched against the param-stripped id, exactly as before, and a line WITH ``[``
+    is matched against the id with its params intact. The ``@group`` suffix is
+    stripped on both sides either way, because that one is an xdist artifact rather
+    than part of the test's identity.
+    """
+    listfile = _REPO_ROOT / "test" / listname
     try:
         text = listfile.read_text(encoding="utf-8")
     except OSError:  # pragma: no cover - list file absent in a partial checkout
         return
-    expected = {
-        _base_nodeid(ln.strip())
-        for ln in text.splitlines()
-        if ln.strip() and not ln.startswith("#")
-    }
-    marker = pytest.mark.skip(
-        reason="known Windows gap -- tracked in test/windows-expected-failures.txt"
+    entries = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
+    expected_base = {_base_nodeid(e) for e in entries if "[" not in e}
+    expected_exact = {_ungrouped_nodeid(e) for e in entries if "[" in e}
+    if not expected_base and not expected_exact:
+        return
+    marker = pytest.mark.xfail(
+        reason=f"known {platform_label} gap -- tracked in test/{listname}; "
+        "delete the line when it starts passing",
+        strict=True,
     )
     for item in items:
-        if _base_nodeid(item.nodeid) in expected:
+        if (
+            _base_nodeid(item.nodeid) in expected_base
+            or _ungrouped_nodeid(item.nodeid) in expected_exact
+        ):
             item.add_marker(marker)
+
+
+def _ungrouped_nodeid(nodeid: str) -> str:
+    """A node id with only the xdist ``@group`` suffix removed, params kept.
+
+    The counterpart to :func:`_base_nodeid` for a gap-list entry that names ONE
+    parametrization. ``@group`` still has to go -- it is added by
+    ``--dist loadgroup`` and absent under ``-n0``, so leaving it in would make the
+    same entry match in one invocation and not the other -- but ``[params]`` is part
+    of what the entry is identifying and stays.
+    """
+    return nodeid.split("@")[0]
 
 
 def _base_nodeid(nodeid: str) -> str:
@@ -2562,6 +2856,7 @@ def _isolate_kirocrew_home(request, _isolation_dirs, _floor_monkeypatch):
         else:
             monkeypatch.setenv(_name, "")  # the undo for this entry is "was absent"
             monkeypatch.delenv(_name)
+    _reset_path_resolver_degradation(monkeypatch)
     paths = sys.modules.get("kiro_crew.config.paths")
     if paths is not None:
         monkeypatch.setattr(paths, "_resolved_home", None, raising=False)
@@ -2572,6 +2867,39 @@ def _isolate_kirocrew_home(request, _isolation_dirs, _floor_monkeypatch):
             raising=False,
         )
     request.node.stash[_HOME_PIN_ARMED] = True
+
+
+def _reset_path_resolver_degradation(monkeypatch) -> None:
+    """Give every test an unstalled sensitive-path resolver, and leave none behind.
+
+    ``security.paths`` remembers resolver degradation and cumulative wait in four
+    PROCESS-GLOBAL structures, and a charged prefix makes ``is_sensitive_path()``
+    answer True for every path beneath it, without touching the filesystem, until
+    the cooldown lapses. Since ``_stall_prefix`` keys on the mount, one test whose
+    resolution is merely slow on a loaded runner can therefore fail every LATER
+    test on the same xdist worker whose paths live under the same prefix -- observed
+    as 77 ``ArtifactError: refusing to use sensitive path as artifact root`` errors
+    across four unrelated files on one Windows shard, from a single charged stall.
+    Resetting on both sides makes that cascade impossible to inherit and impossible
+    to export, so a test that provokes a stall on purpose still sees only its own.
+
+    ``_path_resolve_degraded`` and ``_path_resolve_wedged`` are re-exported by the
+    ``kiro_crew.security`` facade, so they are set THROUGH it: the facade mirrors a
+    write onto the owning submodule, while patching the owner alone would leave the
+    facade holding the original object and break the export-identity contract
+    ``test_security_facade`` pins. ``_path_resolve_load_probes`` and
+    ``_path_resolve_thread_waits`` are NOT re-exported, so they must be set on the
+    submodule -- a facade write for those names would mirror nowhere and silently
+    do nothing.
+    """
+    security = sys.modules.get("kiro_crew.security")
+    paths = sys.modules.get("kiro_crew.security.paths")
+    if security is not None:
+        monkeypatch.setattr(security, "_path_resolve_degraded", {}, raising=False)
+        monkeypatch.setattr(security, "_path_resolve_wedged", [], raising=False)
+    if paths is not None:
+        monkeypatch.setattr(paths, "_path_resolve_load_probes", {}, raising=False)
+        monkeypatch.setattr(paths, "_path_resolve_thread_waits", {}, raising=False)
 
 
 def _breadcrumb_guard(real):
@@ -3183,9 +3511,16 @@ def _no_model_download(_floor_monkeypatch, _isolation_dirs):
     read the developer's real ``~/.ollama`` store — without this, download
     tests would pass/fail machine-dependently on hosts that ran the
     Ollama-era embeddings.
+
+    The same floor covers hosted feature-video media
+    (``KIROCREW_SKIP_FEATURE_VIDEO_DOWNLOAD``), honored by
+    ``feature_videos_cache.ensure_all`` and
+    ``start_background_feature_video_download``: the gateway boot path kicks that
+    transfer too, and a test that stands up the server must not reach a CDN.
     """
     monkeypatch = _floor_monkeypatch
     monkeypatch.setenv("KIROCREW_SKIP_MODEL_DOWNLOAD", "1")
+    monkeypatch.setenv("KIROCREW_SKIP_FEATURE_VIDEO_DOWNLOAD", "1")
     monkeypatch.setenv("OLLAMA_MODELS", str(_isolation_dirs("ollama-models")))
     # Force telemetry OFF for every test. `_consent_enabled` reads this env var BEFORE
     # the config flag, which is what makes it a reliable gate: ~15 tests patch
