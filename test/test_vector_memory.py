@@ -698,6 +698,37 @@ class TestValueSizeLimit:
         assert result is not None
         assert result[0].value == "value_encoding"
 
+    def test_non_ascii_lesson_embedding_is_persisted(self, tmp_path: Path) -> None:
+        # write_lesson persists the row via set_semantic (raw UTF-8) and then
+        # attaches the embedding with an UPDATE guarded on value_json. The
+        # guard must serialize with the same ensure_ascii=False flavor: an
+        # escaped dump matches no row for a non-ASCII rule, so the embedding
+        # stays NULL and the lesson is invisible to semantic search.
+        store = VectorMemoryStore(db_path=tmp_path / "mem.db")
+        store.init()
+        store.embed_fn = lambda text: [0.1] * 8
+
+        korean = "\ud55c\uad6d\uc5b4 rule that must be embeddable"
+        store.write_lesson(korean, category="knowledge", source="user_explicit")
+        row = store.db.execute(
+            "SELECT value_json, embedding FROM semantic_memory "
+            "WHERE is_deleted = 0 AND value_json LIKE '%\ud55c\uad6d\uc5b4%'"
+        ).fetchone()
+        assert row is not None
+        assert json.loads(row[0])["rule"] == korean
+        assert row[1] is not None  # embedding landed on the raw-persisted row
+
+        # ASCII control: unaffected by the serialization flavor.
+        store.write_lesson(
+            "an ascii rule that is also embeddable", category="knowledge", source="user_explicit"
+        )
+        ascii_row = store.db.execute(
+            "SELECT embedding FROM semantic_memory "
+            "WHERE is_deleted = 0 AND value_json LIKE '%ascii rule%'"
+        ).fetchone()
+        assert ascii_row is not None
+        assert ascii_row[0] is not None
+
 
 class TestEventLog:
     def test_create_event(self, tmp_path: Path) -> None:

@@ -5152,11 +5152,14 @@ class VectorMemoryStore:
                 else:
                     # Body equality pins the actual embedding input. A later edit,
                     # tombstone or completed backfill must win this tail race.
+                    # ensure_ascii=False matches the representation set_semantic
+                    # persists; an escaped dump would match no row for a
+                    # non-ASCII lesson, leaving its embedding NULL.
                     self.db.execute(
                         f"UPDATE {self._sem_rel} SET embedding = ? WHERE key = ? "
                         f"AND value_json = ? AND embedding IS NULL AND is_deleted = 0"
                         f"{self._sem_guard}",
-                        (emb_blob, key, json.dumps(value)),
+                        (emb_blob, key, json.dumps(value, ensure_ascii=False)),
                     )
         # ``matched`` is pass 1's verdict: it rewrote an EXISTING row under that row's
         # own key to attach a clause, which is an enrichment. Every other route here
