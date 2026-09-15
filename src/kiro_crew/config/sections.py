@@ -1110,13 +1110,6 @@ class AgentConfig:
             "Custom name the bot identifies as in conversations. Leave empty for default.",
         ),
     )
-    conductor_skill: bool = field(
-        default=False,
-        metadata=_meta(
-            "Conductor Skill",
-            "Enable agent delegation — loads conductor skill with agent roster.",
-        ),
-    )
     tool_search: bool = field(
         default=True,
         metadata=_meta(
@@ -1787,11 +1780,36 @@ class MemoryConfig:
         default="",
         metadata=_meta(
             "Embedding Model ID",
-            "Optional stable identifier for a custom model's vector space. Defaults to "
-            "'custom:<filename>:<size>', which changes when a different model file is "
-            "used. Set this explicitly if you swap between models of identical byte size, "
-            "which the default derivation cannot distinguish.",
+            "Optional label for a custom model. The vector-space identity is "
+            "'<label>:sha256:<digest>' of the model file's bytes, so different models "
+            "of identical name and size are always told apart; this key cannot pin or "
+            "override that identity. Applying a model from the dashboard writes the "
+            "resulting id together with embed_model_stamp.",
             restart=True,
+        ),
+    )
+    embed_model_stamp: list[int] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Embedding Model File Stamp",
+            "Managed file identity for verified custom weights: device, inode, byte size, "
+            "modification nanoseconds and change nanoseconds. An empty list means unverified.",
+        ),
+    )
+    embed_rebuild_generation: str = field(
+        default="",
+        metadata=_meta(
+            "Embedding Rebuild Generation",
+            "Managed explicit-apply request identity. Stores acknowledge it only after "
+            "invalidating their previous vectors; empty preserves ordinary upgrade behavior.",
+        ),
+    )
+    embed_model_legacy_ids: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Embedding Model Legacy IDs",
+            "Managed compatibility labels mapped to embed_model_id and embed_model_stamp. "
+            "Preserves matching stored vectors across restarts; cleared when the model identity changes.",
         ),
     )
     semantic_confidence_threshold: float = field(
@@ -2933,6 +2951,26 @@ class DashboardConfig:
             "Click a suggested reply to send it instantly. Shift+Click to select multiple.",
         ),
     )
+    model_picker_configured: bool = field(
+        default=False,
+        metadata=_meta(
+            "Model Picker Visibility Saved",
+            "Internal marker set after the user saves the interactive model "
+            "picker visibility list. It lets the dashboard distinguish a "
+            "never-configured picker from one intentionally saved with no "
+            "hidden models.",
+        ),
+    )
+    model_picker_hidden_models: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Selectable Models",
+            "Model IDs hidden from the interactive chat model picker. Empty shows "
+            "every advertised model; 'auto' is always shown. This preference does "
+            "not change entitlement, provider model discovery, defaults, role "
+            "models, fallback models, bulk switching, or app-specific model lists.",
+        ),
+    )
     session_grid: bool = field(
         default=False,
         metadata=_meta(
@@ -3164,6 +3202,14 @@ class DashboardConfig:
             "Feature Videos Enabled",
             "Show short feature-intro clips for features this install has not used "
             "yet. Instance-wide kill switch.",
+        ),
+    )
+    feature_videos_cache_max_mb: float = field(
+        default=500.0,
+        metadata=_meta(
+            "Feature Videos Cache Size (MB)",
+            "Disk budget for downloaded clips. Whole release folders are evicted "
+            "oldest-first to fit; the running release is never evicted. 0 = no cap.",
         ),
     )
     folder_suggestions_enabled: bool = field(

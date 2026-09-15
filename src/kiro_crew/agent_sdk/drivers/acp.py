@@ -13,8 +13,9 @@ mise, and an augmented PATH that includes shims a bare ``shutil.which`` cannot
 see. A second search would tell the operator they are ready and then fail the
 session, which is a worse outcome than saying nothing.
 
-Every function returns plain data -- a bool, a string, a tuple of bools -- so no
-ACP type crosses the boundary. Two consequences are deliberate rather than
+Install queries return plain data -- a bool, a string, a tuple of bools -- so no
+ACP type crosses the boundary. The context bridge additionally returns a narrow
+SDK role protocol, never the concrete provider type. Two consequences are deliberate rather than
 incidental:
 
 * **A resolver that raises is left to raise.** The failed-CHECK verdict belongs
@@ -36,16 +37,37 @@ sandbox posture at their defining modules.
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from kiro_crew.agent_sdk.context import ContextPromptProvider
+
 __all__ = [
+    "context_provider_of",
+    "projected_session_mcp_servers",
     "agent_spec_mcp_refs",
     "claude_adapter_cached_negative",
     "claude_adapter_install_command",
     "claude_components_resolve",
     "derived_agent_permissions",
+    "finish_suspended_spawn",
     "kiro_cli_resolves",
     "resolve_pin_spelling",
     "run_kiro_native_commands",
 ]
+
+
+def finish_suspended_spawn(process: object, pid: int, *, label: str) -> bool:
+    """Apply the backend spawn policy, translating its typed failure to a bool."""
+    from kiro_crew.acp.client import AcpError
+    from kiro_crew.acp.client import finish_suspended_spawn as _impl
+
+    try:
+        _impl(process, pid, label=label)  # type: ignore[arg-type]
+    except AcpError:
+        return False
+    return True
 
 
 def resolve_pin_spelling(model_id: str, advertised: object) -> str:
@@ -152,13 +174,20 @@ def agent_spec_mcp_refs(agent: str) -> tuple[bool, list[tuple[str, list[str], bo
     return True, sorted(rows)
 
 
-def backend_mcp_projection(backend: str) -> tuple[str, str, str] | None:
+def backend_mcp_projection(backend: str) -> tuple[str, str, str, str] | None:
     """How *backend* is declared to receive Crew's MCP servers, as plain data.
 
-    Returns ``(kind, channel, tracking)`` -- the kind spelled as its wire value
-    (``native`` / ``mirror`` / ``external`` / ``no-channel``) -- or ``None`` for a
-    backend with no declaration, which is a state the parity test refuses rather
-    than one a consumer should render.
+    Returns ``(kind, channel, tracking, per_tool_deny)`` -- the kind spelled as its
+    wire value (``native`` / ``mirror`` / ``external`` / ``no-channel``) -- or
+    ``None`` for a backend with no declaration, which is a state the parity test
+    refuses rather than one a consumer should render.
+
+    ``per_tool_deny`` is the reach of the spec's per-TOOL MCP restriction on this
+    backend, ``""`` where the declaration carries none (every kind but ``mirror``).
+    It rides along because it answers an operator's question that the other three
+    fields cannot: whether switching ONE tool off removes that tool or the whole
+    server. The kind says the servers arrive; this says what a restriction on them
+    is worth when it does.
 
     The record's ``reason`` is deliberately NOT projected. It is written for the
     reader of the registry, at registry length, and the consumer renders the two
@@ -180,7 +209,13 @@ def backend_mcp_projection(backend: str) -> tuple[str, str, str] | None:
         declared = projection_for(backend)
     except Exception:
         return None
-    return (str(declared.kind.value), declared.channel, declared.tracking)
+    reach = declared.per_tool_deny
+    return (
+        str(declared.kind.value),
+        declared.channel,
+        declared.tracking,
+        str(reach.value) if reach is not None else "",
+    )
 
 
 def kiro_cli_resolves() -> bool:
@@ -341,6 +376,52 @@ def opencode_install_command() -> str:
     return OPENCODE_INSTALL_COMMAND
 
 
+def pi_components_resolve() -> tuple[bool, bool]:
+    """``(adapter, pi_cli)`` -- the pi backend's two halves, separately.
+
+    ``_resolve_pi_acp_bin`` finds the adapter Crew spawns; ``_resolve_pi_bin``
+    finds the agent the adapter spawns, which Crew must ALSO resolve because its
+    gate launcher execs it by absolute path. Two answers rather than one
+    conjunction, for the reason the claude seam gives: the two halves are
+    different half-installs with the same remedy but different diagnoses.
+    """
+    from kiro_crew.acp.client import _resolve_pi_acp_bin, _resolve_pi_bin
+
+    adapter_argv, _searched = _resolve_pi_acp_bin()
+    pi_bin, _searched_pi = _resolve_pi_bin()
+    return bool(adapter_argv), bool(pi_bin)
+
+
+def pi_cached_negative() -> bool:
+    """Has the RUNNING gateway already resolved either pi component as absent?
+
+    Two caches, one answer: a cached miss on EITHER component means the next spawn
+    fails regardless of what a fresh probe finds. Consulted, never invalidated, for
+    the reason ``claude_adapter_cached_negative`` gives.
+    """
+    from kiro_crew.acp import client as _client
+
+    unresolved = getattr(_client, "_UNRESOLVED", object())
+    for name in ("_pi_acp_argv_cache", "_pi_bin_cache"):
+        cached = getattr(_client, name, None)
+        if cached is None or cached is unresolved:
+            continue
+        try:
+            found, _searched = cached  # type: ignore[misc]
+        except Exception:
+            continue
+        if not found:
+            return True
+    return False
+
+
+def pi_install_command() -> str:
+    """The one command that installs both pi components, from the spawn path."""
+    from kiro_crew.acp.client import PI_INSTALL_COMMAND
+
+    return PI_INSTALL_COMMAND
+
+
 def claude_adapter_install_command() -> str:
     """``npm i -g <adapter package>`` -- the adapter's remedy, from the repo.
 
@@ -406,3 +487,29 @@ async def run_kiro_native_commands(
     finally:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(client.shutdown(), timeout=10.0)
+
+
+def context_provider_of(value: object) -> "ContextPromptProvider | None":
+    """Admit real provider implementations, not mock/proxy-advertised attributes."""
+    from typing import cast
+
+    from kiro_crew.agent_sdk.context import ContextPromptProvider
+    from kiro_crew.providers.base import LLMProvider
+
+    if issubclass(type(value), LLMProvider):
+        return cast(ContextPromptProvider, value)
+    return None
+
+
+def projected_session_mcp_servers(
+    agent: str | None, *, work_dir: "str | Path | None" = None
+) -> list[dict[str, Any]]:
+    """Return the existing filtered session MCP projection as plain data.
+
+    Blocking file reads remain the caller's off-loop responsibility. This does
+    not grant authority or start servers; the provider still owns transport and
+    private-session admission. Errors retain the underlying resolver's behavior.
+    """
+    from kiro_crew.acp.session_mcp import session_mcp_servers
+
+    return session_mcp_servers(agent, work_dir=work_dir)

@@ -177,6 +177,7 @@ class TestConductorInstaller:
         for verb in (
             "chat_folder_tree",
             "chat_folder_create",
+            "chat_folder_file_self",
             "session_create",
             "session_read_message",
         ):
@@ -195,6 +196,7 @@ class TestConductorInstaller:
         assert dashboard == {
             "@kirocrew-dashboard/chat_folder_tree",
             "@kirocrew-dashboard/chat_folder_create",
+            "@kirocrew-dashboard/chat_folder_file_self",
             "@kirocrew-dashboard/session_create",
             "@kirocrew-dashboard/session_read_message",
         }
@@ -491,6 +493,23 @@ class TestConductorInstaller:
         assert "work_ledger_read` first, every cycle" in body
         assert "action=accept" in body
 
+    def test_prompt_and_skill_close_a_child_once_its_item_is_terminal(self, tmp_path, monkeypatch):
+        """A conductor that stops an item's loop and leaves its session open leaves a
+        finished worker parked in the sidebar with nothing to re-arm. The prompt
+        names the verb in the child-session tool line, and the skill ties it to
+        ``action=close`` so ending the item and ending its session are one step.
+        """
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
+        assert "`session_close` (close a child once its item is terminal)" in prompt
+        body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
+        assert "Closing the item and closing its session happen together" in body
+        assert "`session_close` archives (reopenable); it never deletes" in body
+        assert "`session_close` each one whose item is terminal" in body
+        assert (
+            "leave open any child still holding a pending human question or driving an"
+            " unmerged PR" in body
+        )
+
     def test_skill_feeds_the_evaluator_through_a_quoted_heredoc(self):
         """The acceptance document is built from ingested text, and the skill's
         example is what the agent copies. A ``printf '%s' '<json>'`` form ends its
@@ -574,6 +593,7 @@ class TestConductorInstaller:
             "@kirocrew-core/ask_question",
             "@kirocrew-dashboard/chat_folder_tree",
             "@kirocrew-dashboard/chat_folder_create",
+            "@kirocrew-dashboard/chat_folder_file_self",
             "@kirocrew-dashboard/session_create",
             "@kirocrew-dashboard/session_read_message",
             "@kirocrew-work/work_ledger_read",
@@ -611,6 +631,7 @@ class TestConductorInstaller:
         ]
         dashboard_resources = [
             "kirocrew-dashboard/chat_folder_create",
+            "kirocrew-dashboard/chat_folder_file_self",
             "kirocrew-dashboard/chat_folder_tree",
             "kirocrew-dashboard/session_create",
             "kirocrew-dashboard/session_read_message",
@@ -739,6 +760,7 @@ class TestConductorInstaller:
             "@kirocrew-core/ask_question",
             "@kirocrew-dashboard/chat_folder_tree",
             "@kirocrew-dashboard/chat_folder_create",
+            "@kirocrew-dashboard/chat_folder_file_self",
             "@kirocrew-dashboard/session_create",
             "@kirocrew-dashboard/session_read_message",
             "@kirocrew-work/work_ledger_read",
@@ -806,11 +828,10 @@ class TestConductorInstaller:
     def test_builtin_skill_does_not_collide_with_the_delegation_skill(self):
         """The packaged skill must NOT be named ``conductor``.
 
-        ``conductor_skill.generate_conductor_skill`` owns
-        ``<skills>/conductor/SKILL.md``, and two paths DELETE that file when
-        ``agent.conductor_skill`` is false (the default): ``cli_setup`` on every
-        setup run and the dashboard config handler on toggle-off. A packaged
-        skill sharing the name would be erased on a stock install.
+        ``<skills>/conductor/SKILL.md`` was the delegation skill the retired
+        ``agent.conductor_skill`` flag generated, and ``kirocrew setup`` still
+        removes a file there whose bytes it wrote on old installs. A packaged
+        skill sharing the name would be erased on an upgraded install.
         """
         assert SKILL_DIR.is_dir()
         assert not (_BUILTIN_SKILLS_DIR / "conductor").exists()
@@ -835,6 +856,40 @@ class TestConductorInstaller:
         # legitimate mention of the tool elsewhere in the skill must not fail a
         # pin whose intent is only that the precreation step stay deleted.
         assert "1. `chat_folder_create`" not in text, "no folder-precreation dispatch step"
+
+    def test_skill_files_the_conductor_itself_under_the_goal(self):
+        """The conductor sits INSIDE the goal's folder, beside its workers.
+
+        The live shape this pins away from: workers filed under the goal while
+        the conductor's own session floats at the top level, so the person has
+        nothing that groups a goal's sessions with the session driving them.
+        The opening plan turn files the conductor with ``chat_folder_file_self``
+        — the verb that writes only the caller's own placement and so never
+        prompts — and the skill must name it there, not leave it to the model
+        to discover.
+        """
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        opening = text.split("### Round 0")[1].split("### Dispatch a round")[0]
+        assert "`chat_folder_file_self`" in opening, "the plan turn must file the conductor"
+        # The auto-approved list must say it never prompts, or a patrol cycle
+        # with nobody at the keyboard would be told to expect one.
+        assert "`chat_folder_file_self` (it writes only your own placement)" in text
+
+    def test_skill_files_each_worker_under_a_per_agent_subfolder(self):
+        """Dispatch files a worker at ``<goal folder>/<agent>``, not the goal root.
+
+        One heading per goal, the conductor directly under it, and one subfolder
+        per agent kind holding that agent's sessions — so the tree reads as
+        goal / who / what, and a nested conductor's own subtree nests under the
+        ``kirocrew-conductor`` subfolder instead of flattening into its parent's.
+        """
+        text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        dispatch = text.split("### Dispatch a round")[1].split("### Patrol")[0]
+        assert "`<goal folder>/<agent>`" in dispatch, "dispatch must name the per-agent path"
+        assert "kirocrew-worker`" in dispatch, "the example must show a real agent segment"
+        # Still the atomic create: the subfolder rides the create's own
+        # ``folder`` argument, never a second move step.
+        assert "2. `session_create`" in dispatch
 
 
 class _proc:

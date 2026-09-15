@@ -47,9 +47,9 @@ export const CHUNK_BUDGETS = {
   // recent catalog increments included in this measurement; Dev Fleet's
   // per-pod system readout then adds its own strings across the same 12
   // catalogs on top of that baseline. The Drive gallery's keys across 13
-  // catalogs and this branch's structured-monitor and session-mode additions
-  // ride inside the headroom that measurement already left, so this branch
-  // does not move the ceiling.
+  // catalogs and this stack's structured-monitor, session-mode, and
+  // source-provider additions ride inside the headroom that measurement already
+  // left, so this stack does not move the ceiling.
   // Re-measured 2026-09-06: main @ 3a6478967 alone builds the chunk at
   // 10,700,930 B (10450 KB) against the 10490 KB ceiling -- 0.4% headroom, so
   // any feature PR shipping a normal set of keys across the 13 catalogs fails
@@ -102,7 +102,18 @@ export const CHUNK_BUDGETS = {
   // merged analyze build measures the chunk at 807,525 B (788.6 KB); keep
   // roughly 5% headroom (matching the `all` entry's convention above) over that
   // combined measurement so expected catalog growth does not block descendants.
-  t: 819 * KB, // measured 788.6 KB on the merged (structured-monitor + managed-credentials) build (~3.7% headroom)
+  // Re-measured 2026-09-13 on the reviewed member capability inheritance
+  // branch rebased onto main @ f382f0a70: the analyze build emits the chunk at
+  // 839,943 B (820.3 KB) against the 819 KB ceiling -- 1,287 B over. The
+  // growth is English catalog copy only: the feature's 96 keys
+  // (`crewCapabilities` / `crewCapabilityEditing`, ~4.7 KB) plus 15 upstream
+  // keys that landed on main after the branch's previous rebase. The chunk
+  // report counts 12 modules; this PR adds no dependency. This is the
+  // documented catalog-growth drift again: the previous ceiling
+  // was set at 3.7% over its own measurement, below the 5% convention, and
+  // ordinary catalog growth since then used that margin up. Back to the 5%
+  // convention over the measured size.
+  t: 861 * KB, // measured 820.3 KB on the capability-inheritance build rebased onto f382f0a70 (~5% headroom)
 
   // Pierre editor implementation (PR #4072 replaced Monaco, whose
   // 'editor.api2' chunk this entry set used to carry) -- the code-editor

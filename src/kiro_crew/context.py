@@ -12,7 +12,8 @@ import re
 import threading
 import time
 import unicodedata
-from collections.abc import Callable
+from collections import defaultdict, deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,9 +30,11 @@ from kiro_crew.cron import get_local_tz
 from kiro_crew.hooks import (
     HOOK_INJECT_CONTEXT,
     HOOK_MODIFY,
+    FileTooLargeError,
     HookManager,
     HookResult,
     safe_read_file,
+    safe_read_file_bytes_nolink,
 )
 from kiro_crew.learn import LessonStore
 from kiro_crew.members import (
@@ -59,6 +62,7 @@ from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.skills import SkillsLoader
 
 if TYPE_CHECKING:
+    from kiro_crew.agent_sdk import ContextPromptProvider
     from kiro_crew.channel_history import ChannelHistory
     from kiro_crew.history import ConversationLog
     from kiro_crew.session import SessionManager
@@ -386,10 +390,13 @@ async def session_store_for_turn(ctx_builder: object, session_key: str) -> str:
     part that is easy to get wrong, and the store a caller resolves is the store its
     vectors must be prepared for.
     """
+
     store = await asyncio.to_thread(
         store_of_session, getattr(ctx_builder, "conversation_log", None), session_key
     )
-    await prepare_store_vectors(ctx_builder, store, session_key=session_key)
+    modes = getattr(ctx_builder, "_session_memory_modes", None)
+    if not isinstance(modes, dict) or modes.get(session_key) != "temporary":
+        await prepare_store_vectors(ctx_builder, store, session_key=session_key)
     return store
 
 
@@ -402,6 +409,24 @@ async def inherit_session_memory(
     from kiro_crew.memory_stores import UnknownMemoryStore, memory_store_version
 
     log = getattr(ctx_builder, "conversation_log", None)
+    modes = getattr(ctx_builder, "_session_memory_modes", None)
+    if isinstance(modes, dict):
+        from kiro_crew.messaging.privacy_mode import strictest
+
+        resolver = getattr(ctx_builder, "memory_mode_for_session", None)
+        mode = await resolver(parent_session_key) if resolver is not None else "persistent"
+        if mode not in {"persistent", "incognito", "temporary"}:
+            raise ValueError("The originating session's memory mode is unavailable")
+        mode = strictest((mode, modes.get(session_key, "persistent"))) or "persistent"
+        if resolver is not None:
+            from kiro_crew.subagent_persistence import bind_session_memory_mode
+            from kiro_crew.workflows.registry import _await_owned
+
+            publication = asyncio.create_task(
+                asyncio.to_thread(bind_session_memory_mode, session_key, mode)
+            )
+            mode = await _await_owned(publication)
+        modes[session_key] = strictest((mode, modes.get(session_key, "persistent"))) or "persistent"
     store = await asyncio.to_thread(store_of_session, log, parent_session_key)
     if store:
         private = await asyncio.to_thread(memory_store_version, store) == 2
@@ -416,6 +441,14 @@ async def inherit_session_memory(
         # Named V1 stores have no protected registry record, but their child must
         # still retain the parent's recorded store rather than widening to Global.
         await asyncio.to_thread(log.update_metadata, session_key, {"memory_store": store})
+    if (
+        isinstance(modes, dict)
+        and log is not None
+        and modes.get(session_key) in {"incognito", "temporary"}
+    ):
+        await asyncio.to_thread(
+            log.update_metadata, session_key, {"memory_mode": modes[session_key]}
+        )
     return await session_store_for_turn(ctx_builder, session_key)
 
 
@@ -450,61 +483,64 @@ async def _build_store_vectors(name: str) -> "VectorMemoryStore | None":
     with _stores_lock:
         generation = _store_cache_generation
 
-    def _construct() -> VectorMemoryStore:
-        mem = KiroCrewConfig.load().memory
-        return VectorMemoryStore(
-            db_path=resolve_store_path(name),
-            confidence_threshold=mem.semantic_confidence_threshold,
-            extra_prefixes=mem.semantic_keys or None,
-            episodic_limit=mem.episodic_max_results,
-            embedding_dim=mem.embedding_dim,
-            decay_rates=mem.decay_rates or None,
-        )
+    cancelled = threading.Event()
 
-    store = await asyncio.to_thread(_construct)
-    await asyncio.to_thread(store.init)
-    # Every store and lazy rebind uses the same bounded embedding cache/worker.
-    store.embed_fn_factory = make_sync_embed_fn
-    if await asyncio.to_thread(model_file_present):
-        store.embed_fn = await asyncio.to_thread(_shared_embed_fn)
-    # Stamp the store's embedding space. An unstamped store is ASSERTED to hold
-    # bundled-model vectors, which for a store an operator fills under a different
-    # backend is a lie that scores incomparable vectors confidently. The stamp may
-    # refuse when the active backend is not ready; a brand-new store has nothing
-    # to lose by staying unstamped until a later boot.
-    try:
-        await asyncio.to_thread(reconcile_store_embedding_space, store)
-    except Exception:
-        logger.debug("could not stamp the embedding space for store %r", name, exc_info=True)
-    try:
-        await asyncio.to_thread(require_memory_store, name)
-    except BaseException:
-        await asyncio.to_thread(store.close)
-        raise
-    # DECIDE under the lock, CLOSE after it. The lock is a threading.Lock and
-    # ``get_memory_for`` takes it synchronously, so awaiting anything while
-    # holding it blocks the loop thread for every other caller -- the exact stall
-    # this function's contract promises it avoids.
-    with _stores_lock:
-        retired_during_build = generation != _store_cache_generation
-        existing = _vector_stores.get(name)
-        if existing is None and not retired_during_build:
-            _vector_stores[name] = store
-            cached = _memory_stores.get(_STORE_KEY_PREFIX + name)
-            if cached is not None:
-                cached.vector_store = store
-    if retired_during_build:
-        await asyncio.to_thread(store.close)
-        raise UnknownMemoryStore("Memory cache changed during preparation; retry the member turn")
-    if existing is not None:
-        # Lost a race. One instance per db_path is an invariant -- two instances
-        # over one file do not share ``_db_lock`` -- so drop ours.
+    def _prepare() -> VectorMemoryStore | None:
+        # The worker owns the connection until cache publication. Cancellation
+        # cannot close it under init(), or strand its lock FD after init returns.
+        store: VectorMemoryStore | None = None
+        published = False
         try:
-            await asyncio.to_thread(store.close)
-        except Exception:
-            logger.debug("could not close a redundant vector store", exc_info=True)
-        return existing
-    return store
+            mem = KiroCrewConfig.load().memory
+            store = VectorMemoryStore(
+                db_path=resolve_store_path(name),
+                confidence_threshold=mem.semantic_confidence_threshold,
+                extra_prefixes=mem.semantic_keys or None,
+                episodic_limit=mem.episodic_max_results,
+                embedding_dim=mem.embedding_dim,
+                decay_rates=mem.decay_rates or None,
+            )
+            store.init()
+            if cancelled.is_set():
+                return None
+            store.embed_fn_factory = make_sync_embed_fn
+            if model_file_present():
+                store.embed_fn = _shared_embed_fn()
+            try:
+                reconcile_store_embedding_space(store)
+            except Exception:
+                logger.debug(
+                    "could not stamp the embedding space for store %r", name, exc_info=True
+                )
+            require_memory_store(name)
+            with _stores_lock:
+                if cancelled.is_set():
+                    return None
+                if generation != _store_cache_generation:
+                    raise UnknownMemoryStore(
+                        "Memory cache changed during preparation; retry the member turn"
+                    )
+                existing = _vector_stores.get(name)
+                if existing is not None:
+                    return existing
+                _vector_stores[name] = store
+                published = True
+                cached = _memory_stores.get(_STORE_KEY_PREFIX + name)
+                if cached is not None:
+                    cached.vector_store = store
+            return store
+        finally:
+            if store is not None and not published:
+                store.close()
+
+    try:
+        return await asyncio.to_thread(_prepare)
+    except asyncio.CancelledError:
+        # Serialize cancellation against publication; a published instance is
+        # owned by the cache, otherwise the worker's finally owns its cleanup.
+        with _stores_lock:
+            cancelled.set()
+        raise
 
 
 # Per-section budget BASE — the char count each section's percentage cap is
@@ -824,14 +860,24 @@ def _marker_spans(
         # actually matches.
         norm: list[str] = []
         origin: list[int] = []
-        for idx, ch in enumerate(text):
-            for compatible in unicodedata.normalize("NFKC", ch):
+        cursor = 0
+        # ASCII is unchanged by every normalization below. Copy entire runs in
+        # C instead of paying the Unicode pipeline per character whenever one
+        # non-ASCII character appears anywhere in a large prompt.
+        for match in re.finditer(r"[^\x00-\x7f]", text):
+            idx = match.start()
+            norm.append(text[cursor:idx])
+            origin.extend(range(cursor, idx))
+            cursor = idx + 1
+            for compatible in unicodedata.normalize("NFKC", match.group()):
                 if _is_marker_ignorable(compatible):
                     continue
                 folded = compatible.translate(_MULTIBYTE_TABLE)
                 for candidate in folded:
                     norm.append("-" if unicodedata.category(candidate) == "Pd" else candidate)
                     origin.append(idx)
+        norm.append(text[cursor:])
+        origin.extend(range(cursor, len(text)))
 
         norm_str = "".join(norm)
         raw = []
@@ -2319,19 +2365,68 @@ _REPLAY_INJECT_MAX_ROWS = (
 _REPLAY_CONVERSATION_MAX_ROWS = 500
 
 
+def _replay_identity(row: dict) -> tuple | None:
+    """Delivery identity, never a global text-equality deduplication key."""
+    meta = row.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+    for field in ("mid", "sendId"):
+        value = meta.get(field)
+        if isinstance(value, str) and value:
+            return (field, value, row.get("role"))
+    ts = row.get("ts")
+    if ts:
+        return ("legacy", ts, row.get("role"), row.get("content"))
+    return None
+
+
+def _merge_replay_rows(disk: list[dict], pending: list[dict], current: dict | None) -> list[dict]:
+    """Reconcile one snapshot before quota selection, budgeting and formatting."""
+    from kiro_crew.history import transcript_sort_key
+
+    current_id = _replay_identity(current) if current is not None else None
+    rows: list[dict] = []
+    positions: dict[tuple, deque[int]] = defaultdict(deque)
+    for row in disk:
+        identity = _replay_identity(row)
+        if current_id is not None and identity == current_id:
+            continue
+        if identity is not None:
+            positions[identity].append(len(rows))
+        rows.append(row)
+    for row in pending:
+        identity = _replay_identity(row)
+        if row is current or (current_id is not None and identity == current_id):
+            continue
+        matches = positions.get(identity) if identity is not None else None
+        if matches:
+            rows[matches.popleft()] = row
+        else:
+            rows.append(row)
+    # Timestamps from each writer share the transcript ordering contract. Keep
+    # insertion order for legacy fixtures/rows with no timestamp at all.
+    if rows and all(row.get("ts") for row in rows):
+        rows.sort(key=lambda row: transcript_sort_key(row["ts"]))
+    return rows
+
+
 def _replay_rows(
-    conversation_log: "ConversationLog",
+    conversation_log: "ConversationLog | None",
     session_key: str,
     *,
     exclude_last_n: int = 0,
+    pending_messages: list[dict] | None = None,
+    current_message: dict | None = None,
 ) -> list[dict]:
     """Tail of the chain under per-role quotas, in chronological order.
 
     Conversation rows get the full quota whatever the inject volume, which a
     single bounded query cannot guarantee.
     """
-    messages = conversation_log.read_messages_chained(session_key)
-    if exclude_last_n > 0:
+    messages = conversation_log.read_messages_chained(session_key) if conversation_log else []
+    if pending_messages is not None or current_message is not None:
+        messages = _merge_replay_rows(messages, pending_messages or [], current_message)
+    elif exclude_last_n > 0:
         messages = messages[:-exclude_last_n]
     kept: list[dict] = []
     conv = inj = 0
@@ -2402,11 +2497,13 @@ def _recall_rows(
 
 
 def build_session_replay(
-    conversation_log: "ConversationLog",
+    conversation_log: "ConversationLog | None",
     session_key: str,
     *,
     exclude_last_n: int = 0,
     model_window: int | None = None,
+    pending_messages: list[dict] | None = None,
+    current_message: dict | None = None,
 ) -> str | None:
     """Build session replay from KiroCrew's conversation_log.
 
@@ -2417,8 +2514,9 @@ def build_session_replay(
     Same-provider resume uses native ACP session/load instead (full fidelity
     without needing this injection).
 
-    *exclude_last_n* is forwarded to ``conversation_log.recent_chained`` to
-    drop the just-flushed current-turn user message from replay.
+    With *pending_messages*, merge the disk and live window by delivery identity
+    and exclude *current_message* explicitly before applying quotas or budgets.
+    The legacy *exclude_last_n* applies only when no live snapshot is supplied.
 
     *model_window* scales the replay budget to the active model's context
     window (the dashboard's primary history vehicle — it must shrink on a
@@ -2426,7 +2524,13 @@ def build_session_replay(
     window). ``None`` ⇒ the 1M reference (unchanged default). The budget is
     scaled by the same factor as the section caps and floored to one message.
     """
-    messages = _replay_rows(conversation_log, session_key, exclude_last_n=exclude_last_n)
+    messages = _replay_rows(
+        conversation_log,
+        session_key,
+        exclude_last_n=exclude_last_n,
+        pending_messages=pending_messages,
+        current_message=current_message,
+    )
     if not messages:
         return None
 
@@ -2662,11 +2766,15 @@ class ContextBuilder:
         name = await asyncio.to_thread(_resolved_store_name, memory_store)
         if not name:
             return None
-        existing = _vector_stores.get(name)
-        if existing is not None:
-            return existing
+        from kiro_crew.embeddings import align_store_embedding_space
+
         try:
-            return await _build_store_vectors(name)
+            store = _vector_stores.get(name)
+            if store is None:
+                store = await _build_store_vectors(name)
+            if store is not None:
+                await asyncio.to_thread(align_store_embedding_space, store)
+            return store
         except Exception:
             from kiro_crew.memory_stores import memory_store_version
 
@@ -2696,6 +2804,8 @@ class ContextBuilder:
         self.lessons = lessons or LessonStore()
         self.conversation_log = conversation_log
         self.channel_history = channel_history
+        self.memory_mode_for_session: Callable[[str], Awaitable[str]] | None = None
+        self._session_memory_modes: dict[str, str] = {}
         if bot_name:
             self._bot_name = bot_name
         else:
@@ -2850,8 +2960,13 @@ class ContextBuilder:
                 "order; any required format ([OPTIONS:], diffs, PR links); one "
                 "undo line for anything destructive; one risk line for anything "
                 "touching security, data or spend.\n\n"
-                "Asked why? Same three checks, plus the reason as one line per "
-                'point. Not asked? Offer it in three words: "say why".\n'
+                "Asked why? Teach it, do not state it. One picture from daily "
+                "life: a dog, a door. Keep it to the end. An objection is a "
+                "character in it. The reasons, numbered, one short line each, "
+                "in the picture's words. End: what it is, one line. Word check "
+                "still runs. Cut check spares the picture and the reasons. This "
+                "reply may run long.\n"
+                'Not asked? Offer it in three words: "say why".\n'
                 'Asked for depth (a doc, a walkthrough, "in detail")? This '
                 "mode is off for that reply.\n\n"
                 "Reply in the user's language."
@@ -2874,7 +2989,12 @@ class ContextBuilder:
                 "You can render rich HTML inline using "
                 '`<mcwidget title="Title">HTML</mcwidget>` tags. Load the `widgets` '
                 "skill for theme variables, format rules, interactive widgets, and "
-                "best practices when emitting one.\n\n"
+                "best practices when emitting one. The frame is themed: its body "
+                "already carries the active theme's background and text color, so "
+                "color every surface with the theme's CSS variables, never a fixed "
+                "palette (`bg-white`, `bg-green-50`, a literal hex), and always set "
+                "a background together with its text color. A half-set pair renders "
+                "unreadable in dark mode.\n\n"
                 "## Artifacts\n\n"
                 "Every widget auto-registers as an UNPINNED artifact as its "
                 "response segment finalizes — do not "
@@ -2890,7 +3010,9 @@ class ContextBuilder:
                 "## Inline Widgets\n\n"
                 "You can render rich HTML inline using `<mcwidget>` tags, but prefer "
                 "plain markdown by default. Load the `widgets` skill when a widget is "
-                "genuinely warranted.\n\n"
+                "genuinely warranted. The frame is themed: color every surface with "
+                "the theme's CSS variables, never a fixed palette, and set each "
+                "background together with its text color.\n\n"
                 "## Artifacts\n\n"
                 "Every widget auto-registers as an unpinned artifact, so do not "
                 "`@kirocrew-core/artifact_save` one you rendered. Load the "
@@ -2899,39 +3021,46 @@ class ContextBuilder:
         return prompt.replace("{{WIDGET_BLOCK}}", widget_block)
 
     @staticmethod
-    def _load_agent_prompt(agent: str) -> str:
-        """Read the prompt from a custom agent's config file."""
-        agents_dir = kiro_agents_dir()
-        for f in agents_dir.glob("*.json"):
-            # Skip macOS AppleDouble sidecars ("._foo.json"); not JSON.
-            if f.name.startswith("._"):
-                continue
-            # Resolve and gate on sensitive paths before reading: a symlink
-            # under ~/.kiro/agents/ could otherwise point at a credential
-            # file (e.g. ~/.aws/credentials renamed *.json).
-            try:
-                resolved = f.resolve(strict=True)
-            except OSError:
-                continue
-            if is_sensitive_path(str(resolved)):
-                continue
-            try:
-                # ValueError covers json.JSONDecodeError + UnicodeDecodeError
-                # so a non-UTF-8 sidecar can't break context building.
-                data = json.loads(resolved.read_text(encoding="utf-8"))
-                if not isinstance(data, dict):
-                    continue
-                if data.get("name") == agent or f.stem == agent:
-                    prompt = data.get("prompt") or ""
-                    if prompt.startswith("file://"):
-                        try:
-                            return safe_read_file(prompt[7:])
-                        except (OSError, PermissionError):
-                            return ""
-                    return prompt
-            except (OSError, ValueError):
-                continue
-        return ""
+    def _load_agent_prompt(
+        agent: str, project: str | None = None, *, owner_template: str = ""
+    ) -> str:
+        """Read the resolved execution prompt, excluding an owner source in essentials."""
+        from kiro_crew.agent_discovery import _read_agent_spec
+        from kiro_crew.member_essential_context import (
+            resolve_relative_prompt_path,
+            resolve_template_path,
+        )
+
+        try:
+            path = resolve_template_path(agent, project)
+            if path is None:
+                return ""
+            data = _read_agent_spec(path, operation="agent_prompt", source="context")
+            if data is None:
+                return ""
+            prompt = data.get("prompt") or ""
+            if not isinstance(prompt, str):
+                return ""
+            # The product prompt is deliberately omitted from V2 essentials;
+            # even a fork referring to it still needs its session-start copy.
+            if agent == owner_template and prompt != f"file://{_prompt_path()}":
+                return ""
+            if prompt.startswith("file://"):
+                source = Path(prompt[7:]).expanduser()
+                if not source.is_absolute():
+                    resolved_source = resolve_relative_prompt_path(source, path, project)
+                    if resolved_source is None:
+                        return ""
+                    source, root = resolved_source
+                    prompt_bytes = safe_read_file_bytes_nolink(str(source), within_root=str(root))
+                    if prompt_bytes is None:
+                        logger.debug("Skipping relative agent prompt rejected at read time")
+                        return ""
+                    return prompt_bytes.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+                return safe_read_file(str(source))
+            return prompt
+        except (OSError, ValueError, FileTooLargeError):
+            return ""
 
     def _build_member_section(
         self, member: str, *, strict: bool = False, include_briefing: bool = True
@@ -3090,6 +3219,11 @@ class ContextBuilder:
         blocks_reads: bool = False,
         context_groups: frozenset[str] | None = None,
         profile_overrides: dict[str, str] | None = None,
+        native_documents: dict[str, str] | None = None,
+        native_envelope_out: list[str] | None = None,
+        execution_template: str = "",
+        conditional_index: bool = False,
+        trigger_text: str = "",
     ) -> str:
         """Refresh complete private-member anchors without a retrieval/model call."""
         from kiro_crew.member_essential_context import (
@@ -3108,9 +3242,29 @@ class ContextBuilder:
         documents = documents_for_member(
             template,
             project,
+            conditional_index=conditional_index,
+            context_settings=True,
+            trigger_text=trigger_text,
             include_project=not blocks_reads
             and _group_included(context_groups, CONTEXT_GROUP_PROJECT),
         )
+        if execution_template and execution_template != template:
+            sources = dict(documents)
+            for source, body in documents_for_member(
+                execution_template,
+                project,
+                conditional_index=conditional_index,
+                context_settings=True,
+                trigger_text=trigger_text,
+                include_project=not blocks_reads
+                and _group_included(context_groups, CONTEXT_GROUP_PROJECT),
+            ):
+                if source in sources and sources[source] != body:
+                    raise MemberEssentialContextError(
+                        f"Essential source {source}: changed during preparation"
+                    )
+                sources[source] = body
+            documents = list(sources.items())
         if reads:
             memory = self.get_memory_for(workspace, memory_store)
             for path, empty in (
@@ -3138,7 +3292,24 @@ class ContextBuilder:
                     "current conversation already answers the question.",
                 )
             )
-        return render_essentials(documents, identity=identity)
+        envelope = render_essentials(documents, identity=identity)
+        if native_envelope_out is not None:
+            native = native_documents or {}
+            native_envelope_out.append(
+                render_essentials(
+                    [
+                        (
+                            (source, "")
+                            if native.get(source) == body
+                            or native.get(f"template://{execution_template}#prompt") == body
+                            else (source, body)
+                        )
+                        for source, body in documents
+                    ],
+                    identity=identity,
+                )
+            )
+        return envelope
 
     def build_session_context(
         self,
@@ -3160,14 +3331,16 @@ class ContextBuilder:
         query_text: str = "",
         project: str | None = None,
         member: str = "",
+        _v2_essentials: str | None = None,
     ) -> str:
         """Build context for a new session (memory + skills + history).
 
         Injected once at session start, not on every message.
 
         When *compressed_history* is provided, it replaces the naive
-        truncation of thread history.  Callers obtain it by awaiting
-        ``compress_thread_history()`` before calling this method.
+        truncation of thread history. An empty string explicitly suppresses the
+        fallback; only None requests a fallback read. build_message uses that
+        suppression when it owns a separately budgeted outer replay.
 
         *model_window* is the active model's context window in tokens; every
         section cap is scaled proportionally to it (see ``_resolve_caps``) so a
@@ -3212,14 +3385,16 @@ class ContextBuilder:
         is_cc = is_claude_code(provider_type)
         caps = _resolve_caps(model_window)
         parts: list[str] = []
-        essentials = self._build_v2_essentials(
-            memory_store,
-            member=member,
-            project=project,
-            workspace=workspace,
-            blocks_reads=blocks_reads,
-            context_groups=context_groups,
-        )
+        essentials = _v2_essentials
+        if essentials is None:
+            essentials = self._build_v2_essentials(
+                memory_store,
+                member=member,
+                project=project,
+                workspace=workspace,
+                blocks_reads=blocks_reads,
+                context_groups=context_groups,
+            )
 
         # Minimal V1 stays date/time + agent identity. Private V2 also carries
         # the complete essential envelope, including member-bound cron jobs.
@@ -3450,7 +3625,12 @@ class ContextBuilder:
         # (claude-agent-acp) does NOT read agent ``resources``, so only it needs
         # the explicit load. Injecting on the ACP/kiro backend would duplicate
         # what kiro-cli already loaded.
-        if not is_custom and is_cc and _group_included(context_groups, CONTEXT_GROUP_PROJECT):
+        if (
+            not essentials
+            and not is_custom
+            and is_cc
+            and _group_included(context_groups, CONTEXT_GROUP_PROJECT)
+        ):
             steering_ctx = _load_steering_resources()
             if steering_ctx:
                 if lazy_skills and len(steering_ctx) > caps.steering:
@@ -3482,7 +3662,7 @@ class ContextBuilder:
                     len(compressed_history),
                 )
                 parts.append(_history_header + compressed_history + "\n[End of thread history]\n\n")
-            else:
+            elif compressed_history is None:
                 recent = _recall_rows(
                     self.conversation_log,
                     session_key,
@@ -3821,6 +4001,7 @@ class ContextBuilder:
         needs_reinjection: bool = False,
         context_groups: frozenset[str] | None = None,
         member: str = "",
+        context_provider: "ContextPromptProvider | None" = None,
     ) -> tuple[str, HookResult]:
         """Build the full message with context and hook processing.
 
@@ -3852,6 +4033,24 @@ class ContextBuilder:
         Returns:
             (full_message, hook_result) — hook_result may be a reply/modify/inject.
         """
+        from kiro_crew.agent_sdk import context_provider_of
+        from kiro_crew.essential_delivery import EssentialDelivery
+
+        delivery = None
+        blocks_reads = (
+            blocks_reads or self._session_memory_modes.get(session_key or "") == "temporary"
+        )
+        native_documents: dict[str, str] = {}
+        context_provider = context_provider_of(context_provider)
+        if context_provider is not None:
+            candidate_delivery = context_provider.essential_delivery
+            if isinstance(candidate_delivery, EssentialDelivery):
+                delivery = candidate_delivery
+                provider_type = context_provider.context_provider_type
+                if project is None:
+                    project = context_provider.cwd or None
+                if is_new_session and not resumed and not needs_reinjection:
+                    native_documents = context_provider.native_context_documents
         is_custom = agent and agent != "kirocrew"
         hook_result = self.hooks.on_message(text)
 
@@ -3885,23 +4084,43 @@ class ContextBuilder:
         #      its rules read keeps the gate).
         #   MINIMAL (V1 cron) -> no member section. Private V2 cron derives
         #      its owner from the validated memory binding above/below and
-        #      refreshes the complete essential envelope on every turn.
+        #      validates the complete envelope on every turn. Its provider
+        #      suppresses only snapshots already acknowledged by that conversation.
         # Missing file still reads as "" (the normal unbounded-by-choice
         # state); a bad slug degrades like the builder.
         from kiro_crew.member_essential_context import member_for_store
 
         _private_owner, _private_template = member_for_store(memory_store, member)
-        if _private_owner and not is_new_session:
-            parts.append(
-                self._build_v2_essentials(
-                    memory_store,
-                    member=member,
-                    project=project,
-                    workspace=workspace,
-                    blocks_reads=blocks_reads,
-                    context_groups=context_groups,
-                )
+        _native_envelopes: list[str] = []
+        _essentials = (
+            self._build_v2_essentials(
+                memory_store,
+                member=member,
+                project=project,
+                workspace=workspace,
+                blocks_reads=blocks_reads,
+                context_groups=context_groups,
+                native_documents=native_documents,
+                native_envelope_out=_native_envelopes,
+                execution_template=agent or "kirocrew",
+                trigger_text=(
+                    hook_result.text
+                    if hook_result.action == HOOK_MODIFY
+                    else (
+                        text[user_text_range[0] : user_text_range[1]]
+                        if user_text_range is not None
+                        else text
+                    )
+                ),
+                conditional_index=context_provider is not None
+                and delivery is not None
+                and not context_provider.native_steering,
             )
+            if _private_owner
+            else ""
+        )
+        if _essentials and not is_new_session:
+            parts.append(_essentials)
         _member_turn = member_turn_context(
             "" if _private_owner else member,
             member_lifecycle(
@@ -3941,7 +4160,7 @@ class ContextBuilder:
             # so the LLM treats it as its identity, not background info.
             if slim_resume:
                 agent_prompt = ""
-            elif is_cc:
+            elif is_cc and (not is_custom or not _private_owner):
                 # CC gets the SAME KiroCrew persona prompt as kiro — including
                 # the Output Format rules (diff blocks, image embeds, OPTIONS)
                 # which are dashboard UI contracts, not kiro-specific. Only the
@@ -3957,7 +4176,9 @@ class ContextBuilder:
                 except Exception:
                     agent_prompt = ""
             elif is_custom:
-                agent_prompt = self._load_agent_prompt(agent or "")
+                agent_prompt = self._load_agent_prompt(
+                    agent or "", project, owner_template=(agent or "") if _private_owner else ""
+                )
             else:
 
                 try:
@@ -3978,7 +4199,7 @@ class ContextBuilder:
                 resumed=resumed,
                 workspace=workspace,
                 memory_store=memory_store,
-                compressed_history=None,
+                compressed_history="" if compressed_history is not None else None,
                 mode=mode,
                 blocks_reads=blocks_reads,
                 provider_type=provider_type,
@@ -3990,6 +4211,7 @@ class ContextBuilder:
                 query_text=text,
                 project=project,
                 member=member,
+                _v2_essentials=_essentials,
             )
             if session_ctx:
                 # Scrub forgeable boundary markers from the UNTRUSTED content in
@@ -4449,14 +4671,19 @@ class ContextBuilder:
             # the cheaper choice mechanism on every interactive surface.
             if has_dashboard_surface(session_key or "") and _agent_includes_crew_context(agent):
                 _interactive_guidance.append(
-                    "\n\n(If a decision is genuinely needed before the work can "
-                    "continue, use the ask_question tool to put it to the user as a card, "
-                    "then END YOUR TURN: the tool does not block, and the answer arrives "
-                    "as the user's next message rather than as the tool's result. Use it "
-                    "SPARINGLY: only when you cannot proceed without the answer. When you "
-                    "are ending your turn anyway, use the final [OPTIONS:] line instead. "
-                    "Never interrupt the user for a non-blocking choice, and never ask "
-                    "what you can reasonably decide or discover yourself.)"
+                    "\n\n(The ask_question tool puts a multiple-choice card to the "
+                    "dashboard user. DEFAULT TO SILENCE: it is ONLY for a decision the "
+                    "human alone can make -- a permission, an irreversible or costly "
+                    "action, a preference you have no basis to infer -- AND only when the "
+                    "work genuinely cannot continue until they answer. Everything else you "
+                    "decide yourself: pick the reasonable option, state in one line which "
+                    "you picked and why, and keep going. Never ask what you can read, run, "
+                    "search or infer; never ask to confirm a plan you were already told to "
+                    "carry out; never ask because a choice merely exists. The card "
+                    "does not block: END YOUR TURN after calling it -- the answer arrives "
+                    "as the user's next message, not as the tool's result. When you are ending "
+                    "your turn anyway, a final [OPTIONS:] line is the cheaper form. When in "
+                    "doubt, do not ask.)"
                 )
                 # A follow-up card is distinct from both: it offers concrete NEXT
                 # tasks after work is done, optionally handing one to a worktree.
@@ -4607,4 +4834,36 @@ class ContextBuilder:
             start = head + len(seg[: _user_bounds[0]].translate(_MULTIBYTE_TABLE))
             end = head + len(seg[: _user_bounds[1]].translate(_MULTIBYTE_TABLE))
             user_span_out.extend((start, end))
+        if delivery is not None and _essentials and context_provider is not None:
+            lifecycle = member_lifecycle(
+                is_new_session=is_new_session,
+                resumed=resumed,
+                minimal_context=minimal_context,
+                needs_reinjection=needs_reinjection,
+            )
+            delivery.bind(
+                _essentials.translate(_MULTIBYTE_TABLE),
+                scope=(
+                    session_key,
+                    _private_owner,
+                    memory_store,
+                    workspace,
+                    project,
+                    agent,
+                    _private_template,
+                    provider_type,
+                    context_provider.served_model,
+                    mode,
+                    blocks_reads,
+                    None if context_groups is None else sorted(context_groups),
+                    minimal_context,
+                    model_window,
+                    _agent_includes_crew_context(agent),
+                ),
+                force=lifecycle is not MemberLifecycle.WARM,
+                incarnation=context_provider.context_incarnation,
+                native_envelope=(
+                    _native_envelopes[0].translate(_MULTIBYTE_TABLE) if native_documents else None
+                ),
+            )
         return final, hook_result

@@ -90,7 +90,9 @@ from kiro_crew.messaging.commands import (
     spawn_command_reply,
     task_command_reply,
 )
+from kiro_crew.messaging.dispatch import admit_inbound_callback
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
+from kiro_crew.messaging.inbound_spool import InboundRoute
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.messaging.renderer import credential_redaction_notice
 from kiro_crew.messaging.session_trust import _trusted_sessions as _shared_trusted_sessions
@@ -2809,6 +2811,7 @@ async def maybe_route_linked_thread(
                 _linked_slot,
                 text,
                 _directive_user_origin=True,
+                _directive_channel_origin=True,
             )
         )
         _linked_slot.task = _chat_task
@@ -2825,6 +2828,7 @@ async def maybe_route_linked_thread(
             text,
             meta=containment_meta(_dashboard_state, _linked_slot),  # type: ignore[arg-type]
             directive_user_origin=True,
+            directive_channel_origin=True,
         )
     _dashboard_state.push_slots_update()  # type: ignore[attr-defined]
     sel().log_tool_invocation(
@@ -2906,6 +2910,20 @@ async def handle_message(
 
     await _hydrate_thread_overrides(session_key, conversation_log)
     _hydrate_conv_flags(sessions, session_key)
+
+    if not await admit_inbound_callback(
+        sessions,
+        channel_type="slack",
+        route=InboundRoute(
+            conversation_id=channel,
+            text=text,
+            user_id=user_id,
+            thread_id=reply_ts,
+            message_id=msg_ts,
+        ),
+        restricted=_is_slack_restricted(session_key),
+    ):
+        return
 
     # Resolve agent early so ALL persist paths (hook auto-reply, command
     # intercepts, review-mode drafts, main LLM path) can forward it.
@@ -3663,6 +3681,7 @@ async def handle_message(
                 blocks_reads=_slack_blocks_reads,
                 model_window=_model_window,
                 runtime_source="slack",
+                context_provider=client,
             )
         else:
             full_message = text

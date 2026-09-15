@@ -72,7 +72,7 @@ import atexit
 import functools
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, TypeVar
+from typing import Any, Awaitable, Callable, TypeVar
 
 _T = TypeVar("_T")
 
@@ -87,6 +87,8 @@ __all__ = [
     "image_executor",
     "stt_executor",
     "path_resolve_executor",
+    "path_probe_executor",
+    "path_transfer_executor",
     "governance_executor",
     "cron_gate_executor",
     "CronGateTimeout",
@@ -95,6 +97,8 @@ __all__ = [
     "run_in_cron_gate_pool",
     "cron_gate_budget",
     "run_in_embed_pool",
+    "run_with_recall_deadline",
+    "recall_executor",
     "shutdown_maintenance_executor",
 ]
 
@@ -260,17 +264,42 @@ _MAX_STT_WORKERS = 2
 # ``security.paths._run_resolution_bounded``).
 _MAX_PATH_RESOLVE_WORKERS = 2
 
+# Dashboard file endpoints take a path from the REQUEST, so which mount it lands
+# on is the caller's choice, and a probe on an unresponsive mount blocks its
+# thread for as long as the kernel takes.  Two pools, split by how long a
+# healthy call holds a worker, so that a burst of large transfers cannot starve
+# the millisecond validation probes behind them:
+#
+# * ``mc-pathprobe`` -- validation and stats (``realpath``, ``isfile``,
+#   ``isdir``).  Milliseconds when healthy, so eight workers is a ceiling on how
+#   many can be WEDGED at once, not on ordinary throughput.
+# * ``mc-pathxfer`` -- the calls that hold a worker for the length of a transfer:
+#   the shared open-and-check envelope's bounded full read, the search walk, the
+#   browse listings, the spreadsheet and document parses.  Bounded by their own
+#   caps when healthy, wedged exactly like a stat when not.
+#
+# Both are reached only through the dashboard's admission gate
+# (``handlers.files._run_path_probe`` -> :func:`run_in_cron_pool`), which
+# refuses with a typed error when no worker frees within its queue budget, so
+# saturating either pool degrades the file surface alone and never the default
+# executor the rest of the gateway shares.
+_MAX_PATH_PROBE_WORKERS = 8
+_MAX_PATH_TRANSFER_WORKERS = 8
+
 _lock = threading.Lock()
 _pool: ThreadPoolExecutor | None = None
 _subprocess_pool: ThreadPoolExecutor | None = None
 _cron_pool: ThreadPoolExecutor | None = None
 _discovery_pool: ThreadPoolExecutor | None = None
 _embed_pool: ThreadPoolExecutor | None = None
+_recall_pool: ThreadPoolExecutor | None = None
 _image_pool: ThreadPoolExecutor | None = None
 _stt_pool: ThreadPoolExecutor | None = None
 _governance_pool: ThreadPoolExecutor | None = None
 _cron_gate_pool: ThreadPoolExecutor | None = None
 _path_resolve_pool: ThreadPoolExecutor | None = None
+_path_probe_pool: ThreadPoolExecutor | None = None
+_path_transfer_pool: ThreadPoolExecutor | None = None
 
 
 def configure_default_executor() -> None:
@@ -447,6 +476,47 @@ def path_resolve_executor() -> ThreadPoolExecutor:
                 )
                 atexit.register(shutdown_maintenance_executor)
     return _path_resolve_pool
+
+
+def path_probe_executor() -> ThreadPoolExecutor:
+    """Return the dashboard request-path PROBE pool, creating it on first use.
+
+    Threads are named ``mc-pathprobe``.  Serves the validation and stat half of
+    the dashboard file endpoints (see :data:`_MAX_PATH_PROBE_WORKERS`).  Callers
+    go through ``handlers.files._run_path_probe``, never ``submit`` directly:
+    the gate is what turns a full pool into a refusal instead of an unbounded
+    queue.
+    """
+    global _path_probe_pool
+    if _path_probe_pool is None:
+        with _lock:
+            if _path_probe_pool is None:
+                _path_probe_pool = ThreadPoolExecutor(
+                    max_workers=_MAX_PATH_PROBE_WORKERS,
+                    thread_name_prefix="mc-pathprobe",
+                )
+                atexit.register(shutdown_maintenance_executor)
+    return _path_probe_pool
+
+
+def path_transfer_executor() -> ThreadPoolExecutor:
+    """Return the dashboard request-path TRANSFER pool, creating it on first use.
+
+    Threads are named ``mc-pathxfer``.  Serves the calls that hold a worker for
+    the length of a bounded transfer rather than a stat (see
+    :data:`_MAX_PATH_TRANSFER_WORKERS`); same gate, same refusal, separate
+    workers so transfers queue behind transfers and probes behind probes.
+    """
+    global _path_transfer_pool
+    if _path_transfer_pool is None:
+        with _lock:
+            if _path_transfer_pool is None:
+                _path_transfer_pool = ThreadPoolExecutor(
+                    max_workers=_MAX_PATH_TRANSFER_WORKERS,
+                    thread_name_prefix="mc-pathxfer",
+                )
+                atexit.register(shutdown_maintenance_executor)
+    return _path_transfer_pool
 
 
 def embed_executor() -> ThreadPoolExecutor:
@@ -791,6 +861,38 @@ async def run_in_cron_gate_pool(func: Callable[..., _T], /, *args: Any, timeout:
         raise CronGateTimeout(asyncio.get_running_loop().time() - queued_at) from exc
 
 
+RECALL_TIMEOUT_SECS = 9.0  # Finish before the MCP HTTP client's ten-second timeout.
+
+
+def recall_executor() -> ThreadPoolExecutor:
+    """Retrieval cannot occupy the workers needed for prompt preparation."""
+    global _recall_pool
+    with _lock:
+        if _recall_pool is None:
+            _recall_pool = ThreadPoolExecutor(
+                max_workers=_MAX_EMBED_WORKERS, thread_name_prefix="mc-recall"
+            )
+            atexit.register(shutdown_maintenance_executor)
+        return _recall_pool
+
+
+async def run_with_recall_deadline(awaitable: Awaitable[_T]) -> _T:
+    """Bound an entire recall, including cold store opening and pool admission."""
+    import time
+
+    from kiro_crew.embeddings import EmbeddingWork, embedding_work
+
+    inherited = embedding_work.get()
+    work = inherited or EmbeddingWork(time.monotonic() + RECALL_TIMEOUT_SECS)
+    token = embedding_work.set(work)
+    try:
+        return await asyncio.wait_for(awaitable, timeout=max(0.0, work.deadline - time.monotonic()))
+    finally:
+        if inherited is None:
+            work.cancelled.set()
+        embedding_work.reset(token)
+
+
 async def run_in_embed_pool(func: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
     """Offload bounded memory work, waiting without rejecting ordinary prompts.
 
@@ -798,14 +900,21 @@ async def run_in_embed_pool(func: Callable[..., _T], /, *args: Any, **kwargs: An
     cancelled caller releases a slot only when its underlying thread actually
     finishes (or the queued future is successfully cancelled).
     """
+    from contextvars import copy_context
+
+    from kiro_crew.embeddings import embedding_work
+
     loop = asyncio.get_running_loop()
-    admission = getattr(loop, "_kirocrew_memory_admission", None)
+    recall = embedding_work.get() is not None
+    admission_key = "_kirocrew_recall_admission" if recall else "_kirocrew_memory_admission"
+    admission = getattr(loop, admission_key, None)
     if admission is None:
         admission = asyncio.Semaphore(_MAX_EMBED_WORKERS)
-        setattr(loop, "_kirocrew_memory_admission", admission)
+        setattr(loop, admission_key, admission)
     await admission.acquire()
     try:
-        future = embed_executor().submit(functools.partial(func, *args, **kwargs))
+        executor = recall_executor() if recall else embed_executor()
+        future = executor.submit(copy_context().run, functools.partial(func, *args, **kwargs))
     except BaseException:
         admission.release()
         raise
@@ -827,19 +936,23 @@ def shutdown_maintenance_executor() -> None:
     The default executor pool is NOT included here -- it is owned by each event
     loop and shut down by asyncio when the loop closes.
     """
-    global _pool, _subprocess_pool, _cron_pool, _discovery_pool, _embed_pool
+    global _pool, _subprocess_pool, _cron_pool, _discovery_pool, _embed_pool, _recall_pool
     global _governance_pool, _image_pool, _cron_gate_pool, _stt_pool, _path_resolve_pool
+    global _path_probe_pool, _path_transfer_pool
     with _lock:
         pool, _pool = _pool, None
         subprocess_pool, _subprocess_pool = _subprocess_pool, None
         cron_pool, _cron_pool = _cron_pool, None
         discovery_pool, _discovery_pool = _discovery_pool, None
         embed_pool, _embed_pool = _embed_pool, None
+        recall_pool, _recall_pool = _recall_pool, None
         governance_pool, _governance_pool = _governance_pool, None
         image_pool, _image_pool = _image_pool, None
         cron_gate_pool, _cron_gate_pool = _cron_gate_pool, None
         stt_pool, _stt_pool = _stt_pool, None
         path_resolve_pool, _path_resolve_pool = _path_resolve_pool, None
+        path_probe_pool, _path_probe_pool = _path_probe_pool, None
+        path_transfer_pool, _path_transfer_pool = _path_transfer_pool, None
     if pool is not None:
         pool.shutdown(wait=False, cancel_futures=True)
     if subprocess_pool is not None:
@@ -850,6 +963,8 @@ def shutdown_maintenance_executor() -> None:
         discovery_pool.shutdown(wait=False, cancel_futures=True)
     if embed_pool is not None:
         embed_pool.shutdown(wait=False, cancel_futures=True)
+    if recall_pool is not None:
+        recall_pool.shutdown(wait=False, cancel_futures=True)
     if governance_pool is not None:
         governance_pool.shutdown(wait=False, cancel_futures=True)
     if image_pool is not None:
@@ -860,3 +975,7 @@ def shutdown_maintenance_executor() -> None:
         stt_pool.shutdown(wait=False, cancel_futures=True)
     if path_resolve_pool is not None:
         path_resolve_pool.shutdown(wait=False, cancel_futures=True)
+    if path_probe_pool is not None:
+        path_probe_pool.shutdown(wait=False, cancel_futures=True)
+    if path_transfer_pool is not None:
+        path_transfer_pool.shutdown(wait=False, cancel_futures=True)

@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple, TypeVar
 
 from aiohttp import web
 
-from kiro_crew.acp.types import STOP_REASON_CANCELLED
 from kiro_crew.atomic_write import atomic_write, fsync_dir
 from kiro_crew.config.loader import (
     DASHBOARD_PORT,
@@ -60,7 +59,6 @@ from kiro_crew.history import (
     latest_transcript_ts,
     mint_row_mid,
     monotonic_transcript_ts,
-    transcript_sort_key,
 )
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.loop_lock import LoopBoundLock
@@ -2756,8 +2754,8 @@ def should_queue_refusal_recovery(
     refusal_reasons: list,
     stopping: bool,
     needs_reset: bool,
-    stop_reason: str,
     *,
+    user_stopped: bool,
     notices_sent: int = 0,
     notices_pending: int = 0,
 ) -> bool:
@@ -2767,41 +2765,61 @@ def should_queue_refusal_recovery(
     - No refusals occurred
     - A stop is still in progress
     - A session reset is already re-queuing
-    - The turn was cancelled by the user (not a policy block)
+    - The user pressed Stop during the turn (``user_stopped``)
     - Every refusal was already explained IN-BAND and the backend confirmed it
+
+    ``user_stopped`` is the host's own Stop signal, read LIVE at the call: a stop
+    in flight, or ``slot._stop_generation`` moved since the turn began. It is the
+    only user-cancel input this gate takes; the backend's wire ``stopReason`` is
+    deliberately not one. The two are not the same thing: codex-acp's command
+    approval advertises ``cancel`` as its ONLY reject option (measured on
+    codex-acp 1.11.0 / codex 0.153.4 -- there is no ``decline``), and codex
+    answers that reject by aborting the whole turn with ``stopReason:
+    "cancelled"`` before the model is called again. A gate that read that stop
+    reason as a Stop press skipped this continuation on every policy block, and
+    on codex this continuation is the only channel that reaches the model (the
+    turn itself is gone, so no in-band notice can). A backend abort with
+    refusals recorded and no Stop pressed is the refusal's own consequence, and
+    the continuation is exactly what is owed.
+
+    The parameter is keyword-only and REQUIRED so no caller can reintroduce a
+    stop-reason rule by omission. Callers must read it at the gate, not from a
+    snapshot taken before an await: a Stop that presses and resolves during an
+    awaited Stop hook leaves ``stopping`` False again, and only the generation
+    counter still says it happened.
 
     ``notices_sent`` is how many :func:`build_refusal_steer_notice` bodies were
     steered into the turn, and ``notices_pending`` how many of those the
     ``steering_consumed`` echo did NOT account for. The extra turn is skipped only
-    when every refusal got a notice AND none is still pending — an unconfirmed
+    when every refusal got a notice AND none is still pending -- an unconfirmed
     steer is treated as undelivered, so the fallback continuation still runs. The
     check is deliberately coarse (counts, not a per-refusal pairing): its two
     failure directions are not symmetric. Skipping wrongly leaves the model with
     kiro-cli's "User denied tool execution" and no correction, while queueing
-    wrongly costs one turn the model would otherwise have been told twice — which
-    is exactly what this path already cost before in-band delivery existed.
-
-    Both are keyword-only with defaults so a caller on a harness without mid-turn
-    steer keeps the original three-condition behaviour unchanged.
+    wrongly costs one turn the model would otherwise have been told twice --
+    which is exactly what this path already cost before in-band delivery
+    existed. Both keep defaults so a caller on a harness without mid-turn steer
+    behaves as if nothing was steered.
     """
     if refusal_reasons and notices_sent >= len(refusal_reasons) and notices_pending == 0:
         return False
-    return bool(
-        refusal_reasons
-        and not stopping
-        and not needs_reset
-        and stop_reason != STOP_REASON_CANCELLED
-    )
+    return bool(refusal_reasons and not stopping and not needs_reset and not user_stopped)
 
 
-def should_queue_hook_continuation(stopping: bool, needs_reset: bool, stop_reason: str) -> bool:
+def should_queue_hook_continuation(
+    stopping: bool, needs_reset: bool, *, user_stopped: bool
+) -> bool:
     """Decide whether a Stop hook's block decision may inject a continuation.
 
     Mirrors :func:`should_queue_refusal_recovery`'s suppression set so a hook can
     never override the Stop button: a stop in progress, a pending session reset,
-    or a user-cancelled turn all win over the hook.
+    or a Stop pressed during the turn all win over the hook. Like that gate it
+    takes the host's live Stop signal and not the backend's wire ``stopReason``:
+    a backend that aborts a policy-denied turn (codex) reports ``cancelled``
+    with no Stop pressed, and a hook continuation is owed there just as the
+    refusal continuation is.
     """
-    return bool(not stopping and not needs_reset and stop_reason != STOP_REASON_CANCELLED)
+    return bool(not stopping and not needs_reset and not user_stopped)
 
 
 def parse_hook_continuations(stdouts: list[str]) -> list[str]:
@@ -2832,7 +2850,11 @@ def parse_hook_continuations(stdouts: list[str]) -> list[str]:
 
 
 def build_refusal_recovery_prompt(
-    refusals: list[tuple[str, str]], *, credential_tool_hint: str = "", answered: bool = False
+    refusals: list[tuple[str, str]],
+    *,
+    credential_tool_hint: str = "",
+    answered: bool = False,
+    turn_aborted: bool = False,
 ) -> str:
     """Build the body of an automatic continuation after a recoverable tool refusal.
 
@@ -2876,6 +2898,15 @@ def build_refusal_recovery_prompt(
     model's last word on the subject is kiro-cli's "User denied tool execution",
     and it will keep attributing the block to the user in later turns.
 
+    ``turn_aborted`` says the backend ended the blocked turn as CANCELLED rather
+    than letting it run on -- codex, whose only reject option aborts the turn.
+    Codex then tells the model, in its own words, that the turn was interrupted
+    ("aborted by user" on the tool result, a ``<turn_aborted>`` note saying the
+    user interrupted on purpose). Those words are wrong here and they arrive
+    right next to this continuation, so the body has to name and overrule them
+    explicitly; the generic "not a user action" sentence alone loses to two
+    harness-authored messages saying the opposite.
+
     Lives here (a leaf module that owns the prefix) rather than in context.py so
     chat_runner can import it at module top without a circular import. There is
     deliberately no retry cap: the model decides when to stop, and the user's
@@ -2896,9 +2927,16 @@ def build_refusal_recovery_prompt(
             "user action — do not treat it as a cancellation or interruption by "
             "the user."
         ),
-        "",
-        "Blocked:",
     ]
+    if turn_aborted:
+        lines.append(
+            "The backend then reported that turn as aborted or interrupted (a tool "
+            "result reading 'aborted by user', or a note that the user interrupted "
+            "the previous turn on purpose). That abort was the consequence of the "
+            "blocked call, not an interruption by the user -- disregard those "
+            "messages."
+        )
+    lines += ["", "Blocked:"]
     for title, reason in refusals:
         lines.append(f"  - {title}: {reason}" if reason else f"  - {title}")
     lines += [
@@ -3404,11 +3442,11 @@ class _ChatSlot:
 
     __slots__ = (
         "_buffers",
-        "_decision_dismissed_ts",
         "_projection",
         "_queue_repository",
         "_source_links_cache",
         "_source_links_revision",
+        "_closing",
         "key",
         "title",
         "agent",
@@ -3428,6 +3466,7 @@ class _ChatSlot:
         "total_messages",
         "_task",
         "_turn_generation",
+        "_chunk_seq",
         "event",
         "_pending",
         "_pending_consumers",
@@ -3657,12 +3696,19 @@ class _ChatSlot:
         # (content revision, links) cache for the sidebar PR chips scan.
         self._source_links_revision = 0
         self._source_links_cache: tuple[tuple[int, int], list[dict]] | None = None
+        # Admission fence while slot deletion spans monitor retirement and history I/O.
+        self._closing = False
         self.total_messages: int = 0  # lifetime count (survives trimming)
         self._task: asyncio.Task[Any] | None = None
         # Monotonic publication history for turn ownership. ``task`` returns to
         # None after teardown, so consumers that span awaits cannot distinguish
         # "stayed idle" from "ran and finished" by comparing task references.
         self._turn_generation: int = 0
+        # Wire seq of the newest chat_chunk this slot has emitted, across turns:
+        # the counter never restarts, so a client's replay floor (the seq its
+        # transcript already holds) orders every later chunk above it without
+        # knowing where one turn ended and the next began.
+        self._chunk_seq: int = 0
         self.event = asyncio.Event()
         self._pending: list[dict[str, str]] = []
         # Number of readers currently treating ``_pending`` as their delivery
@@ -4307,15 +4353,6 @@ class _ChatSlot:
         # "the agent is done and asked you something", and which entries a user
         # message may retire.
         self._question_pending: dict[str, dict] = {}
-        # Dismiss tombstone for the projection's buried-decision scan
-        # (slot_projection.py): the ``ts`` of the one options-bearing assistant
-        # row whose ``pending_decision`` the user explicitly waved away. The
-        # projection re-derives from the transcript on every push, so dismissal
-        # cannot be a state delete — there is no state to delete — it has to name
-        # the message it silences. A LATER options turn has a different ts and
-        # surfaces normally. In-memory like ``_question_pending``: after a
-        # restart the card may reappear, which errs on the side of re-asking.
-        self._decision_dismissed_ts: str = ""
 
     def bump_tags_revision(self) -> str:
         """Rotate and return the revision for the current tag list.
@@ -4330,6 +4367,19 @@ class _ChatSlot:
         """
         self.tags_revision = mint_tags_revision()
         return self.tags_revision
+
+    @property
+    def is_closing(self) -> bool:
+        """Whether slot teardown currently fences new monitor admission."""
+        return self._closing
+
+    def begin_close(self) -> None:
+        """Fence new monitor admission before teardown reaches its first await."""
+        self._closing = True
+
+    def cancel_close(self) -> None:
+        """Release the admission fence when teardown leaves this slot live."""
+        self._closing = False
 
     @property
     def _dirty(self) -> bool:
@@ -4785,6 +4835,7 @@ class _ChatSlot:
         meta: dict | None = None,
         *,
         directive_user_origin: bool = False,
+        directive_channel_origin: bool = False,
     ) -> str:
         return self._queue_repository.queue_append(
             self,
@@ -4792,6 +4843,7 @@ class _ChatSlot:
             kind,
             meta,
             directive_user_origin=directive_user_origin,
+            directive_channel_origin=directive_channel_origin,
         )
 
     def _note_enqueue(self) -> None:
@@ -4807,6 +4859,7 @@ class _ChatSlot:
         on_consumed: Callable[[bool], None] | None = None,
         on_irreversibly_consumed: Callable[[], Awaitable[None] | None] | None = None,
         directive_user_origin: bool = False,
+        directive_channel_origin: bool = False,
     ) -> str:
         return self._queue_repository.queue_insert(
             self,
@@ -4818,6 +4871,7 @@ class _ChatSlot:
             on_consumed,
             on_irreversibly_consumed,
             directive_user_origin,
+            directive_channel_origin,
         )
 
     def queue_pop(self, index: int = 0) -> dict[str, Any]:
@@ -4841,12 +4895,14 @@ class _ChatSlot:
         content: str,
         *,
         directive_user_origin: bool = False,
+        directive_channel_origin: bool = False,
     ) -> bool:
         return self._queue_repository.queue_edit_by_id(
             self,
             queue_id,
             content,
             directive_user_origin=directive_user_origin,
+            directive_channel_origin=directive_channel_origin,
         )
 
     def queue_promote_by_id(self, queue_id: str) -> bool:
@@ -5211,7 +5267,10 @@ class DashboardState:
         # Secretary subsystem removed; kept as permanent None for apps/routes.py
         # builtin-service restart lookup (getattr-based, no-op when None).
         self._secretary_restart: Any = None  # restart callback (always None — service removed)
-        self.workflow_service: Any = None  # lazy-init in server.py (WorkflowService, M6)
+        self.workflow_service: Any = None  # published only after complete recovery
+        self.workflow_startup_status = "pending"
+        self.workflow_startup_stopping = False
+        self.workflow_startup_task: asyncio.Task[None] | None = None
         self.context_builder = context_builder
         self.conversation_log = conversation_log
         self.consolidator = consolidator
@@ -5547,6 +5606,20 @@ class DashboardState:
         from kiro_crew.dashboard.file_index import FileIndexRegistry
 
         self.file_indexes = FileIndexRegistry()
+        # Runtime services share the gateway's policy, never a model-supplied mode.
+        from kiro_crew.dashboard.handlers._shared import (
+            require_live_session_memory_mode,
+            resolve_session_memory_mode,
+        )
+
+        if self.subagents is not None:
+            self.subagents._memory_mode_for_session = lambda key: require_live_session_memory_mode(
+                self, key
+            )
+        if self.context_builder is not None:
+            self.context_builder.memory_mode_for_session = lambda key: resolve_session_memory_mode(
+                self, key
+            )
 
     def register_channel_transport(self, transport: "MessagingTransport") -> None:
         """Register a live channel transport for cross-surface mirror delivery.
@@ -6420,46 +6493,6 @@ class DashboardState:
         """Tell owner clients that question cards are no longer actionable."""
         _questions_for(self).broadcast_retired(self, slot_key, card_ids)
 
-    def dismiss_pending_decision(self, slot_key: str, ts: str) -> bool:
-        """Silence one buried [OPTIONS:] decision without answering it.
-
-        ``ts`` names the options-bearing assistant row (the ``pending_decision``
-        payload carries it), not the slot: the decision can be superseded by a
-        newer options turn before the dismissal lands, and a slot-wide clear
-        would silence THAT one unseen. The projection re-derives on every push,
-        so this only records the tombstone and pushes; there is no record to
-        delete. The tombstone is monotonic under ``transcript_sort_key``
-        ordering (transcripts can mix naive and offset-aware rows): a dismiss
-        naming an OLDER ts than the recorded one is a delayed request about a
-        superseded decision and is refused rather than letting it un-silence
-        the newer dismissal. Returns False for an unknown slot, a blank ts, or
-        a stale ts so the route can 404 instead of acknowledging a no-op.
-        """
-        slot = self._slots.get(slot_key)
-        if slot is None or not ts:
-            return False
-        current = getattr(slot, "_decision_dismissed_ts", "") or ""
-        if current:
-            # Out-of-order dismiss: a delayed request naming a superseded
-            # decision must not overwrite the tombstone of the newer one that
-            # was dismissed after it. Ordered by transcript_sort_key, not
-            # string compare -- transcripts can mix naive rows (older builds)
-            # with offset-aware ones, and on a non-UTC host string order is
-            # not row order for that pair (see history.transcript_sort_key).
-            # Only refuse when BOTH sides parse (bucket 0): an unparseable
-            # value carries no order, and refusing against one would let a
-            # single bad ts brick every later dismissal. Either way the named
-            # decision is already superseded -- 404 tells the client its
-            # card was stale, which is already that caller's
-            # take-the-card-away exit.
-            key_new = transcript_sort_key(ts)
-            key_cur = transcript_sort_key(current)
-            if key_new[0] == 0 and key_cur[0] == 0 and key_new < key_cur:
-                return False
-        slot._decision_dismissed_ts = ts
-        _questions_for(self).push_slots(self)
-        return True
-
     def _push_slots(self) -> None:
         """Push question status without failing the question lifecycle."""
         _questions_for(self).push_slots(self)
@@ -6951,17 +6984,29 @@ class DashboardState:
         """Push a chat message to all SSE clients via the global stream."""
         role = msg.get("role", "")
         content = msg.get("content", "")
-        # Mirror the display-time redaction gate _prepare_messages applies on
-        # the HTTP history path, so a row's *content* leaves the backend in one
-        # byte form regardless of which consumer receives it. Scope: content
-        # only — `cls` / `meta` and the live `chat_chunk` stream are
-        # deliberately not covered (see the direct_meta comment below). Gate is
-        # `!= "user"` for the same reason as there: every non-user role can
-        # carry model/tool output, and user-authored content stays raw (the
-        # user typed it and is the only one who sees it back).
-        if role != "user" and isinstance(content, str) and content:
-            content, _ = redact_exfiltration_urls(content)
-            content, _ = redact_credentials(content)
+        # This site and _prepare_messages (the HTTP history path) share ONE
+        # helper — chat_utils.redact_display_content — so a row's *content*
+        # leaves the backend in one byte form regardless of which consumer
+        # receives it, including structured (list/dict) legacy content, which
+        # is redacted recursively rather than skipped. Scope: content only —
+        # `cls` / `meta` and the live `chat_chunk` stream are deliberately not
+        # covered (see the direct_meta comment below). Gate is `!= "user"` for
+        # the same reason as there: every non-user role can carry model/tool
+        # output, and user-authored content stays raw (the user typed it and
+        # is the only one who sees it back).
+        # Deferred import: chat_utils imports from this module at module
+        # level, so the reverse import must stay function-level.
+        from kiro_crew.dashboard.chat_utils import (
+            redact_display_content,
+            serialize_wire_content,
+        )
+
+        if role != "user" and content:
+            content = redact_display_content(content)
+        else:
+            # The wire-string invariant covers EVERY row: a structured user
+            # row or a falsy container serializes to text without redaction.
+            content = serialize_wire_content(content)
         payload: dict[str, Any] = {
             "_type": "chat_message",
             "slot": slot_key,

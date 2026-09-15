@@ -21,6 +21,27 @@ from kiro_crew.dashboard.handlers import source_providers as source
 from kiro_crew.sandbox import spawn_shim_argv
 
 
+def _trust_ancestors_above(monkeypatch, base):
+    """Pin ancestor owners without changing fixture files or permission bits."""
+    ancestors = set(base.resolve().parents)
+    real_stat = pathlib.Path.stat
+
+    def fake_stat(self, **kwargs):
+        info = real_stat(self, **kwargs)
+        if self not in ancestors:
+            return info
+
+        class AncestorStat:
+            st_uid = 0
+
+            def __getattr__(self, name):
+                return getattr(info, name)
+
+        return AncestorStat()
+
+    monkeypatch.setattr(pathlib.Path, "stat", fake_stat)
+
+
 @pytest.fixture(autouse=True)
 def _mock_source_sel(monkeypatch):
     audit = MagicMock()
@@ -388,6 +409,9 @@ def test_provider_executable_not_found_gives_install_guidance(monkeypatch) -> No
         "PROVIDER_EXECUTABLE_CANDIDATES",
         {"gh": ("/nonexistent-kirocrew/gh",), "glab": ("/nonexistent-kirocrew/glab",)},
     )
+    # Windows also scans the Program Files install dirs; a host with a real gh
+    # there (GitHub's own runners ship one) must still read as "not found".
+    monkeypatch.setattr(github_runner, "_wellknown_windows_dirs", lambda _executable: ())
 
     with pytest.raises(source.SourceProviderError) as excinfo:
         source._resolve_provider_executable("gh")
@@ -450,6 +474,7 @@ def test_provider_executable_accepts_user_owned_install(monkeypatch, tmp_path) -
     monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
     monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
     monkeypatch.setenv("KIROCREW_GH_BIN", str(executable))
+    _trust_ancestors_above(monkeypatch, tmp_path)
 
     assert source._resolve_provider_executable("gh") == str(executable.resolve())
 
@@ -470,6 +495,7 @@ def test_provider_executable_accepts_symlinked_install(monkeypatch, tmp_path) ->
     monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
     monkeypatch.setattr(github_runner, "agent_writable_roots", lambda: ())
     monkeypatch.setenv("KIROCREW_GH_BIN", str(link))
+    _trust_ancestors_above(monkeypatch, tmp_path)
 
     assert source._resolve_provider_executable("gh") == str(target.resolve())
 
@@ -500,10 +526,15 @@ def test_provider_executable_strict_mode_rejects_symlink(monkeypatch, tmp_path) 
         source._resolve_provider_executable("gh")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="exercises the POSIX uid branch")
 def test_provider_executable_refuses_a_root_gateway(monkeypatch, tmp_path) -> None:
-    """A root gateway is refused in BOTH modes: every process it spawns (the
-    agent's own shell included) is root too, which makes the ownership and
-    agent-tree checks vacuous."""
+    """A root POSIX gateway is refused in BOTH modes. The sandbox masks the
+    credential homes from the agent's children but leaves the filesystem
+    writable, and a provider child runs unsandboxed with those credentials —
+    so a root agent could overwrite a root-owned `gh` and this walk could not
+    tell that write from the operator's install. The refusal keeps the mask a
+    boundary; the Windows elevated case has no such boundary and is not refused
+    (see the test below)."""
     executable = tmp_path / "gh"
     executable.write_text("#!/bin/sh\nexit 0\n")
     executable.chmod(0o755)
@@ -513,6 +544,46 @@ def test_provider_executable_refuses_a_root_gateway(monkeypatch, tmp_path) -> No
 
     with pytest.raises(ValueError, match="disabled for a root gateway"):
         source._validate_provider_executable(str(executable))
+
+
+def test_provider_executable_elevated_windows_gateway_is_not_refused(
+    monkeypatch, tmp_path
+) -> None:
+    """On Windows the validator asks nothing about the token's elevation: the
+    built-in Administrator account (always elevated, no UAC split token) and a
+    "Run as administrator" launch both go through the same ACL walk as any user,
+    keyed on the gateway user's SID."""
+    executable = tmp_path / "gh.exe"
+    executable.write_text("rem\n")
+    executable.chmod(0o755)
+    checked: list[tuple[str, str]] = []
+
+    def fake_windows_check(path, *, label, me_sid, strict):
+        checked.append((label, me_sid))
+
+    monkeypatch.delenv("KIROCREW_PROVIDER_BIN_STRICT", raising=False)
+    monkeypatch.setattr(github_runner.sys, "platform", "win32")
+    monkeypatch.setattr(github_runner.platform_compat, "current_user_sid", lambda: "S-1-5-21-7-500")
+    monkeypatch.setattr(github_runner, "check_provider_path_component_windows", fake_windows_check)
+    monkeypatch.setattr(github_runner, "path_parents", lambda _path: [])
+
+    assert github_runner.validate_provider_executable(str(executable)) == str(executable.resolve())
+    assert checked == [("executable", "S-1-5-21-7-500")]
+
+
+def test_provider_executable_windows_still_refuses_an_unverifiable_sid(
+    monkeypatch, tmp_path
+) -> None:
+    """The SID is the analog of ``uid``; without it the ACL walk cannot say
+    whose install this is, so that refusal stays."""
+    executable = tmp_path / "gh.exe"
+    executable.write_text("rem\n")
+    executable.chmod(0o755)
+    monkeypatch.setattr(github_runner.sys, "platform", "win32")
+    monkeypatch.setattr(github_runner.platform_compat, "current_user_sid", lambda: None)
+
+    with pytest.raises(ValueError, match="SID is unverifiable"):
+        github_runner.validate_provider_executable(str(executable))
 
 
 def test_provider_executable_rejects_binary_owned_by_another_user(

@@ -761,15 +761,14 @@ class TestLogsCmdOtherSources:
         assert sel_rec.operations == ["logs"]
 
     def test_zero_lines_argument_falls_back_to_the_default(
-        self, monkeypatch, tmp_path, sel_rec, fake_execvp
+        self, monkeypatch, tmp_path, sel_rec, capsys
     ) -> None:
-        """``lines=0`` is falsy, so the product substitutes 100 rather than tailing nothing."""
+        """``lines=0`` selects the default tail length on an unsupported service host."""
         monkeypatch.setattr(cli_server, "current_platform", lambda: Platform.UNSUPPORTED)
         monkeypatch.setattr(cli_server, "config_dir", lambda: tmp_path)
         (tmp_path / "gateway.log").write_text("x\n", encoding="utf-8", newline="\n")
-        with pytest.raises(_ExecCalled) as exc:
-            cli_server._logs_cmd(argparse.Namespace(follow=False, lines=0))
-        assert exc.value.argv[:3] == ["tail", "-n", "100"]
+        cli_server._logs_cmd(argparse.Namespace(follow=False, lines=0))
+        assert capsys.readouterr().out == "x\n"
 
 
 # --------------------------------------------------------------------------
@@ -1135,7 +1134,8 @@ class TestRunTask:
         self, taskrunner_env, tmp_path, monkeypatch
     ) -> None:
         """``VectorMemoryStore.init()`` must honour its caller contract:
-        the Windows path shells out to icacls, so an async caller offloads it
+        it is blocking file IO whose Windows DACL writes can block on a
+        network volume round-trip, so an async caller offloads it
         via ``asyncio.to_thread`` instead of freezing the loop. Ordering is
         asserted too: init must COMPLETE before ``_run_task`` wires the embed
         hooks (a fire-and-forget offload would reorder them). The sibling

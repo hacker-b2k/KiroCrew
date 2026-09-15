@@ -77,7 +77,7 @@ from kiro_crew.dashboard.chat_delivery import (
     attachment_meta,
     find_written_steer_row,
 )
-from kiro_crew.dashboard.chat_persistence import _build_history_prefix, save_slot_off_loop
+from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
 from kiro_crew.dashboard.chat_summary import generate_session_summary
 from kiro_crew.dashboard.chat_title import (
     _extract_and_redact_plan_metadata,
@@ -106,6 +106,7 @@ from kiro_crew.dashboard.chat_utils import (
     _remove_queued_by_id,
     _validate_tool_name,
     build_recovery_requeue,
+    chunk_generation,
     effective_session_key,
     expire_slack_options,
     is_harness_slash_command,
@@ -114,7 +115,6 @@ from kiro_crew.dashboard.chat_utils import (
     parse_workflow_command,
     remember_slack_options,
     slack_mirror_is_paused,
-    slot_history_key,
     user_text_span,
 )
 from kiro_crew.dashboard.handlers import (
@@ -328,6 +328,7 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: E402
     EmptyTurnActivity,
     RecoveryPayload,
     classify_empty_turn,
+    has_unfinished_progress_claim,
     is_promise_only_terminal,
     is_synthetic_payload_item,
     is_synthetic_recovery_item,
@@ -1050,7 +1051,7 @@ def _backfill_canonical_model(client: Any, provider: str) -> str:
     ``global.anthropic.claude-opus-4-8[1m]``) — not the alias the user picked —
     so backfilling it pins the slot to one profile + region. A session that once
     resolved to the 1M Opus profile then stays nailed to it across resumes even
-    when that profile is capacity-throttled, and the picker can no longer
+    when that profile is capacity-throttled, and the picker cannot
     dislodge the poisoned value (observed: every "model unavailable" throttle hit
     the profile-form id, never the dotted alias, which kiro routes with capacity
     awareness). So for non-``claude_code`` providers we DROP a profile-form id
@@ -1812,7 +1813,7 @@ def _mcp_server_name_is_ambiguous(server_name: str, safe_name: str) -> bool:
     ``server_name`` is stored REDACTED, because it is ACP-controlled and reaches
     chat content and the WS broadcast. :func:`_redact_acp_string` maps EVERY
     credential-shaped name onto one sentinel (``[REDACTED: credential]``), so once
-    redaction has fired the stored name no longer identifies a server: two
+    redaction has fired the stored name cannot identify a server: two
     unrelated servers can share it.
 
     Redaction firing at all is the exact test. A name that came through untouched
@@ -1902,7 +1903,7 @@ def _emit_mcp_oauth_request(
     authorization — the process whose loopback listener and PKCE verifier the
     URL is redeemable against. It is stamped into the banner meta so the
     read-time gate (`_expire_dead_child_oauth_meta`) can withdraw the link the
-    moment that child is no longer the live one serving the slot, HOWEVER it
+    moment that child ceases to be the live one serving the slot, HOWEVER it
     ended: gateway restart, session reset, idle sweep, RSS recycle, or the
     child exiting on its own. An empty value stamps nothing, and an unstamped
     banner is judged dead on first read — the fail direction that removes a
@@ -2001,7 +2002,7 @@ def _emit_mcp_oauth_request(
     # A new authorize request for this server means kiro-cli started a FRESH
     # flow, and the loopback listener plus the PKCE verifier live in that flow —
     # so every still-open banner for the same server now points at a callback
-    # port that can no longer redeem anything. Retire them before appending, or
+    # port that cannot redeem anything. Retire them before appending, or
     # the older button stays live-looking forever and sends the browser to a
     # dead port that answers with a bare `/?code=…` page.
     #
@@ -4330,9 +4331,21 @@ _RESUME_PREFETCH_TTL_SECS = 600.0
 # falls out of the accounting.
 _RESUME_PREFETCH_MAX_LIVE = resource_status.PREWARM_MAX_LIVE
 # Insertion-ordered arm registry (loop-owned, like all chat_runner state):
-# session_key -> None. Entries leave on TTL fire, on eviction, or lazily when
-# an eviction attempt finds the session already claimed/gone.
+# session_key -> _RESERVED (admitted, not yet registered) or the arm
+# generation the entry registered under (see _arm_generation). Entries leave
+# on TTL fire, on eviction, or lazily when an eviction attempt finds the
+# session already claimed/gone.
 _armed_prefetches: "dict[str, object]" = {}
+
+# Bumped at every registration (_cap_armed_prefetches). An admission carries
+# the generation current when its SLOT SIGNAL arrived and may only evict
+# entries registered at or before it: an entry registered AFTER the signal
+# was armed by a CONCURRENT signal that won the same allowance, not by an
+# older one the newer signal outranks. Without this, two simultaneous slot
+# signals on an allowance of one spawn twice -- the slower signal's admission
+# lands after the faster one registered, sees a "live" entry, evicts the
+# session spawned moments ago, and spawns its own.
+_arm_generation = 0
 
 # Registry value for a key whose spawn is admitted but not yet registered. It
 # counts against the allowance like a live entry -- the process is about to
@@ -4340,6 +4353,16 @@ _armed_prefetches: "dict[str, object]" = {}
 # signals admitted concurrently against an allowance of one would otherwise
 # both pass (each seeing an empty registry) and both spawn.
 _RESERVED = object()
+
+
+def _entry_arm_generation(value: object) -> float:
+    """The arm generation a registry entry registered under.
+
+    Entries predating the generation scheme (or seeded by tests) carry
+    ``None``; treat them as generation zero -- older than every signal, so
+    always within eviction reach.
+    """
+    return value if isinstance(value, (int, float)) else 0
 
 
 def _prewarm_allowance() -> int:
@@ -4352,11 +4375,24 @@ def _prewarm_allowance() -> int:
     return resource_status.prewarm_allowance()
 
 
-async def _evict_prefetches_beyond(sessions: Any, limit: int, *, keep: str | None = None) -> bool:
+async def _evict_prefetches_beyond(
+    sessions: Any,
+    limit: int,
+    *,
+    keep: str | None = None,
+    up_to_generation: float | None = None,
+) -> bool:
     """Evict oldest unclaimed prefetches until at most *limit* remain.
 
     *keep* is a key exempt from eviction AND from the count — the session being
     (re-)armed, whose own registration is accounted for by the caller.
+
+    *up_to_generation* bounds which entries are within reach: only entries
+    registered at or before that arm generation may be evicted. ``None``
+    means unbounded — the post-registration cap and the critical band evict
+    regardless of age. Admission passes its signal's generation so it never
+    tears down a session a CONCURRENT signal registered while this one was
+    still working toward its admission (see ``_arm_generation``).
 
     Returns ``True`` once the population is within *limit*. A failed removal
     returns ``False`` at once and LEAVES the entry registered: the process is
@@ -4365,14 +4401,28 @@ async def _evict_prefetches_beyond(sessions: Any, limit: int, *, keep: str | Non
     that attempt finds the session already claimed or gone.
     """
     while len([k for k in _armed_prefetches if k != keep]) > limit:
-        evictable = [k for k, v in _armed_prefetches.items() if k != keep and v is not _RESERVED]
+        evictable = [
+            k
+            for k, v in _armed_prefetches.items()
+            if k != keep
+            and v is not _RESERVED
+            and (up_to_generation is None or _entry_arm_generation(v) <= up_to_generation)
+        ]
         if not evictable:
-            # Every entry over the limit is a reservation: an admitted spawn
-            # whose process does not exist yet, so there is nothing to remove.
-            # Room cannot be made; the caller treats this like a failed
-            # eviction and the reservation's owner registers or rolls back.
+            # Every entry over the limit is out of reach: a reservation (an
+            # admitted spawn whose process does not exist yet) or a session a
+            # newer-generation signal registered. Room cannot be made; the
+            # caller treats this like a failed eviction — the reservation's
+            # owner registers or rolls back, and a concurrent registrant
+            # keeps the allowance it already spent.
             return False
         oldest = evictable[0]
+        # The removal below awaits; a focus/reload signal can re-register the
+        # SAME key with a newer generation meanwhile. Capture the entry's
+        # value and pop only if it is still the one this eviction selected —
+        # unconditionally popping by key would erase the replacement's
+        # accounting and let the next admission spawn on top of it.
+        oldest_value = _armed_prefetches.get(oldest)
         try:
             # Shielded for the same reason as the TTL removal: an interrupted
             # removal leaks the process holding the native lock.
@@ -4389,11 +4439,18 @@ async def _evict_prefetches_beyond(sessions: Any, limit: int, *, keep: str | Non
         except Exception:
             logger.warning("Resume prefetch: eviction failed for %s", oldest, exc_info=True)
             return False
-        _armed_prefetches.pop(oldest, None)
+        if _armed_prefetches.get(oldest) is oldest_value:
+            _armed_prefetches.pop(oldest, None)
+        # A changed value means a re-registration won the window: leave its
+        # entry alone and let the loop re-evaluate — under an admission's
+        # generation bound the fresh entry is out of reach, so the admission
+        # refuses rather than tearing it down.
     return True
 
 
-async def _admit_prefetch(sessions: Any, new_key: str, allowance: int) -> bool:
+async def _admit_prefetch(
+    sessions: Any, new_key: str, allowance: int, *, signal_generation: float | None = None
+) -> bool:
     """Make room for *new_key* BEFORE it spawns; ``False`` when it must not.
 
     A zero allowance refuses, and first evicts every idle pre-warm already
@@ -4405,6 +4462,15 @@ async def _admit_prefetch(sessions: Any, new_key: str, allowance: int) -> bool:
     the handshake. An eviction that FAILS refuses too: the room was not made,
     so admitting on top of it would exceed the allowance just the same.
 
+    *signal_generation* is the arm generation current when this admission's
+    slot signal arrived (``None``: read it now). Eviction is bounded by it,
+    so an admission delayed past a concurrent signal's registration — the
+    allowance probe runs in a worker thread, and Windows scheduling can hold
+    it beyond the other signal's whole handshake — refuses instead of tearing
+    down the session that signal spawned moments ago and spawning a second
+    one. A genuinely LATER signal reads a generation at or
+    above every live registration, so newest-signal-wins eviction is intact.
+
     Admission RESERVES *new_key* in the registry before returning ``True``: the
     eviction above awaits, and two slot signals admitted in the same window
     would otherwise each see the room the other is about to fill. The
@@ -4414,14 +4480,20 @@ async def _admit_prefetch(sessions: Any, new_key: str, allowance: int) -> bool:
     without one. A key already registered is re-armed in place and is not
     reserved again, so a rollback cannot drop a live entry.
     """
+    if signal_generation is None:
+        signal_generation = _arm_generation
     if allowance <= 0:
         # The band that refuses a new pre-warm also has no room for the ones
         # already idle, *new_key*'s own earlier pre-warm included -- a re-arm
-        # in this band gets no exemption. A failed eviction is logged by the
-        # helper and the next signal retries it.
+        # in this band gets no exemption, and neither does a concurrent
+        # signal's fresh registration: the host is critical, so the idle
+        # population falls to zero regardless of age. A failed eviction is
+        # logged by the helper and the next signal retries it.
         await _evict_prefetches_beyond(sessions, 0)
         return False
-    if not await _evict_prefetches_beyond(sessions, allowance - 1, keep=new_key):
+    if not await _evict_prefetches_beyond(
+        sessions, allowance - 1, keep=new_key, up_to_generation=signal_generation
+    ):
         return False
     if new_key not in _armed_prefetches:
         _armed_prefetches[new_key] = _RESERVED
@@ -4450,8 +4522,10 @@ async def _cap_armed_prefetches(
     first real turn on that slot cold-starts, exactly as if the allowance had
     read zero before the spawn and ``_admit_prefetch`` had refused.
     """
+    global _arm_generation
+    _arm_generation += 1
     _armed_prefetches.pop(new_key, None)  # re-arm moves the key to newest
-    _armed_prefetches[new_key] = None
+    _armed_prefetches[new_key] = _arm_generation
     if cap <= 0:
         await _evict_prefetches_beyond(sessions, 0)
         return
@@ -4487,7 +4561,13 @@ def schedule_eager_spawn(
     prev = getattr(slot, "_eager_spawn_task", None)
     if prev is not None and not prev.done():
         prev.cancel()
-    task = asyncio.create_task(_eager_spawn(state, slot, allow_resume=allow_resume))
+    # The arm generation as of THIS slot signal, read synchronously HERE:
+    # create_task only queues the coroutine, so a registration landing before
+    # its first step would otherwise be inside a later snapshot and look
+    # evictable to the very signal it raced.
+    task = asyncio.create_task(
+        _eager_spawn(state, slot, allow_resume=allow_resume, signal_generation=_arm_generation)
+    )
     slot._eager_spawn_task = task
     return task
 
@@ -4569,7 +4649,11 @@ def _slot_binding(slot: "_ChatSlot") -> tuple[str, str, str, str, str]:
 
 
 async def _eager_spawn(
-    state: "DashboardState", slot: "_ChatSlot", *, allow_resume: bool = False
+    state: "DashboardState",
+    slot: "_ChatSlot",
+    *,
+    allow_resume: bool = False,
+    signal_generation: float | None = None,
 ) -> None:
     """Debounce, re-validate, then create the slot's session and release it.
 
@@ -4591,6 +4675,14 @@ async def _eager_spawn(
        session.
     """
     try:
+        # The arm generation as of this slot signal. ``schedule_eager_spawn``
+        # reads it synchronously at signal arrival (create_task only queues
+        # this coroutine, so reading it here would already be one scheduling
+        # hop late); a direct call falls back to reading it now, before any
+        # await. Every registration that lands after the snapshot belongs to
+        # a concurrent signal, and the admission below must not evict it.
+        if signal_generation is None:
+            signal_generation = _arm_generation
         await asyncio.sleep(_EAGER_SPAWN_DEBOUNCE_SECS)
         sessions = getattr(state, "sessions", None)
         if sessions is None:
@@ -4793,7 +4885,9 @@ async def _eager_spawn(
             # is made first (oldest unclaimed evicted) so the population never
             # overshoots during the handshake. Off the loop: it reads procfs.
             allowance = await asyncio.to_thread(_prewarm_allowance)
-            if not await _admit_prefetch(sessions, session_key, allowance):
+            if not await _admit_prefetch(
+                sessions, session_key, allowance, signal_generation=signal_generation
+            ):
                 logger.info(
                     "Eager spawn: host memory admits %d pre-warmed session(s) and "
                     "%d are live; leaving slot %s to first turn",
@@ -5832,6 +5926,12 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     directive_user_origin = bool(consumed) and all(
         item.get("_directive_user_origin") is True for item in consumed
     )
+    # Channel authority is the narrower credential boundary. If batching combines
+    # channel and dashboard entries, the whole turn must retain that boundary so a
+    # directive derived from either message cannot inherit dashboard-owner secrets.
+    directive_channel_origin = bool(consumed) and any(
+        item.get("_directive_channel_origin") is True for item in consumed
+    )
     if slot._stopping and not is_system_injection:
         slot.append(
             "error",
@@ -5978,7 +6078,7 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
         if is_cron:
             _inject_meta["cronLabel"] = cron_label
         _drained_meta.update(_inject_meta)
-    slot.append(
+    current_row = slot.append(
         row_role,
         next_msg,
         row_cls,
@@ -6032,8 +6132,10 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
                 await result
 
     _run_kwargs: dict[str, Any] = {
+        "_current_message": current_row,
         "_synthetic_payload": synthetic_payload,
         "_directive_user_origin": directive_user_origin,
+        "_directive_channel_origin": directive_channel_origin,
     }
     if _settleable or _delivery_callbacks:
         _run_kwargs["_on_consumed"] = _note_consumed
@@ -6281,10 +6383,12 @@ async def _run_chat(
     # issues from inside that wake is its own act. Cron, app and sub-agent
     # injections never set it.
     _directive_self_wake: bool = False,
+    _directive_channel_origin: bool = False,
     regenerate_hint: str = "",
     _on_consumed: "Callable[[bool], None] | None" = None,
     _on_irreversibly_consumed: "Callable[[], Awaitable[None] | None] | None" = None,
     monitor_completion: MonitorCompletionHook | None = None,
+    _current_message: dict | None = None,
 ) -> None:
     """Stream LLM response into *slot*.  Survives browser disconnect."""
 
@@ -6319,6 +6423,41 @@ async def _run_chat(
     # suspended and reset _stop_state to idle before continuation processing.
     # The monotonic generation preserves that user intent across the whole call.
     _stop_gen_at_entry = slot._stop_generation
+    # Dispatch appends the triggering row before entering this runner. Freeze
+    # that row now, before await points, prompt expansion or new deliveries.
+    _current_replay_message = _current_message
+    if _current_replay_message is None:
+        _current_replay_message = next(
+            (
+                m
+                for m in reversed(slot.messages)
+                if m.get("role") in ("user", "nudge", "subagent", "inject")
+            ),
+            None,
+        )
+        if (
+            _current_replay_message is not None
+            and _current_replay_message.get("content") != message
+        ):
+            _current_replay_message = None
+
+    def _stop_pressed() -> bool:
+        """The user's Stop signal for this turn, read LIVE at the call site.
+
+        True when a stop is in flight OR the monotonic stop generation moved since
+        entry -- a Stop that pressed and already resolved back to idle is invisible
+        to ``_stopping`` but not to the counter. The two end-of-turn continuation
+        gates (Stop-hook and refusal recovery) read THIS, never the backend's wire
+        stop reason: a backend that aborts a policy-denied turn (codex answers its
+        only reject option, ``cancel``, that way) reports ``cancelled`` with no
+        Stop pressed, and the continuation is owed there. A function rather than a
+        value so no gate can consume a snapshot taken before an await -- the Stop
+        hook and the credential-hint lookup both suspend between the turn's end
+        and the queue write.
+        """
+        return bool(getattr(slot, "_stopping", False)) or (
+            getattr(slot, "_stop_generation", _stop_gen_at_entry) != _stop_gen_at_entry
+        )
 
     session_key = effective_session_key(slot)
     sessions = getattr(state, "sessions", None)
@@ -6458,7 +6597,10 @@ async def _run_chat(
     # touches it between here and the flag block.
     _produced_visible_output = False
     last_heartbeat = time.time()
-    chunk_seq = 0
+    # Continues the slot's counter rather than starting at 0: seqs are ordered
+    # across turns so a client floor from an earlier turn sits below every
+    # chunk of this one (see _ChatSlot._chunk_seq).
+    chunk_seq = slot._chunk_seq
     in_tool_group = False
     # Whole-turn assistant-text buffer for orchestrator plan detection. Unlike
     # `assistant_text` (reset on every tool-call boundary), this is NEVER reset
@@ -6492,8 +6634,18 @@ async def _run_chat(
         if not wire:
             return
         chunk_seq += 1
-        slot.append("chunk", wire, "chunk")
-        state.broadcast_ws("chat_chunk", {"slot": slot.key, "content": wire, "seq": chunk_seq})
+        slot._chunk_seq = chunk_seq
+        # The window row carries the same seq (and process generation) as the
+        # wire frame so a slot snapshot taken mid-stream can tell the client how
+        # far the stream it already contains has advanced (see
+        # chat_utils._collapse_wire_rows / chunk_generation).
+        row = slot.append("chunk", wire, "chunk")
+        row["seq"] = chunk_seq
+        row["gen"] = chunk_generation()
+        state.broadcast_ws(
+            "chat_chunk",
+            {"slot": slot.key, "content": wire, "seq": chunk_seq, "gen": chunk_generation()},
+        )
 
     # Same rolling-buffer protection for the separate chat_thinking wire stream
     # (thinking is broadcast-only / ephemeral, but still real-time on the WS).
@@ -6660,6 +6812,7 @@ async def _run_chat(
                 _on_irreversibly_consumed if not _irreversible_consumption_reported else None
             ),
             directive_user_origin=_directive_user_origin,
+            directive_channel_origin=_directive_channel_origin,
         )
 
     # Model-activity marker for the poisoned-conversation streak ONLY:
@@ -6787,6 +6940,9 @@ async def _run_chat(
     # `getattr(state, "sessions", None)` above).
     _stop_gen_turn_start = getattr(slot, "_stop_generation", 0)
     _retrying_empty = False
+    # Any empty-response verdict is unlanded for replay durability, including
+    # the terminal give-up rung (which intentionally queues no recovery).
+    _had_empty_response_verdict = False
     # Set when the turn ended on a promise-only final message and we injected one
     # continuation (see the promise-only guard near turn completion). Like
     # _retrying_empty it suppresses success-recording for this non-landing turn.
@@ -6814,6 +6970,10 @@ async def _run_chat(
     # re-queue), every `except` arm, and a hard CancelledError — not just the
     # graceful-cancel and empty-re-queue paths that reach the success check.
     _turn_landed = False
+    # Replay settlement also lives in ``finally``. Bind at turn scope because
+    # config, binding and session-start failures can reach teardown before the
+    # acquisition block determines whether replay is pending.
+    _replay_accepted_this_turn = False
     # True while a member DM thread's FIRST turn is in flight: the session
     # client is allocated before the context build, so a build failure (e.g.
     # MemberRulesUnreadable aborting on a malformed rules file) leaves a warm
@@ -6928,6 +7088,7 @@ async def _run_chat(
                     _prompt_depth=1,
                     _directive_user_origin=_directive_user_origin,
                     _directive_self_wake=_directive_self_wake,
+                    _directive_channel_origin=_directive_channel_origin,
                 )
             elif status == "blocked":
                 sel().log_tool_invocation(
@@ -7385,6 +7546,18 @@ async def _run_chat(
         # account instead of running as the previous one.
         await _retire_sessions_on_identity_change(state)
         _require_current_binding()
+        # A linked channel can retain a dashboard-owned key. Resolve both the
+        # dedicated Slack field and any inbound-capable channel-neutral mirror
+        # before provider construction, so a restart cannot erase the dispatcher
+        # signal that distinguishes a linked turn from a direct dashboard turn.
+        # Outbound-only mirrors do not own inbound resume and stay direct turns.
+        _mirror_link = state.sessions.get_mirror_link(session_key)
+        _mirror_resumes = state.sessions.mirror_accepts_inbound(session_key)
+        _provider_channel_id = getattr(slot, "_slack_channel", "") or (
+            getattr(_mirror_link, "channel_id", "")
+            if _mirror_link is not None and _mirror_resumes
+            else ""
+        )
         client, is_new, resumed = await state.sessions.get_or_create(
             session_key,
             agent=kiro_agent or slot.agent or None,
@@ -7394,9 +7567,20 @@ async def _run_chat(
             crew_agent=crew_alias,
             model=slot.model or agent_model or default_model or None,
             cwd=slot.project or None,
+            # The persisted channel stays separate from the dashboard-owned key
+            # so provider startup can distinguish a linked dispatcher from a
+            # direct dashboard turn.
+            channel_id=_provider_channel_id or None,
             reasoning_effort_override=slot.reasoning_effort or None,
         )
         _acquired = True
+        # A fresh provider can still owe Kiro Crew history after its one-shot
+        # ``is_new`` observation was consumed by a slash command. Keep that debt
+        # separate from provider creation: slash commands bypass ContextBuilder,
+        # while the next ordinary prompt must behave as the context-bearing first
+        # turn and acknowledge replay only after assembly succeeds.
+        _replay_pending = state.sessions.provider_switch_replay_pending(session_key) is True
+        _context_is_new = is_new or _replay_pending
         # A member DM's first turn carries the four-layer member section as
         # session-start context. Record that it is at stake HERE — the moment
         # the session client exists — not at the context build: every early
@@ -7415,7 +7599,7 @@ async def _run_chat(
         _member_session_start_pending = (
             slot.mode == "member"
             and member_lifecycle(
-                is_new_session=is_new,
+                is_new_session=_context_is_new,
                 resumed=resumed,
                 minimal_context=False,
                 needs_reinjection=False,
@@ -7734,6 +7918,13 @@ async def _run_chat(
         # are added. Final prefix scrubbing can then preserve this trusted tail
         # (including its sole minted reply-format marker) byte-for-byte.
         _trusted_prompt_tail: str | None = None
+        _provider_has_history = resumed
+        if not _provider_has_history:
+            # An ACP provider exposes its native client; ``resumed`` is True only
+            # after a successful session/load. ``is True`` keeps a mock's truthy
+            # attribute from counting as a resume.
+            if getattr(getattr(client, "client", None), "resumed", None) is True:
+                _provider_has_history = True
         if is_slash:
             full_message = message
             sel().log_tool_invocation(
@@ -7753,20 +7944,12 @@ async def _run_chat(
             # far the user's text was pushed down — its offset for split_blocks.
             _core_msg_len = len(message)
 
-            compressed: str | None = None
+            compressed: str | None = ""
             # Provider-agnostic session replay: KiroCrew's conversation_log
             # is the canonical history source. Skip only when the provider
             # successfully resumed its own native session (same provider,
             # full-fidelity history already loaded via ACP session/load).
-            _provider_has_history = resumed
-            if not _provider_has_history:
-                from kiro_crew.providers.acp import (
-                    AcpProvider,  # circular: providers -> session -> chat_runner
-                )
-
-                if isinstance(client, AcpProvider) and client.client.resumed:
-                    _provider_has_history = True
-            if is_new and not _provider_has_history and state.context_builder.conversation_log:
+            if _context_is_new and not _provider_has_history:
                 # Consumed HERE rather than before the branch, so only a real cold
                 # start can spend the flag: a warm turn that never rebuilds history
                 # must not burn the one chance the reset asked for.
@@ -7775,29 +7958,26 @@ async def _run_chat(
                         "Session replay suppressed by an explicit conversation reset: %s",
                         session_key,
                     )
-                    compressed = None
+                    compressed = ""
                 else:
                     from kiro_crew.context import (  # circular: context -> chat
                         build_session_replay,
                         window_for_provider_client,
                     )
 
-                    # drop the just-flushed current-turn user message
-                    # from replay. chat_handlers.py:146 (or queue dequeue at L1898)
-                    # always appended exactly one message before _run_chat fires,
-                    # and the periodic flush_loop may have already written it to
-                    # disk during the kiro-cli cold spawn (~5s flush vs ≥15s spawn).
-                    # Scale the replay budget to the model window (client is live here).
-                    # Offloaded: resolving this chat's tab id globs and opens every
-                    # session file sharing it to rebuild an index, then reads each
-                    # chained file in full — unbounded file IO on the hottest path in
-                    # the gateway, where it would block every other request.
-                    compressed = await asyncio.to_thread(
-                        build_session_replay,
-                        state.context_builder.conversation_log,
-                        session_key,
-                        exclude_last_n=1,
-                        model_window=window_for_provider_client(client),
+                    # Merge the disk transcript and a frozen live-window tail
+                    # before one budget pass. Exclude this request by identity,
+                    # whether or not the periodic flush has persisted it yet.
+                    compressed = (
+                        await asyncio.to_thread(
+                            build_session_replay,
+                            state.context_builder.conversation_log,
+                            session_key,
+                            pending_messages=list(slot.messages),
+                            current_message=_current_replay_message,
+                            model_window=window_for_provider_client(client),
+                        )
+                        or ""
                     )
                     logger.info(
                         "Session replay: key=%s result=%s",
@@ -7848,7 +8028,7 @@ async def _run_chat(
             # Folder breadcrumb: inject once per session, and again after a
             # folder move (no session reset — it's just a label refresh).
             folder_path = None
-            if is_new or slot._folder_changed:
+            if _context_is_new or slot._folder_changed:
                 folder_path = state.folder_breadcrumb(slot.folder_id) or None
                 slot._folder_changed = False
             _color_theme = getattr(slot, "color_theme", "")
@@ -7865,7 +8045,11 @@ async def _run_chat(
             # A governance-evaluation error therefore denies (persona skipped
             # for that turn; the chat itself is unaffected).
             _persona_permitted = True
-            if is_new and isinstance(_color_theme, str) and _color_theme.startswith("custom-"):
+            if (
+                _context_is_new
+                and isinstance(_color_theme, str)
+                and _color_theme.startswith("custom-")
+            ):
                 from kiro_crew.platform.governance_profiles import governance_permits
 
                 _decision = governance_permits(
@@ -7885,7 +8069,7 @@ async def _run_chat(
                 persona_message = _maybe_inject_persona(
                     message,
                     _color_theme,
-                    is_new,
+                    _context_is_new,
                     theme_consent_sha=getattr(slot, "theme_consent_sha", None),
                 )
                 message, persona_context = _detach_appended_context(message, persona_message)
@@ -7930,10 +8114,10 @@ async def _run_chat(
             full_message, _ = await run_in_embed_pool(
                 state.context_builder.build_message,
                 message,
-                is_new,
+                _context_is_new,
                 session_key,
                 agent=kiro_agent or slot.agent or None,
-                resumed=resumed,
+                resumed=_provider_has_history,
                 workspace=slot.workspace or None,
                 project=slot.project or None,
                 memory_store=memory_store,
@@ -7959,6 +8143,7 @@ async def _run_chat(
                 ),
                 user_span_out=_user_span,
                 needs_reinjection=_needs_reinjection,
+                context_provider=client,
             )
             # The reported span is valid for the message as build_message
             # returned it. Several later steps PREPEND to the finished prompt
@@ -7976,46 +8161,20 @@ async def _run_chat(
             _trusted_prompt_tail = full_message
         else:
             full_message = _request_prefix_context + message
+            if (
+                _context_is_new
+                and not _provider_has_history
+                and not state.sessions.consume_replay_suppression(session_key)
+            ):
+                from kiro_crew.dashboard.chat_persistence import _build_history_prefix
 
-        # Re-inject history if session was reset but messages haven't been
-        # saved to JSONL yet (e.g. stop button killed the process mid-chat).
-        # build_session_context already injects recent() from JSONL, so this
-        # only adds value when in-memory messages are newer than disk.
-        # Skip for soft stops — session is preserved, no re-injection needed.
-        if is_new and slot.messages:
-            # Check if last stop was soft (session preserved, no re-injection).
-            # cls is a JSON-encoded dict (see api_chat_slot_stop); parse it.
-            _last_stop_soft = False
-            for m in reversed(slot.messages):
-                cls_val = m.get("cls", "")
-                if not isinstance(cls_val, str) or not cls_val.startswith("{"):
-                    continue
-                try:
-                    _cls = json.loads(cls_val)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                if not isinstance(_cls, dict) or _cls.get("kind") != "stop_event":
-                    continue
-                if _cls.get("outcome") == "soft":
-                    _last_stop_soft = True
-                break
-            if not _last_stop_soft:
-                history_key = slot_history_key(slot)
-                disk_count = 0
-                if state.conversation_log:
-                    # Off the loop: read_messages parses the whole transcript
-                    # (100-300 ms on a large store), and this runs on the
-                    # prompt-submit path where a stalled loop delays every other
-                    # session's frames. ``mem_count`` is counted AFTER the hop so
-                    # both sides of the comparison reflect post-await state.
-                    disk_count = len(
-                        await asyncio.to_thread(state.conversation_log.read_messages, history_key)
-                    )
-                mem_count = sum(1 for m in slot.messages if m.get("role") in ("user", "assistant"))
-                if mem_count > disk_count:
-                    history = _build_history_prefix(slot)
-                    if history:
-                        full_message = history + full_message
+                history = await asyncio.to_thread(
+                    _build_history_prefix,
+                    slot,
+                    conversation_log=state.conversation_log,
+                    current_message=_current_replay_message,
+                )
+                full_message = history + full_message
 
         if is_new:
             spawn_injected = await _fire(HOOK_EVENT_AGENT_SPAWN, session_key)
@@ -8098,7 +8257,7 @@ async def _run_chat(
                 user_offset=_user_prepend_offset,
                 user_span=_span_arg,
             )
-            slot_ctx_phase = PHASE_SESSION_START if is_new else PHASE_PER_TURN
+            slot_ctx_phase = PHASE_SESSION_START if _context_is_new else PHASE_PER_TURN
             # Named rather than counted: naming only four blocks by hand
             # under-describes most of the bytes being reported.
             _named = ", ".join(
@@ -8250,6 +8409,15 @@ async def _run_chat(
             monitor_completion.mark_accepted()
         event_stream = client.stream_command(message) if is_slash else client.stream(full_message)
         async for event in event_stream:
+            # Async-generator creation is not prompt acceptance. The first
+            # provider event is the earliest evidence that the replay-bearing
+            # prompt entered the turn; pre-output errors and empty streams never
+            # reach this branch. Acceptance is runner-local: the shared lease
+            # stays armed until final settlement so a concurrent shutdown cannot
+            # publish the fresh SID before this turn proves durable.
+            if _replay_pending and not is_slash:
+                _replay_pending = False
+                _replay_accepted_this_turn = True
             # Heartbeat every 5s during long operations
             if time.time() - last_heartbeat > 5:
                 state.broadcast_ws("heartbeat", {"slot": slot.key, "ts": time.time()})
@@ -8348,11 +8516,22 @@ async def _run_chat(
                 wire = _wsred.feed(event.text)
                 if wire:
                     chunk_seq += 1
-                    slot.append("chunk", wire, "chunk")
+                    slot._chunk_seq = chunk_seq
+                    # Same seq and generation on the window row as on the wire
+                    # frame (see _flush_text_stream) so a mid-stream snapshot
+                    # carries them.
+                    row = slot.append("chunk", wire, "chunk")
+                    row["seq"] = chunk_seq
+                    row["gen"] = chunk_generation()
                     # Push chunk to WS clients (HTTP SSE reader drains from slot._pending)
                     state.broadcast_ws(
                         "chat_chunk",
-                        {"slot": slot.key, "content": wire, "seq": chunk_seq},
+                        {
+                            "slot": slot.key,
+                            "content": wire,
+                            "seq": chunk_seq,
+                            "gen": chunk_generation(),
+                        },
                     )
             elif event.kind == EVENT_THINKING_CHUNK:
                 # Thinking content is not included in the main response text.
@@ -8877,6 +9056,7 @@ async def _run_chat(
                             dict(_oob.get("args") or {}),
                             producer_is_user_facing=_directive_user_origin,
                             producer_is_self_wake=_directive_self_wake,
+                            producer_is_channel=_directive_channel_origin,
                         )
                         _record_terminal_question(_applied_kind, _applied_one)
                         logger.info(
@@ -9066,6 +9246,7 @@ async def _run_chat(
                                 _dir_args,
                                 producer_is_user_facing=_directive_user_origin,
                                 producer_is_self_wake=_directive_self_wake,
+                                producer_is_channel=_directive_channel_origin,
                             )
                             _record_terminal_question(_dir_tool, _applied_one)
                             _out = _redact_tool_field(_applied_one)
@@ -10453,6 +10634,16 @@ async def _run_chat(
                         assistant_text = ""
                         _wsred.reset()
             elif event.kind == EVENT_CLEAR_STATUS:
+                # A confirmed native clear is the one destructive slash command:
+                # replaying the persisted Kiro Crew history afterwards would undo
+                # the user's clear. Retire either an unconsumed slash lease or the
+                # consumed-turn marker before any terminal can re-arm it.
+                if _replay_pending or _replay_accepted_this_turn:
+                    state.sessions.commit_provider_switch_replay_sid(session_key)
+                if _replay_pending:
+                    state.sessions.consume_provider_switch_replay(session_key)
+                    _replay_pending = False
+                _replay_accepted_this_turn = False
                 slot.messages.clear()
                 # The boundary was captured against the pre-clear message
                 # count; the list is now empty, so reset it to 0 or the
@@ -11496,6 +11687,7 @@ async def _run_chat(
             and not _terminal_question_posted
             and not _refusal_reasons
         ):
+            _had_empty_response_verdict = True
             # Model returned an empty response — retry once, then notify user.
             # Precedence: a turn that ended on a recoverable tool refusal also has
             # empty assistant_text when the model went straight to the blocked
@@ -11950,6 +12142,40 @@ async def _run_chat(
                 "perform the action.",
                 "msg msg-info",
             )
+        # A long mixed turn may execute many tools and then end with a NEW
+        # foreground-progress claim ("I'm continuing with the gate run"). The
+        # zero-tool promise recovery above intentionally refuses mixed turns:
+        # replaying one could duplicate a push, deployment, message, or other
+        # side effect. Silence is not acceptable either, because the terminal
+        # assistant bubble then claims work is running after the turn is idle.
+        # Diagnose only: keep the valid earlier work landed and state the true
+        # lifecycle. The same notice covers present-progressive claims with no
+        # tool calls, which are outside the narrow "I'll do it now" detector.
+        elif (
+            not _armed_final
+            and not slot._in_stage_execution
+            and _prompt_depth == 0
+            and (bool(assistant_text.strip()) or _produced_visible_output)
+            and _stop_reason == STOP_REASON_END_TURN
+            and not _refusal_reasons
+            and not _should_suppress_requeue(slot)
+            and getattr(slot, "_stop_generation", _stop_gen_turn_start) == _stop_gen_turn_start
+            and not _has_user_queued_followup(slot)
+            and not getattr(slot, "_pending_steers", None)
+            and (
+                has_unfinished_progress_claim(assistant_text)
+                or (_turn_tool_calls > 0 and is_promise_only_terminal(assistant_text))
+            )
+        ):
+            slot.append(
+                "notice",
+                "ℹ️ This turn ended after the model said work was still in progress. "
+                "No further main-agent steps run from this completed turn unless a "
+                "Stop hook explicitly requests a bounded continuation. Separately "
+                "shown subagents or monitor loops, if any, continue on their own; "
+                "otherwise send a message to resume.",
+                "msg msg-info",
+            )
         # On an empty-response re-queue the turn produced nothing and will
         # immediately re-run; skip persistence entirely so we don't save a
         # spurious empty turn or skew reliability metrics.
@@ -12053,7 +12279,17 @@ async def _run_chat(
             # Resetting it on the recovery turn's completion would let a repeated
             # post-token 5xx during recovery re-queue forever.
 
-        if _stop_reason == STOP_REASON_CANCELLED:
+        if _stop_reason == STOP_REASON_CANCELLED and _refusal_reasons and not _stop_pressed():
+            # Not a user stop: the backend aborted the turn on the rejected tool
+            # (codex answers its only reject option, `cancel`, this way). Logged
+            # apart from the user case so an operator reading "cancelled by user"
+            # is not sent looking for a Stop press that never happened.
+            logger.info(
+                "Turn for slot %s aborted by the backend after a policy-blocked tool "
+                "call (stopReason=cancelled, no Stop pressed) -- refusal recovery follows",
+                slot.key,
+            )
+        elif _stop_reason == STOP_REASON_CANCELLED:
             logger.info("Turn cancelled by user for slot %s", slot.key)
         elif (
             not _retrying_empty
@@ -12134,14 +12370,12 @@ async def _run_chat(
         # override the Stop button. A configurable consecutive-turn backstop
         # bounds faulty always-block hooks; 0 explicitly disables that backstop.
         # The finally block's dequeue loop dispatches accepted continuations.
-        if should_queue_hook_continuation(slot._stopping, needs_session_reset, _stop_reason) and (
-            # Suppress if any user stop was initiated during this turn (streaming,
-            # completion persistence, or the hook _fire above): stop_turn()
-            # reporting "idle" resets _stop_state before this guard reads
-            # _stopping, but _stop_generation counts stop INITIATIONS and never
-            # rewinds, so an entry-vs-now delta is the durable signal.
-            slot._stop_generation
-            == _stop_gen_at_entry
+        # `user_stopped` is read live: a Stop initiated during this turn
+        # (streaming, completion persistence, or the hook _fire above) may have
+        # resolved already -- stop_turn() reporting "idle" resets _stop_state --
+        # and only the generation counter still says it happened.
+        if should_queue_hook_continuation(
+            slot._stopping, needs_session_reset, user_stopped=_stop_pressed()
         ):
             _hook_reasons = parse_hook_continuations(_stop_hook_out)
             # No block decision -> nothing to queue; skip the cap load and
@@ -12154,11 +12388,8 @@ async def _run_chat(
                 # Config loading yields to the event loop. Recheck the Stop
                 # boundary before mutating the queue so a Stop that lands during
                 # that await cannot be bypassed by the stale outer guard.
-                if (
-                    not should_queue_hook_continuation(
-                        slot._stopping, needs_session_reset, _stop_reason
-                    )
-                    or slot._stop_generation != _stop_gen_at_entry
+                if not should_queue_hook_continuation(
+                    slot._stopping, needs_session_reset, user_stopped=_stop_pressed()
                 ):
                     _hook_reasons = []
             else:
@@ -12241,11 +12472,17 @@ async def _run_chat(
         # third case, so the ordering answer-then-block gets the same awareness
         # body as block-then-answer instead of being told to continue and
         # re-deriving what is already on screen.
+        #
+        # The user-cancel input is the host's live Stop signal, not the wire
+        # stop reason: on codex the ONLY reject option a command approval
+        # advertises is `cancel`, which aborts the turn with stopReason
+        # "cancelled" -- the refusal's own consequence, not a Stop press, and
+        # this continuation is the only channel that still reaches its model.
         if should_queue_refusal_recovery(
             _refusal_reasons,
             slot._stopping,
             needs_session_reset,
-            _stop_reason,
+            user_stopped=_stop_pressed(),
             notices_sent=len(_refusal_notices) + _refusal_notices_settled,
             notices_pending=len(_refusal_notices),
         ):
@@ -12256,14 +12493,26 @@ async def _run_chat(
                 )
                 if _recovery_hint:
                     break
-            _recovery_body = build_refusal_recovery_prompt(
-                _refusal_reasons,
-                credential_tool_hint=_recovery_hint,
-                answered=(
-                    bool(_answer_text.strip())
-                    or _produced_visible_output
-                    or _turn_flushed_visible_text
-                ),
+            # The hint lookup above yields to the event loop. Re-read the Stop
+            # signal before the queue write, exactly as the hook-continuation
+            # gate does after its config load: a Stop that lands during that
+            # await must not be bypassed by the outer gate's earlier read.
+            _recovery_body = (
+                ""
+                if _stop_pressed()
+                else build_refusal_recovery_prompt(
+                    _refusal_reasons,
+                    credential_tool_hint=_recovery_hint,
+                    answered=(
+                        bool(_answer_text.strip())
+                        or _produced_visible_output
+                        or _turn_flushed_visible_text
+                    ),
+                    # The backend ended the blocked turn as cancelled: it will
+                    # tell the model the user interrupted, so the body must say
+                    # otherwise.
+                    turn_aborted=(_stop_reason == STOP_REASON_CANCELLED),
+                )
             )
             if _recovery_body:
                 _queue_recovery(
@@ -13149,6 +13398,31 @@ async def _run_chat(
             _flush_file_changes(slot)
         except Exception:
             logger.debug("_flush_file_changes failed", exc_info=True)
+        # Replay settlement belongs on the one path every turn exit crosses.
+        # A clean, non-synthetic landed end_turn is the only ordinary terminal
+        # whose fresh native transcript is durable enough to replace the prior
+        # full-history SID. Exceptions, hard cancellation, synthetic completion,
+        # recovery returns and unlanded terminals re-arm the lease; close_all then
+        # sees provider_switch_replay and preserves the old SID on restart.
+        if _replay_accepted_this_turn:
+            try:
+                _replay_landed = (
+                    _turn_landed
+                    and _stop_reason == STOP_REASON_END_TURN
+                    and not _terminal_synthetic
+                    and not _had_empty_response_verdict
+                )
+                if _replay_landed:
+                    if not state.sessions.commit_provider_switch_replay_sid(session_key):
+                        state.sessions.mark_provider_switch_replay(session_key)
+                else:
+                    state.sessions.mark_provider_switch_replay(session_key)
+            except Exception:
+                logger.debug("settling replay SID failed", exc_info=True)
+                try:
+                    state.sessions.mark_provider_switch_replay(session_key)
+                except Exception:
+                    logger.debug("re-arming replay after settlement failure failed", exc_info=True)
         # This turn consumed the one-shot post-compaction re-injection flag but
         # never landed, so the prompt carrying the skills index was discarded —
         # an early return (stale-recover / tool-stall / error re-queue), an

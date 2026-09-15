@@ -122,12 +122,27 @@ profile reads in worker threads. Store cache generation and retirement checks
 still surround construction; no cache lock is held across an await. Global
 consolidation uses the same off-loop profile-read scheduling with unchanged
 content and write policy.
+
+Named-store preparation gives one worker ownership from construction through
+initialization, embedding wiring, validation and cache publication. Cancellation
+is serialized against publication. A published store belongs to the cache; every
+unpublished store, including an initialization failure, a race loser or a
+cache-generation mismatch, is closed by that worker after its final use.
+Cancellation never closes a connection while initialization is using it. No
+cache lock is held across blocking I/O or an await.
+
 Private consolidation allocates an ephemeral member-bound provider session,
 records its own billing and removes that provider after release. It never uses
 the shared V1 background provider. The default background path is unchanged.
 
 Memory content endpoints honor the selected store for import, context preview
-and observability. Legacy Markdown migration is Global V1 only and refuses a
+and observability. During validated private preferences/projects writes,
+identity or filesystem failures return a stable `503 store_unavailable`, without
+including exception text or local store paths in the response. The gateway log
+retains the store, exception type and reason through operational-log credential
+redaction. These failures preserve both profile documents; owner authorization
+still precedes the write, and invalid essential content remains a distinct 400.
+Legacy Markdown migration is Global V1 only and refuses a
 named store; private members copy selected starting knowledge through the owner
 workflow. Automatic episode promotion refuses V2, where changes and forgetting
 remain explicit. Embedding configuration continues to describe the installation.
@@ -323,9 +338,172 @@ the off-store consumers hold — the snapshot `memory` component, `portability`'
 export/import zip, `scripts/sync-to-remote.sh` — so relocating it drops the index
 from every backup while a restore writes a copy nothing reads. A NAMED store's index
 does live beside its own markdown, which is what makes the index per-store and puts
-it behind the `memory_stores/` fence; those three consumers name no per-store path,
-so a named store's index is simply outside their reach until one of them learns a
-store name.
+it behind the `memory_stores/` fence. The snapshot `memory` component and
+`portability`'s export both carry the whole `memory_stores/` tree (see
+[Named stores ride the backup paths](#named-stores-ride-the-backup-paths)), so a
+named store's index rides beside its markdown; `scripts/sync-to-remote.sh` still
+names only the root paths.
+
+### Named stores ride the backup paths
+
+`memory_stores/` is a tree of the snapshot `memory` component
+(`snapshot.COMPONENTS["memory"].trees`), and `portability.create_export_zip` walks it
+with the same pinned walk it uses for `workspace/`. A bundle that declares `memory`
+therefore carries every named store — markdown, vector file, FTS index,
+`lessons.jsonl`, `member-memory.json` — not only the default store's root files. Three
+rules make the tree a component without making its runtime state one:
+
+- **The host-local half never rides, in either direction.**
+  `memory_stores.is_host_local_store_state(rel_parts)` is the ONE predicate naming
+  it: the member signing key (`MEMBER_API_KEY_FILE`, regenerated on the restoring host
+  exactly as `sel_hmac.key` is), the private execution logs
+  (`EXECUTION_LOGS_DIR_NAME`, per-process diagnostics of runs that happened here) and
+  the local rolling-backup directories (`MEMBER_BACKUPS_DIR_NAME`, and a named V1
+  store's own `STORE_BACKUP_DIR_NAME`, which hold that host's recovery copies and any
+  pending-restore journal — the default store's `<home>/backups/` sits outside every
+  component for the same reason). The snapshot applies it at staging
+  (`_staging_ignore`) and at extraction (`_never_ships`, by PATH, because a
+  `backups` folder is an ordinary name anywhere but `memory_stores/<store>/`); the
+  export applies it in `_keep_store_for_export` and the import strips it from an
+  extracted archive before either mode copies (`_strip_host_local_store_state`). The
+  writers spell these names through the same constants, so the exclusion cannot drift
+  from what they create. Retirement records under `MEMBER_MEMORY_ARCHIVE_DIR`
+  (`.archived-members/`) are also host-local: replace and rollback preserve them in
+  place, and archives cannot import or reset this host's retirement decisions. This
+  prevents an older configuration from reactivating a retired generation, even when
+  its marker predates the restore. Member deletion, package-sync pruning and failed
+  allocation retirement acquire namespace admission before the configuration lock;
+  failed-publication rollback keeps that order. Cache release happens outside namespace
+  admission because a cold cache constructor can hold the cache lock while awaiting it.
+- **A store's databases are product databases.** `memory_stores.named_store_product_file`
+  recognises `memory_stores/<name>/memory.db` and `.../memory_index.db` by shape (a
+  well-formed store name, the exact filename), and `snapshot.is_product_tree_database`
+  extends the fixed `PRODUCT_TREE_DATABASES` set with it: a store's database is copied
+  through the SQLite backup API, refused at snapshot time when it is not a readable
+  database, and validated strictly before a restore installs it. Merge keeps each
+  existing named store whole and installs only stores the destination lacks
+  (`_merge_named_stores`), so a manifest and its databases stay in one generation.
+  Both restore output and the import summary name each store kept
+  (`memory_stores/<name> (kept the existing store …)`). Empty and Markdown-only
+  destination directories are also kept: missing SQLite files do not prove that local
+  preferences, lessons or a provisioning operation can be overwritten. Use replace to
+  deliberately take the archive's whole store. The
+  redaction pass treats the store index as derived (dropped for a rebuild) and the
+  store vector file as payload, as it does their root twins.
+- **The export lifts the agent fence for this tree only, and the routes are
+  owner-only.** `is_sensitive_path` is True for every store path so a crew's agent
+  cannot read another crew's memory; `portability._open_verified(..., fenced_ok=True)`
+  admits those paths on the `memory_stores/` walk alone, because the export is the
+  operator downloading their own install. Containment, the regular-file and
+  single-link checks and the lexical filter above all still apply, and the filter is
+  what keeps the signing key out. What makes "the operator" true is the route:
+  `GET /api/portability/export` and `POST /api/portability/import` run
+  `require_owner_dashboard_request` after authentication, so a non-owner dashboard
+  subject (an allow-listed messaging user holding a `!dashboard` token) gets the
+  standard `owner_only` 403 and the archive is never built.
+- **An import validates the memory it will install before it moves anything.**
+  `apply_import_zip` runs the restore's own `_refuse_corrupt_source_databases` over the
+  `memory` component in both modes (replace installs everything, merge only what the
+  destination lacks -- a named store the destination lacks being exactly the case that
+  would otherwise copy a torn `memory.db` verbatim). A refusal reaches the handler as
+  `SourceComponentUnsound` and is answered `409` with the sentence, not `500`.
+- **Named-store readers participate in replacement admission.** The dashboard's
+  named V1 Markdown cache holds a shared store-use lock on POSIX without requiring a vector
+  database. The lock is released when neither the cache nor an in-flight request
+  retains the object; V2 keeps its vector-tier admission. Snapshot staging holds shared
+  locks across both tree copying and database restaging, and ZIP export holds them
+  across the named-store walk. SQLite export opens sources read-only, so a vanished
+  database is refused rather than recreated empty. These are generation barriers, not
+  a transaction spanning every file or every store. Writers outside these admission
+  paths still require a stopped gateway for replace.
+- **Namespace changes are serialized before enumerating stores.**
+  `memory_stores.memory_store_namespace_lock` holds the stable
+  `.member-backups/.namespace.lock` across replace's enumeration, backup, mutation and
+  rollback, on every platform. Provisioning and configuration publication take the same
+  lock; publication revalidates the store after acquisition, so a store removed between
+  allocation and publication cannot be acknowledged as a successful create. Merge and
+  backup readers also take it to avoid copying a half-provisioned store. Public named
+  `MemoryStore` and `LessonStore` read/write operations hold this lock across the
+  complete call, including read-modify-write and index updates. This covers Windows
+  Markdown-only stores without relying on an open SQLite handle, and protects named
+  lesson JSONL on every platform. Nested calls share a thread-local, per-root hold;
+  exception exit releases it. Operation-local file/configuration locks follow namespace
+  admission; replace probes the separate lifetime locks without waiting. Global V1
+  operations do not acquire this namespace lock. The namespace lock is released on
+  acquisition failures as well as successful or rolled-back replacements. Async callers
+  offload the entire store operation with `asyncio.to_thread` or an existing executor,
+  including cold `ContextBuilder.get_memory_for` construction and JSONL reads. Passing
+  `load_all()` as an executor argument does not offload it; the call belongs inside the
+  worker. The synchronous-I/O ratchet is lexical and does not prove indirect store calls
+  safe, so endpoint tests also assert that locked operations run off the event loop.
+  Offloaded context calls still declare `memory_store`. The offline evaluator passes
+  `DEFAULT_MEMORY_STORE`: its `ContextBuilder` registers the supplied scenario memory
+  as the default cache entry, rather than selecting a crew or the configured default.
+- **Replace holds every store's lifetime lock for its whole duration.**
+  `member_memory_backup.hold_stores_for_replace(root, names)` takes the EXCLUSIVE lock
+  on each store's `.member-backups/<name>/.store-use.lock` -- the lock every open named
+  `VectorMemoryStore` (V1 or V2) holds shared for its connection's lifetime -- without waiting, and
+  `_do_replace` holds them across phase one, the mutations and any rollback. A store
+  that is open makes the acquisition fail at once and `_do_replace` raises
+  `NamedStoresInUse` before anything is saved or moved (the empty rollback directory is
+  removed); a store opened WHILE the replace runs blocks inside
+  `acquire_store_use_lock` until it finishes and then opens what the replace put there.
+  Without either half, the removal of a store directory would leave that process writing
+  into an unlinked database whose rows vanish at its next restart (POSIX keeps an open
+  file alive past its unlink) -- the case the gateway-running check cannot see is an
+  import applied inside the running gateway, or a second process. The names held are
+  the live stores AND the archive's, so a store the archive introduces is held before
+  anything can find it. Every named `VectorMemoryStore.init()` first takes namespace
+  admission, then acquires its shared lifetime lock and opens SQLite. Cold initialization
+  cannot create an unenumerated directory during replace; a completed open before
+  enumeration is visible and its lifetime lock makes replace refuse. This applies to
+  direct CLI and audit openers as well as `ContextBuilder` workers, without maintaining
+  a second list of declared names. `ensure_memory_store_dir` and pending member-restore
+  activation also hold namespace admission when creating or publishing directories.
+  The namespace lock holds new provisioning until the replace
+  finishes; writers that bypass both locks still require a stopped gateway.
+  Two consequences shape the
+  replace: `memory_stores/` is cleared
+  entry by entry (`_clear_store_directories`) and its root-level host-local entries --
+  `.member-backups/`, `.execution-logs/`, `.member-api-key` -- stay in place, because
+  the held lock is the file at that path and removing the directory would let a new
+  opener create a fresh, unheld lock beside the held handle; and the archive's tree is
+  copied into that kept root (`must_create=False` for the root alone, every child still
+  refused on collision). A named V1 store's own `backups/` sits inside its store
+  directory and goes with it into the rollback set. Recovery also clears only store
+  children and copies the saved directories into the kept root, so the root, lock inodes
+  and rollback copy survive a failed replace. The per-store lifetime lock is a no-op
+  on Windows, where SQLite's open handle denies deleting the database; the namespace
+  lock still serializes provisioning and replacement there.
+
+**Archive boundary.** Backup archives contain the selected private memory in cleartext.
+Owner-only directory permissions on snapshot staging and ZIP extraction restrict other
+OS users; they do not extend the agent's `memory_stores/` path fence to arbitrary
+archive or temporary paths. The operator must keep backup outputs and temporary roots
+outside untrusted agent access. This change does not claim archive encryption or a
+whole-install, cross-file transactional backup.
+
+**Replace and the bundle's silence.** Replace clears each memory tree and refills it
+from the archive, so a store directory the archive lacks is removed (into the rollback
+set) — the destination's stores end up matching the archive's. The store rollback
+copy lives at `<home>/memory_stores/.member-backups/pre-restore-<timestamp>/`,
+inside the same agent-hidden fence as the live stores, never in the ordinary
+`<home>/pre-restore-<timestamp>/` rollback directory. The save excludes root-level
+host-local entries (including its own destination), keeps each store's internal V1
+`backups/`, and prints the private rollback path, including in an incomplete-rollback
+failure report. Its directory is allocated independently
+so repeated restores cannot share a rollback set even when the ordinary one is empty.
+A bundle written before
+the tree was a component is silent for a different reason, so `MANIFEST.json`'s
+`version` (`snapshot.MANIFEST_VERSION`, 4; the export's own `EXPORT_MANIFEST_VERSION`,
+3) is what `_bundle_carries_named_stores` reads: replacing from an older bundle leaves
+the live tree untouched and prints that it did, while the rest of `memory` is
+replaced. Replace also keeps the tree on its list whether or not `workspace` is
+selected — the two `workspace/` subtrees defer to the workspace pass, `memory_stores/`
+is under no other component's tree. A staged tree that holds no file (a home whose
+`memory_stores/` contains only runtime state) does not count as payload for the
+declared-without-payload refusal. Restored store entries land owner-only (`0o700` /
+`0o600` in the tar filter), as provisioning makes them.
 
 **A named store starts EMPTY.** Nothing is copied from the default store and nothing
 is inferred from it: no preferences, no projects, no history, no semantic or episodic
@@ -536,6 +714,37 @@ The store subscribes to the `memory` section in `__init__`, and `reconfigure(mem
 
 Embedding width is deliberately NOT touched. Changing `memory.embedding_dim` invalidates every stored vector, which is a re-embed rather than a value swap, so it stays boot-only and its apply path is the dashboard's embedding-model route.
 
+### Vector publication across processes
+
+Managed inference pins the actual shared backend before recording database
+provenance. Its signature must match the observed database signature, and a
+pending explicit rebuild refuses inference. Cache hits and coalesced requests
+use that same pinned backend. Results retain their signature and handled request
+through vector normalization; publication rechecks them under SQLite write
+admission. The installation config lock covers managed publication too, so a
+new explicit request cannot land between the final request check and commit.
+Acquire that config lock before the store's process-local database lock, including
+primary episodic writes and lazy/explicit backfills, so a config waiter does not
+hold up database readers. `_vector_commit` owns both locks through commit or
+rollback; callers must not wrap it in an earlier database-lock hold.
+Recall checks the same result provenance before publishing its response.
+
+| Caller | Durable content and vector failure contract |
+|---|---|
+| `set_semantic` | Content commits first; failed vector admission, update or commit is logged and leaves the content saved. |
+| `write_lesson` | The rule's primary write must succeed; its vector tail is best effort. |
+| Lazy lesson backfill | A failed derived update does not prevent the primary lesson operation. |
+| `write_episodic` | Content and optional vector share the primary transaction; obsolete vectors become NULL, but primary transaction failures propagate. |
+| Three explicit backfills | Each vector has one transaction; failure propagates for repair reporting, with earlier committed rows retained. |
+| `recall` | No vector write; changed provenance discards the partial result and retries lexical retrieval. |
+
+`_vector_commit` owns derived transaction admission, commit and rollback. Its
+callers do not commit inside it. Failed admission never rolls back a transaction
+it did not start. Rollback failure closes the uncertain connection, retaining
+previously committed content and refusing further use of that connection.
+Resident vector indexes are discarded after rollback. This is per-record repair,
+not a transaction across every database or a guarantee against filesystem failure.
+
 ### Thread safety (`_db_lock`, `threading.RLock`)
 
 One `VectorMemoryStore` instance **per `db_path`** is shared by the gateway event
@@ -551,8 +760,13 @@ same time corrupt each other's row iteration (observed as
 a column the `WHERE` clause excluded), while a concurrent FAISS `add` during a
 `search` can corrupt the C++ index outright. `self._db_lock` (a reentrant
 `threading.RLock`, so a locked method may call another locked method)
-serializes every statement on that connection. The critical sections that
-matter most:
+serializes every statement on that connection. The structural regression guard
+recognizes explicit lock scopes and `_vector_commit`, checks the latter's actual
+`ExitStack.enter_context(_db_lock)` acquisition, and fails if that acquisition
+is removed. Its negative fixtures retain checks before acquisition, after scope
+exit, on failed admission and in deferred nested functions. Generation rechecks
+must be lexically inside a lock-owning scope, not merely later in source order.
+The critical sections that matter most:
 
 - **Semantic write** (`_write_semantic`): the whole `SELECT` →
   conflict-resolve → `UPSERT` sequence. Unlocked, a read-modify-write can
@@ -1198,13 +1412,55 @@ owned V2 store and validates its exclusive binding. A supplied member that
 disagrees with that owner is an error. V1 and unowned legacy stores retain
 their existing context path.
 
+The owner persona and execution prompt share one project-first template resolver.
+A distinct execution template contributes its admitted prompt, resources and
+context settings to the same complete snapshot and digest. Its changes or source
+removals refresh that snapshot without changing the private memory owner. Sources
+shared by both templates occur once; a source changing between their reads refuses
+preparation. Conditional guides on a framework without native selectors have
+an explicit activation path: a user `#guide` reference or a matching file path
+loads the guide's full current text into the snapshot. A supplied user-text span
+excludes generated prefixes from selection; a modify hook's replacement is the
+effective request. Other conditional guides remain guarded discovery pointers.
+Auto relevance and file paths first discovered through tools remain agent-driven:
+the pointer tells the agent to read the complete file when its condition holds,
+not to apply every conditional body unconditionally.
+A project override of a template takes precedence over its global copy. A
+relative `file://` prompt uses the project root when its template comes from the
+project's agents directory, and the user home when it comes from the global
+agents directory, even with a project bound. Both readers share the same path
+validator: resolve symlinks and require the result to remain inside that resolved
+root. Relative execution prompts retain that root through the no-follow byte
+reader, which checks the opened descriptor's path against it. An ancestor swap
+between resolution and opening cannot redirect that read outside the root.
+UTF-8 decoding normalizes CRLF and CR like the essential reader; unreadable or
+over-50-MiB execution prompt files are skipped, never truncated.
+A `..` segment that stays inside is valid; an escaping traversal or symlink
+is skipped with a debug log. Sensitive-path checks remain in force, and the
+essential reader also retains its managed-memory source refusal. Absolute
+`file://` prompts retain each reader's existing rules. Neither relative reader
+depends on the gateway process's working directory. When the
+execution template is the owner's template, its custom persona appears only in
+the per-turn essential envelope, not again in the session-start prompt. A
+different execution template still supplies its task instructions. An inherited
+exact product-prompt URI stays in the product session-start path, not in
+essentials. Essential sources are validated on every private member turn; their
+complete snapshot is submitted only when the conversation needs it.
+
 `ContextBuilder` injects the owner's identity, current permanent rules and
 bound custom-template persona on fresh, warm, resumed, post-compaction and
 minimal turns, including delegated and cron turns with no DM member argument.
 An execution-template override supplies task instructions; it does not replace
-the memory owner's persona. The generic `kirocrew` product prompt retains its
-existing provider/session-start path. The member's working briefing keeps its
-existing bounded/platform-gated reader; it is not unbounded archival memory.
+the memory owner's persona. The generic product prompt retains its existing
+provider/session-start path, including when a member's fork inherits it. The
+loader recognizes the exact current `file://` URI selected by `_prompt_path()`,
+not a template name or file basename. Package installs outside the user home,
+development prompt overrides and the global user prompt override therefore do
+not become project essentials or spend the essential envelope's budget. A
+custom persona, including one on a template named `kirocrew`, remains essential
+and passes the same file-admission checks as other declared sources. The member's
+working briefing keeps its existing bounded/platform-gated reader; it is not
+unbounded archival memory.
 
 Admitted project essentials are the active project's root `AGENTS.md` and
 `SOUL.md`, default/`always` documents under `.kiro/steering`, and Markdown file
@@ -1225,7 +1481,41 @@ under, a link below the root is still refused. The managed-state isolation
 resolved spelling, so it fires for resolved candidates on symlinked-home hosts
 exactly as it does elsewhere.
 
-These essentials are refreshed from the current source on every member turn.
+These essentials are read and validated on every member turn. The builder
+stages a complete snapshot on the actual serving provider, which suppresses its
+wire envelope after successful consumption while its content, source list and
+scope remain unchanged. Fresh, resumed and post-compaction conversations receive
+a snapshot; changed content or scope receives one complete replacement, explicitly
+superseding sources absent from its source list. Ordinary private chats, member
+DMs, messaging, cron and delegated runs use the same provider receipt contract
+specified in [providers](providers.md#essential-context-delivery-contract).
+A provider-parametrized wire test covers both dedicated and shared adapters:
+fresh delivery, warm suppression, observable clear/compaction, one complete
+retransmission and renewed suppression. Only the model transport is simulated;
+this pins the adapter/receipt pairing, not unobservable native history behavior.
+Admission, protected identity and permanent-rule checks are not cached by a
+receipt. A missing declared source still refuses; missing optional root guides
+change the snapshot instead. There is no mtime-only content cache or automatic
+retrieval on the warm path.
+
+Structural-marker scanning copies contiguous ASCII segments without per-character
+Unicode normalization. Non-ASCII characters retain the same normalization rules;
+matching, original-text coordinates and span-local rewriting are unchanged. This
+is a per-call computation optimization, not a cache of content or admission.
+
+The receipt is an observable-event contract, not a native-history guarantee.
+Suppression ends only on something the gateway can observe: a changed snapshot
+content or scope, an invalidating event the provider yielded (compaction, clear,
+agent switch), a history-discarding command the gateway itself dispatched, or a
+client/process replacement. A native history loss that the backend performs
+without emitting any of those is not detected. Unchanged warm turns then keep
+omitting the snapshot, with no bound on how many turns, until one of the
+conditions above requires delivery again. The gateway does not claim that such a
+silent loss recovers on the next turn, does not periodically resend the snapshot
+on a schedule or turn count, and does not assert that every native trim path
+emits a notification; which paths do is recorded per backend in
+[providers](providers.md#native-harness-notifications-relied-on).
+
 They have a separate 64,000-character envelope, including wrappers and identity;
 an over-budget or refused essential aborts context construction with a named
 reason rather than truncating its tail. Ordinary session context yields space
@@ -1334,19 +1624,44 @@ keeps its existing sweep; exact-identity proposals and explicit V2 correction
 and review continue through the revision-aware write path.
 
 `recall(query_text, cap=3000, project_dir=None)` is the on-demand entry point
-for both versions, using the selected store's retrieval policy. It returns bounded semantic, episodic and lesson context plus
-the selected fact/episode snippets and their compact retrieval evidence, never
-unabridged source rows or vector blobs. Truncated episode evidence is marked;
-full source content remains available to the owner editor. The character cap
-includes wrappers; an empty query or zero cap yields no context. A separate
-16 KiB transport budget counts JSON escaping, previews, evidence and the MCP
-TextContent envelope, with 1 KiB reserved for ordinary RPC framing/request IDs.
-Caller-controlled arbitrarily large JSON-RPC IDs are outside this memory-data
-bound. The final HTTP/MCP serializers recheck the budget after redaction,
-omitting whole tail records and regenerating matching contexts, previews and
-counts when necessary. Omitted records are reported in the retrieval metadata.
-Episodic references carry their stable memory ids. The MCP transport derives the store
-from the caller's trusted binding; it accepts no model-selected store argument.
+for both versions, using the selected store's retrieval policy. Each nonempty
+recall computes its query embedding at most once and passes success or failure
+to fact, episode and lesson retrieval. The result carries the store's
+vector-space generation and recorded signature across those reads. Checks run
+under the store lock before vector-bearing reads and before publication;
+inference never runs while holding that lock. A changed space discards the
+complete partial result and performs one keyword-only retry, without another
+inference. Failure is retained only for that call, not in a negative cache.
+
+The store and dashboard return bounded semantic, episodic and lesson context
+plus selected snippets and retrieval evidence, never unabridged source rows or
+vector blobs. Truncated evidence is marked; full content remains available to
+the owner editor. The character cap includes wrappers; an empty query or zero
+cap yields no context. A separate 16 KiB transport budget counts JSON escaping
+and the MCP TextContent envelope, with 1 KiB reserved for ordinary RPC
+framing/request IDs. Caller-controlled arbitrarily large JSON-RPC IDs are
+outside this memory-data bound. The MCP boundary uses a model-facing projection:
+each body appears only once in its trusted reference context, evidence retains
+identifiers, scores, provenance and truncation flags without another body, and
+previews are omitted. Dashboard/UI payloads retain their existing shape. The
+final serializers recheck their actual representation after redaction,
+shortening snippets or omitting whole tail records and regenerating matching
+contexts and counts when necessary. Omitted records are reported in retrieval
+metadata. Episodic references carry their stable memory ids. The MCP transport
+derives the store from the caller's trusted binding; it accepts no model-selected
+store argument.
+
+HTTP recall has one nine-second server-side monotonic work deadline, shorter
+than its ten-second MCP client timeout. Retrieval uses a bounded `mc-recall`
+pool and separate admission from prompt preparation's `mc-embed` pool. The work
+budget follows the worker into native inference. Expired or cancelled queued
+jobs are removed without inference; a claimed native call cannot be interrupted
+in-process and retains its executor worker and admission until it completes.
+This change does not add process isolation or guarantee prompt progress when a
+prompt itself requires the same wedged native model. The registered
+`api_memory_recall` handler applies `memory_recall_deadline` before authorization,
+cold store opening, admission and retrieval; expiry returns HTTP 504 with
+`memory_recall_timeout` without changing caller-authority checks.
 `get_context_preview()` uses the same result for V2 and keeps V1's response.
 The `member_v2` harness report also carries the V2 classifier's admission confusion
 per mode on the same measured pair cosines, separately from its ranking and
@@ -1755,9 +2070,260 @@ same. Failures are not cached. Loading remains asynchronous: callers receive
 `None` until the shared model is resident. These are resource ceilings, not a
 claim of measured latency or RSS improvement on every supported platform.
 
+Embedding cache stripes protect only short cache and full-key in-flight
+bookkeeping. No stripe is held during model inference or another caller's wait.
+At most 128 in-flight keys are retained. Same-key callers share one inference;
+non-bulk work without an explicit budget expires after 30 seconds. This stops
+queued work and coalesced waits, but cannot interrupt an in-flight native call.
+Bulk inference and bulk coalescing have no implicit deadline, so shared duty-cycle
+cooldowns cannot expire unattended repair work. An explicit caller budget still
+applies to every priority, including recall's nine seconds. Expired work leaves
+vectors NULL and eligible for the next repair; failures are not cached.
+Model loading remains asynchronous and is not charged to this queue-wait budget.
+An interactive caller promotes an existing queued bulk job. Promotion cannot
+interrupt an already-running job or extend an explicit deadline. A shared
+producer whose own budget expires while the native call is running still
+publishes and caches the vector that call returned; only its own return value is
+the unavailable-vector fallback, and each waiter's own budget decides whether it
+receives the vector. A producer that obtained no vector yields the fallback to
+every waiter.
+
+A custom model's identity is `<label>:sha256:<digest>` of its weights, even when
+the operator supplies a model label. `memory.embed_model_id` contributes only
+the label part; it is not an identity override and cannot pin a vector space
+across a change of weights. Explicit apply persists `memory.embed_model_id`
+and `memory.embed_model_stamp` together; the stamp contains device, inode, byte
+size, modification nanoseconds and change nanoseconds. An unchanged file reuses
+that digest at startup without reading its weights, even in a fresh process.
+A changed or missing stamp starts one deduplicated verification worker. Event-loop
+readers report a transient unverified model and never hash weights or cache its
+placeholder as the shared backend. The worker and synchronous resolvers verify
+the digest and persist its identity/stamp pair through the locked config writer,
+only while the configured path, identity and file generation still match.
+Subsequent polls construct the real backend without operator action, and the next
+process start reuses the persisted stamp. Default backend construction does not
+hold the shared-backend lock while hashing, so loop readers remain responsive.
+Applying also computes the digest off-loop and persists the new digest/stamp pair.
+Model identity and vector width define the vector space.
+The embedding-status response reports `server_healthy=false` while a configured
+custom model is unverified or has a validation error, even if its file exists or
+an older backend is loaded. Successful verification restores normal health
+reporting without requiring the operator to apply the model again.
+
+The first verified custom-model stamp and `memory.embed_model_legacy_ids` are
+written in one locked config update when the stamp is absent or empty and the
+configured identity contains no digest. The stored list names the basename/size
+identity and any explicit label superseded by that verified digest. A ready
+custom backend may re-stamp a matching V1 or V2 store without clearing vectors,
+rebuilding indexes, changing generation or submitting embedding work, including
+stores opened lazily in another process. The backend path, digest identity and
+file stamp must match the persisted configuration, and the store width must
+match the backend. Unrelated signatures do not qualify. An existing stamp alone
+cannot grant compatibility; the persisted legacy list is also required. A missing
+or unreadable current model stamp is a mismatch, so alignment uses normal
+reconciliation rather than aborting the caller or preserving unverified vectors.
+
+A same-name/same-size weight replacement, or reuse of an explicit identity label,
+made before the first verified stamp cannot be detected from the old metadata;
+this is the pre-upgrade identity limit. Weight changes after that stamp get a new
+digest, clear the compatibility list and invalidate vectors normally. Explicit
+model apply always removes the compatibility list and commits a fresh
+`memory.embed_rebuild_generation` alongside the verified model settings. Every
+explicit apply requests a rebuild, including the same file and digest with no
+legacy labels left. Untouched upgrades have an empty generation and retain the
+compatibility behavior above.
+
+Each store records its handled generation in `memory_meta.embedding_rebuild_generation`.
+Alignment checks it before legacy restamping and equal-signature shortcuts.
+The store advances its in-process vector generation before invalidation, clears
+vectors through the existing physical relations, removes stale FAISS files and
+commits the signature and handled generation with the invalidation. SQLite
+immediate admission serializes the request check across connections. An index
+removal failure may leave cleared vectors but never acknowledges the request;
+a transaction failure preserves the previous database state. Existing NULL-only
+backfill repairs the cleared rows without resetting completed rows on retry.
+
+The request survives config rollback, partial failure and restart. Conditional
+rollback checks both this apply's model settings and request identity, preserves
+unrelated edits, and never erases the repair request. A competing model edit
+refuses rollback and leaves the candidate gated. Cached and late-opened V1/V2
+stores share alignment; non-mutating staleness checks also include the request,
+so pending stores use lexical retrieval rather than score stale vectors.
+
+`embedding-status` retains English `setup_warning` and `setup_error` diagnostics
+and adds stable `setup_warning_code`, `setup_error_code` and parameter objects.
+Known codes render fully localized copy that names a next step and never
+interpolates the backend's English exception: `model_verification_failed` keeps
+only `{{path}}`, `model_download_failed` takes no parameter, and both keep the raw
+text reachable through a collapsed "View details" block beside the notice
+(`embeddingSetupDiagnostic`), rendered `translate="no"`. Missing and unknown
+codes still fall back to their diagnostic prose as the body, so a new backend
+code is never swallowed. `model_active` reports the serving loaded backend
+separately. A known model is shown as active or configured-but-inactive; the
+latter retains a neutral provenance badge. An unknown model identity shows the
+localized fallback without a bundled/custom badge, so provenance does not read
+as a claim that the model is known. The Vector Memory card's Embeddings stat tile
+agrees with that header: once `setup_step` is idle or done nothing is
+progressing, so `model_active` (or, for an older backend without it,
+`model_available` then `server_healthy`) reads `false` as a muted `not active`,
+an absent answer as a muted `unknown`, and only `true` as the success-coloured
+`active`; it never guesses "model loading". A progressing or failed
+`setup_step` keeps precedence and shows its localized step label. `repair` names its `open_stores` scope, pending invalidations,
+remaining live NULL vectors, deferred closed/unavailable stores and unknown scope.
+It does not open closed stores or claim they are repaired. Public re-embed status
+is `deferred` rather than `done` while that scope is incomplete. Progress counts
+cover open-store work, not a promise of whole-install completion. The dashboard
+renders the standing rebuild ONCE, on the Embedding Model card (the card that
+owns Apply), in user vocabulary with the three counts kept apart:
+`pending_vectors` is memory entries still waiting for a vector,
+`pending_invalidation` is open STORES still holding old vectors, and
+`deferred_stores` is closed or unavailable stores rebuilt when next opened. They
+are never summed, and a state where only the invalidation count is non-zero is
+still shown as pending. Only the non-zero units are named: the sentence
+(`repair_pending`) takes one `{{items}}` slot filled by the surviving clauses
+joined through the `fmtList` seam (`Intl.ListFormat` for the UI language), so an
+omitted unit never leaves a `0 …` clause or a dangling separator, and each
+clause still selects its own localized plural form. The sentence names its
+scope (`across all memory stores`): the counts cover every active store (open
+ones inspected, closed ones deferred) while the Vector Memory card's stat tiles
+count only the store shown, so without the scope the two sets of numbers
+cannot be reconciled on the page. All three zero renders
+nothing; `unknown_scope` wins over any counts. `unknown_scope` copy names what actually happens (the
+check retries automatically while the page is open; a closed store is rebuilt
+when it next opens; persistent display means read the gateway log) rather than
+promising that an unavailable store is repaired by opening it. The unknown-scope
+notice links directly to the Logs page in a separate tab, preserving an unsaved
+model-path edit while the operator inspects diagnostics. The Vector Memory
+card keeps its 30-second refetch while a rebuild is pending but does not repeat
+the line. Each count selects its own localized plural form. Deferred repair is
+announced as status text, without a progress bar; applying and running retain
+their existing progress semantics. Setup and download labels translate known
+states, with a localized model-loading fallback for unknown tokens.
+
+Both Memory-tab cards observe the same React Query embedding-status snapshot.
+The status tile is labeled `Embedding status` (localized), distinct from the
+`Embedded` vector count and the `Embedding Model` configuration card.
+The Embedding Model card no longer copies a response into local status and then
+cancels/overwrites the other card's query. Overlapping reads deduplicate, and a
+new shared response updates both views without replacing a typed path draft.
+Polling retains the two-second active / thirty-second deferred cadence; an idle
+Embedding Model card requests no automatic focus/reconnect read. Its existing
+conditional missing-path focus refresh explicitly fetches fresh shared data.
+
+While `_apply_embedding_model` backfills, each store's
+`backfill_missing_embeddings` receives a per-store progress adapter
+(`_store_progress_adapter`) that offsets the store's own `(done, total)` stream by
+the rows earlier stores completed, folds the lesson-to-episode phase reset into a
+running offset instead of moving the bar backward, and never reports a total below
+what has been counted. The exact per-store count is still reconciled from the
+store's NULL count after it finishes, so final `done`/`total`, failures and the
+multi-store total are unchanged; the adapter only keeps the bar moving during a
+single store's sweep.
+
+The prior legacy labels are captured by the config writer's locked mutation.
+Inheritance requires a non-empty list whose every item is a string. Status
+warnings and legacy alignment use the same validator; malformed scalar or
+mixed-list values grant no compatibility and show no inheritance warning.
+First verification emits one WARNING about inherited vectors;
+embedding status keeps the same text in `setup_warning` until explicit apply.
+The warning is written for the operator, not in code vocabulary: the vectors
+predate the record of which model file produced them, and a changed file needs
+the model reapplied. The Memory tab's vector card renders it as a status notice
+with a link that moves focus to the Embedding Model card's path field, so the
+fix is reachable from the notice. When the same status also carries a
+`model_path_*` error code (the configured file is missing, unreadable or not a
+file), the warning swaps its "reapply" clause for "fix the model path first, then
+apply" (`legacy_vectors_warning_path_error`). When the path field is mounted,
+this warning owns the only settings link and suppresses the separate path-error
+pointer. Without the legacy warning the pointer remains: one sentence naming the
+fault and its cost (keyword search meanwhile), with the adjacent
+`Open embedding model settings` link as the only statement of where the fix
+lives, so the destination is not said twice. Without the field the
+Vector Memory card retains the complete error. Non-path errors remain complete.
+The Embedding Model card echoes
+the localized path error under its path field and keeps Apply disabled while the
+field still shows the configured path: submitting it would fail with the same
+error. That gate is DERIVED from the current status plus the field's live-check
+state, never stored, and it yields only to a VERDICT, never to a keystroke:
+editing the path keeps the notice (and `aria-invalid` / `aria-describedby` on
+the field) and keeps Apply disabled, because nothing is known about the new
+path yet and an enabled Apply beside an unchecked path is the state a reader
+would not trust. Blurring the field runs the live validate call, whose verdict
+replaces the status-derived one: a readable file clears the notice and enables
+Apply, a failed check shows its own message and keeps Apply off, and an
+emptied field still reverts to the bundled model without a request. A field
+whose configured path is healthy keeps the ordinary edit semantics (editing
+enables Apply; the blur check still runs).
+A file restored IN PLACE is re-checked without a blur: while that status-derived
+notice is showing for the untouched configured path, the card re-reads
+`embedding-status` when the window regains
+focus (the endpoint re-validates the configured path on every call through
+`resolve_custom_model`, so one read is the whole re-check). A restored file
+clears the notice and re-enables Apply; a still-missing file re-reports the same
+code and changes nothing; the listener exists only while the notice describes
+the untouched configured path, so an
+idle card without a path error stays quiet and a field the user has edited or
+live-checked is never refetched over (a status read still in flight when typing
+starts lands without touching the draft, and a stale error status landing after a
+passed live check does not re-disable Apply, because the live verdict owns the
+gate). A stale status can therefore never block a
+correction or a valid reapply of the same file. The button's LABEL is decided
+separately from that gate, by the path it will submit: when the trimmed field
+equals the configured `model_path` (including an edit typed and then restored,
+and an empty field while the bundled model is configured) it reads
+`Rebuild memory vectors`: the configured path is unchanged and its vectors are
+rebuilt (the file behind that path may have been replaced, which the explicit
+apply supports; the label claims nothing about the weights);
+any other path reads `Apply model`; `Applying…` while the request is in flight.
+`touched` is not the signal — a restored edit is touched and still a reapply.
+A reapply uses the ordinary button treatment, not the primary accent, so an
+idle healthy card does not visually urge a full rebuild. A changed path keeps
+the primary Apply treatment; both actions retain their confirmation and gates.
+The confirm modal follows the same reading: a reapply borrows the card's own
+neutral title (`Embedding Model`) and confirms with `Rebuild memory vectors`, a path change
+keeps `Change the embedding model?` / `Change model`. The reapply body describes
+reloading the configured model and clearing and rebuilding its stored vectors,
+without asserting that a new model exists or that the file has changed. A path
+change retains the different-model comparison warning. The disabled
+guards (no status, busy, applying, checking, failed live check, status path
+error) apply identically under either label, so an unchanged-path reapply is enabled
+whenever a change would be. While a rebuild is applying, running or deferred,
+the card shows the muted `Keyword search still works. Safe to leave this page.`
+line once, under the progress block; a failed rebuild shows the failure hint
+instead, with the raw backend text in its tooltip only. This compatibility choice preserves unchanged custom installations but
+does not prove the provenance of vectors created before any weight digest.
+Signatures retain the original SHA-256 encoding of `model_id|dim`, truncated to
+16 hex characters, so unchanged bundled vectors need no rebuild. Custom-model
+tests derive expected
+identities with `_custom_model_id(path, configured_label)` and spaces with
+`embedding_space_signature`, including an independent SHA-256 check of the
+weight bytes rather than a basename/size or label-only assertion.
+
+Store opening, model application and standing repair share
+`align_store_embedding_space`. It snapshots one ready backend, validates a
+positive width no greater than 65,536, then aligns width, generation and
+signature under the store lock. Replacing an existing signature advances the
+generation even when the width is unchanged, so a write already embedding
+against the outgoing model cannot commit that vector after reconciliation.
+First attribution of an unstamped store with unchanged width does not advance
+the generation. Backend replacement is serialized against this operation.
+A loaded candidate waits for its configured identity and width before aligning
+stores, and cannot serve vectors until reconciliation completes. Digest and
+configuration-write failures occur before vector clearing. The validated,
+expanded path is shared by candidate construction and persistence, including
+`~/...` input. A later alignment failure restores only the model settings that
+apply wrote, preserving unrelated config edits; if those model settings changed
+concurrently or rollback fails, the candidate remains gated and reports the
+failure. Late-opened stores are collected again after persistence and do not
+combine an old configuration width with a candidate signature.
+The legacy unready bundled-model attribution path remains non-clearing; strict
+alignment requires readiness.
+
 ### Model Download Manager (`embeddings.py`)
 
 `ModelDownloadManager` (singleton via `model_download_manager()`) downloads the embedding GGUF in the BACKGROUND at gateway startup — boot is never blocked by the 610MB transfer:
+
+**Where the transfer lives.** The streamed-and-verified HTTPS transfer itself is `asset_downloader.download_to` (shared with hosted feature-video media, `feature-videos.md`): it owns connecting, hashing while streaming, the atomic install and the wording of each failure. `ModelDownloadManager` keeps everything that is about the MODEL — which url to resolve, the sha/size pins, the Ollama salvage, the retry ladder, and turning byte counts into the `status` dict. A second private downloader would be a second place for "did we verify this before installing it?" to be answered differently.
 
 **Download flow** (`ensure_model()` / `start_background_model_download()`):
 - **Salvage fast-path** (`_salvage_legacy_ollama_blob`): before downloading, checks the legacy Ollama blob store (`~/.ollama/models/blobs/sha256-<digest>`, honoring `$OLLAMA_MODELS`) — Ollama stores layer blobs content-addressed and the Ollama-era GGUF is byte-identical, so migrating users skip the 610MB re-download entirely. The copy is sha256-verified like a real download; any failure falls through to the normal download
@@ -1775,9 +2341,9 @@ claim of measured latency or RSS improvement on every supported platform.
 - On failure: status resets to `idle` with error message, frontend shows error + Retry button
 - Prevents concurrent setup attempts (409 if already in progress)
 - `can_retry` flag in status response for frontend retry button
-- `GET /api/memory/embedding-status` — `enabled` is always `true`; `provider` reports the legacy `"ollama"` token (the shipped frontend hard-checks `provider === "ollama"` — kept until the frontend companion change lands); `setup_step` maps the manager's steps to the legacy vocabulary the shipped polling loop terminates on (`ready`→`done`, `failed`→`error`, `downloading`/`verifying`/`waiting_retry`→`downloading`); the raw step and attempt are additionally exposed as `download_step` + `download_attempt` for newer frontends; `server_healthy` = model file present OR model loaded; `model_id` + `model_dim` disclose the embedding model producing vectors (read live from the shared embedder — e.g. `qwen3-embedding:0.6b` / `1024`) so the Memory tab can show which model runs locally
+- `GET /api/memory/embedding-status` — `enabled` is always `true`; `provider` reports the legacy `"ollama"` token (the shipped frontend hard-checks `provider === "ollama"` — kept until the frontend companion change lands); `setup_step` maps the manager's steps to the legacy vocabulary the shipped polling loop terminates on (`ready`→`done`, `failed`→`error`, `downloading`/`verifying`/`waiting_retry`→`downloading`); the raw step and attempt are additionally exposed as `download_step` + `download_attempt` for newer frontends; `server_healthy` requires a present or loaded model and no custom-model validation error; `setup_warning` exposes inherited legacy-vector identity until explicit model apply; `model_id` + `model_dim` disclose the embedding model producing vectors (read live from the shared embedder — e.g. `qwen3-embedding:0.6b` / `1024`) so the Memory tab can show which model runs locally
 - `POST /api/memory/embedding-model` — changes the local embedding model at runtime. Two modes, and note which one is the default: `{"path": "...", "validate_only": true}` validates only (returns `size_bytes` without touching the live backend), while **omitting `validate_only` performs the swap** — there is no `apply` flag, so a caller that sends only `path` applies the model. An empty `path` reverts to the bundled model. Refuses with 403 on a restricted session (SEL-audited), 409 while a re-embed is already running (single-flight), and 409 `env_override_active` when `KIROCREW_EMBED_MODEL_PATH` is set, because the env var wins at load and persisting a config path under it would store a path/dim pair the process never uses
-- **Apply ordering** (each step gates the next, so a failure rolls back rather than half-applying): build the candidate **gated** (not serving) → install it, retiring the outgoing model in the same step so two ~700MB models never co-reside → `begin_space_change()` → bounded `wait_ready` (600s) → `set_embedding_dim()` → reconcile → **verify the recorded space equals the active signature** → persist config → `activate_shared_embedder()` → backfill in the background. Config is written LAST so a reconcile failure leaves config naming the PREVIOUS model, which is what makes the rollback rebuild that model instead of resurrecting an ungated new one. Every rollback also restores the store's previous vector width, since a store left on the new width rejects every vector against the restored model
+- **Apply ordering**: build the gated candidate, install it while retiring the outgoing model, advance the store generation, wait for readiness (600s bound), persist the verified model configuration, retarget and reconcile stores, verify every recorded signature, activate, then backfill. Configuration-write failure preserves stored vectors. Alignment failure conditionally restores the prior model settings before resetting the candidate and restoring widths; rollback failure leaves the candidate gated with an actionable error. Unrelated configuration fields are not rolled back.
 - `GET /api/memory/embedding-status` additionally returns a `reembed` snapshot (`step`: `idle`/`applying`/`running`/`done`/`failed`, plus `done`/`total`/`error`) so the dashboard can render background re-embed progress; the card polls only while that step is busy
 - `POST /api/memory/disable-embeddings` — **gone**: embeddings are always-on. Kept as a graceful HTTP 410 stub (not a 404) because the shipped frontend still renders a Disable button; remove together with the frontend button
 
@@ -1823,6 +2389,14 @@ When vector memory is active, lessons are stored as semantic entries:
 - Methods: `write_lesson()`, `get_lessons()`, `delete_lesson()`, `get_lessons_context()`
 - Context: injected as `[Learned corrections]` block, separate from `[Semantic Memory]`
 - Allowlist: `lesson.*` prefix in `_BUILTIN_PREFIXES`
+
+A lesson's final embedding commit and deferred lazy backfills match the exact
+`value_json` that was embedded, require `is_deleted = 0` and `embedding IS NULL`,
+and recheck the embedding-space generation under the store lock. An owner edit,
+including a revision-checked edit, a tombstone or a completed newer backfill
+cannot be overwritten by an older writer's vector tail. The body remains
+committed when its obsolete vector is discarded; ordinary backfill can fill a
+remaining NULL vector.
 
 Model: `Qwen/Qwen3-Embedding-0.6B` Q8_0 GGUF (610MB). Apache-2.0 licensed. Served in-process via the vendored llama-cpp-python runtime on all supported platforms.
 
@@ -1896,6 +2470,14 @@ route's own operation name (`preferences.write`, `projects.write`, `history.writ
 `semantic.write`, `semantic.delete`, `episodic.delete`, `memory.migrate`,
 `memory.import`, `memory.promote`), and every non-2xx body carries a machine-readable
 `code`.
+
+Gateway-created child context retains an admitted privacy mode separately from
+its store. `ContextBuilder.build_message` honors temporary mode even when a
+caller omits `blocks_reads`; continuation setup skips vector preparation and
+mirrors restricted mode into child history for consolidation. Runtime-key modes
+are recovered from the existing protected binding tree after restart, never
+from editable transcript mode. The in-process mode map lasts for the context
+builder's gateway lifetime; it is not an independent persistent authority.
 
 The matching GET on each markdown route is a **read** path and is deliberately
 ungated — gating it would blank the Memory tab for every session the probe cannot
@@ -2280,6 +2862,16 @@ why a caller that must never replace an existing lesson routes to
 `set_semantic_if_absent` instead (see `onboarding_import`, whose comment records that a
 foreign directive could otherwise delete a correction the user taught the agent).
 
+**A call that stores nothing deletes nothing.** Every branch above QUEUES its
+supersedes; the queue drains only after the semantic write commits the submission. The
+ordering carries the whole guarantee, because the branches read rows newest-first and
+each of them can be reached before a later row declines the write: deleting where a
+branch decides would let a row retired early in the scan be destroyed by a call that
+goes on to return `deduped` / `substring_covered`, leaving one stored lesson gone, the
+submission unstored, and a result naming the surviving lesson as still in effect beside
+the deletion. Draining after the write extends the same guarantee to a value the
+semantic write itself rejects.
+
 **What a write reports.** `write_lesson()` returns a `LessonWriteResult` naming WHICH
 outcome occurred: `inserted` / `enriched` / `unchanged` / `deduped` / `refused`, plus a
 short reason code (a `SemanticRejectCode` value for a refusal, the dedup rule's name for
@@ -2302,8 +2894,9 @@ lesson, so a write that tombstoned a stored rule reported a bare `inserted` with
 `reason=None` and the caller was told its lesson was saved with nothing naming the cost.
 The result is the only channel that can carry it: the deleted row is a tombstone, so by
 the time the caller looks it is absent from `get_lessons()`, from `learn_list` and from
-the injected lessons block. It is empty on every path that deleted nothing (including
-`enriched`, which is decided in pass 1 and skips the dedup scan), is forwarded by
+the injected lessons block. It is empty on every path that deleted nothing —
+`enriched` (decided in pass 1, which skips the dedup scan) and every `deduped` or
+`refused` outcome, none of which reach the drain — is forwarded by
 `/api/lessons` as a JSON array, and is rendered in full — not counted, not truncated —
 by the `learn add` CLI and the `learn_add` tool, because that text is the last readable
 copy of the removed rule.
@@ -2358,7 +2951,7 @@ lesson beat a contradicting preference in the same prompt.
 | Lesson contradicts a preference | Lesson wins via the `[Learned corrections]` framing | `context.py` |
 | Two semantic writes to one key in V1 | User-explicit writes win; automated writes cannot replace a user-explicit fact, and otherwise use the existing confidence precedence | `vector_memory._write_semantic()` |
 | Two semantic writes to one key in V2 | Owner correction or verified transcript correction with matching revision replaces the fact; other changed automated assertions remain reviewable proposals | `vector_memory._write_semantic()` |
-| Duplicate lessons in V1 | Substring dedup (contained-in-stored declines; contains-a-stored-one deletes it, longer wins, regardless of source), then topic-overlap dedup (shared keywords cover at least 50% of the LARGER keyword set; newer replaces older regardless of source), then embedding dedup (cosine > 0.85; newer replaces older unless a stored near-duplicate outranks the write: `user_explicit` over a lower-authority source, or strictly higher stored confidence). A non-mutating authority pre-pass decides semantic-match refusals before the scan; it mirrors the earlier substring/topic branches, which remain source-blind. Semantic-match deletions are deferred until the scan completes without refusal; substring/topic branches retain their delete-as-you-go behavior. The final semantic write follows those deletions and reports any superseded rows even if it refuses. A write declined on authority deletes nothing and reports empty `superseded`; every completed deletion is named in `LessonWriteResult.superseded` | `vector_memory.write_lesson()` |
+| Duplicate lessons in V1 | Substring dedup (contained-in-stored declines; contains-a-stored-one deletes it, longer wins, regardless of source), then topic-overlap dedup (shared keywords cover at least 50% of the LARGER keyword set; newer replaces older regardless of source), then embedding dedup (cosine > 0.85; newer replaces older unless a stored near-duplicate outranks the write: `user_explicit` over a lower-authority source, or strictly higher stored confidence). A non-mutating authority pre-pass decides semantic-match refusals before the scan; it mirrors the earlier substring/topic branches, which remain source-blind. Every branch's deletions are deferred and execute only after the semantic write commits, so a call that stores nothing deletes nothing: a `deduped` verdict from any branch and a `refused` from the semantic write each preserve every live lesson row and report empty `superseded` (a lazy embedding backfill for a row the call read may still have flushed, which changes a vector and no lesson). `delete_semantic` takes an optional `expect_value_json`, carrying the comparison inside its own UPDATE, so a queued row is tombstoned only while its stored body is still the version the scan read and one a competing writer changed is skipped -- the same compare-and-write contract the lazy embedding backfill applies, atomic against another process, and what covers the write's own key once `set_semantic` has committed under it. A drain that stops partway (raised error, killed process) keeps the submission and leaves the rows it had not reached: the residue is a duplicate, never a lost lesson, and the next write matching those rows retires them. Every completed deletion is named in `LessonWriteResult.superseded` | `vector_memory.write_lesson()` |
 | Distinct lessons in V2 | Different rule text coexists without substring, topic or embedding deduplication. Exact-rule enrichment remains; key-targeted corrections use the owner/revision machinery | `vector_memory.write_lesson()` |
 | Contradicting episodic fragments | No explicit resolution: time decay plus MMR surfaces the newer/more relevant fragment | `vector_memory.search_episodic()` |
 | A semantic value is superseded | `_retire_stale_episodic()` tombstones episodic rows that quote the old value | `vector_memory._write_semantic()` step 9 |
@@ -2372,6 +2965,11 @@ private session fails instead of falling back to that global store. Legacy
 named V1 stores retain their own files. `test/test_memory_v1_golden.py` pins
 the preserved V1 policies and eager session recall. Shared metadata, record
 editing and optional MCP recall do not convert V1 or replace its prompt path.
+
+Private member workflow execution is explicitly unsupported until author and
+worker sessions can retain the complete protected memory identity. Workflow
+service admission rejects private parents before any model work instead of
+silently executing on Global V1; this includes replay and reruns after restart.
 
 Deleting or package-pruning a Crew Member retires its private store by removing
 the member binding while retaining the ownership record and files for explicit
@@ -2469,6 +3067,13 @@ share one SQLite file.
 It returns `None` for the default store (whose vector store is the global one, wired at
 startup). A private V2 failure raises; a declared legacy V1 store may return
 `None` and retain its own Markdown/keyword path.
+
+Before returning either a cached store or the freshly published winner,
+`ensure_store` awaits `align_store_embedding_space` off-loop, without holding
+the cache lock. A store opened while model configuration is still being written
+keeps its existing width and vectors. After persistence, alignment adopts the
+ready candidate's width and signature together; unpublished-store ownership
+stays with the preparation worker.
 
 It cannot live inside `get_memory_for`. That method is synchronous, is called
 unconditionally on every context build, and holds `_stores_lock`; `VectorMemoryStore.init()`
@@ -2712,11 +3317,29 @@ truncated to 300 chars.
 
 Markdown files at `~/.kiro/crew/skills/{name}/SKILL.md` with optional YAML frontmatter (`name`, `description`, `always`).
 
+Builtin skill bodies remain independently usable by custom and lite agents that
+may not receive the default base prompt or deferred tool descriptions. Condense
+repeated prose within a skill, using local section references for shared steps,
+but retain its executable syntax, schemas, consent/refusal rules and resources.
+Do not replace these contracts with a pointer to unseen base instructions or
+introduce fragment-loading machinery solely to deduplicate prose.
+
 Frontmatter is parsed line-by-line (`_parse_frontmatter`): only a column-0 `key: value` line is a field. A value that is a bare block-scalar indicator (`>`, `|`, optionally chomped with `-`/`+`) is resolved from the indented lines that follow — folded (`>`) folds single breaks to spaces while preserving blank-line counts and more-indented line breaks, literal (`|`) preserves newlines — so a multi-line `description` still routes. Explicit indentation indicators (`>2`) are not supported. The other frontmatter readers stay reconciled with this resolution: the onboarding import gate treats a bare indicator as an activating `always` value (fail-closed), the auto-skill update path's `history._frontmatter_value` resolves block scalars the same way, so a live skill's block-scalar `description`/`triggers` survive the staged-candidate round-trip instead of collapsing to the indicator character, and the skill-provider preview endpoint (`dashboard/handlers/discover.py`) parses SKILL.md with the loader's own grammar, so the previewed name/description match what the installed skill will show.
 
 Supports nested directories (e.g. `skills/utils/tiny-url/SKILL.md`). The skill name is the relative path from the skills root (e.g. `utils/tiny-url`).
 
 **Source precedence** (project-level wins): `$KIROCREW_PROJECT_DIR/skills/` → `builtin_skills/` (bundled). Auto-copied to `~/.kiro/crew/skills/` on first run. Copies entire skill directories (scripts, assets, etc.).
+
+**Retired generated skill cleanup.** `skills.remove_retired_conductor_skill()`
+removes `skills/conductor/SKILL.md` only when a descriptor-pinned, capped read has
+a CRLF-normalized SHA-256 matching one of the static generator outputs. Linked
+conductor directories, linked final names, oversized files, and identity changes
+return false. Read and unlink errors reach its best-effort callers to log or print;
+empty-directory prune errors are ignored. Platforms without descriptor-relative
+opens keep the final-name and size checks while the
+ancestor and unlink identity checks degrade to by-name checks. Setup and gateway
+startup both invoke it; startup runs it on every boot so a package upgrade needs
+no separate setup command.
 
 **Project skills (`<project>/.kiro/skills`) — a different source from the one above.**
 `$KIROCREW_PROJECT_DIR/skills/` is a *sync* source: its contents are copied into
@@ -2974,15 +3597,17 @@ requests, so ordinary requests reach the recipe without placing the whole body i
 every prompt. The base prompt points long-lived pull-request readiness requests to
 this skill and prefers the structured path whenever typed provider facts fully
 determine the objective.
-For a public GitHub pull request with the `review_ready` objective it gives the
-agent one exact bounded `monitor_watch` call and makes retained inspection state
-authoritative; its acknowledgement remains pending until the current turn ends,
-so agent inspection happens only at the start of a later user/wake turn. It also
-explains that reported-token enforcement may be incomplete while runtime and
-completed-turn limits remain hard fallbacks. It does not reproduce provider
-polling policy in the prompt. Its legacy `monitor_start` recipe is limited to
-unsupported targets and requires a positive cadence, cycle cap, and runtime
-bound while naming the full-turn/token cost and ordinary approval policy.
+For a supported GitHub, GitLab, Azure DevOps, or Bitbucket Cloud pull request
+with the `review_ready` objective it maps the canonical URL to one exact bounded
+`monitor_watch` call and makes retained inspection state authoritative; its
+acknowledgement remains pending until the current turn ends, so agent inspection
+happens only at the start of a later user/wake turn. It also explains that
+reported-token enforcement may be incomplete while runtime and completed-turn
+limits remain hard fallbacks. It does not reproduce provider polling policy in
+the prompt. Its legacy `monitor_start` recipe is limited to unsupported targets
+and requires a positive cadence, cycle cap, and runtime bound while naming the
+full-turn/token cost and ordinary approval policy. A supported provider's setup
+or authentication refusal never falls back to the costly legacy loop.
 
 **Loading:**
 1. **Always-on**: skills with `always: true` have full content injected every new session
@@ -3334,17 +3959,20 @@ this change, which could splice a folded value; the trade is a capability for a 
 form is still written, as a block literal, because there the author's intent is
 unambiguous.
 
-**The writer is bound by the reader's dialect, not by YAML.** `SKILL_LOADER` strips
-quote characters and resolves bare `|` / `>` block scalars, and does nothing else --
-no unescaping, no explicit indentation indicators. So a managed value is only ever
+**The writer is bound by the reader's dialect, not by YAML.** `SKILL_LOADER` removes
+one matched level of wrapping quotes (collapsing a single-quoted scalar's `''`) and
+resolves bare `|` / `>` block scalars, and does nothing else -- no backslash
+unescaping, no explicit indentation indicators. So a managed value is only ever
 emitted in a form that dialect decodes: a plain or quoted scalar with no backslash
 escape, or a bare block scalar. A value whose OWN TEXT begins or ends with a quote
-character also goes to a block scalar: the reader unquotes with `value.strip("\"'")`,
-which cannot tell a wrapping quote from one belonging to the text, so
-`description: Runs "build"` would read back as `Runs "build`. That rule tests the value,
-not the rendered line -- a correctly wrapper-quoted scalar begins and ends with a quote
-by construction, and routing those to a block scalar costs a value its leading
-whitespace for nothing. A value whose first line begins with whitespace would
+character also goes to a block scalar. The reader would survive most of those
+inline -- it removes exactly the one wrapping level the YAML writer would add -- but
+the block literal is the one representation with no quoting subtleties on either
+side, so the route is kept as a guarantee rather than a necessity. That rule tests
+the value, not the rendered line -- a correctly wrapper-quoted scalar begins and
+ends with a quote by construction, and routing those to a block scalar costs a
+value its leading whitespace for nothing. A value whose first line begins with
+whitespace would
 force YAML to emit `|2-`, which the reader would take as the literal value, so the
 leading whitespace is dropped instead -- the same bounded loss the previous
 line-based assembler had, preferred over losing the whole value.
@@ -4092,3 +4720,14 @@ offers **Keep editing** and **Discard changes**; keeping the draft leaves the
 original member and document mounted. Old initialization-error metadata is
 displayed as historical diagnostic text and does not suppress retry of a valid
 V1 conversation.
+
+### Private workflow execution
+
+Dynamic workflows bind their run and worker sessions through the existing
+protected session registry. The workflow identity is immutable across authoring,
+worker reuse, restart and subtree replay. Each private prompt is built after
+`inherit_session_memory` and store preparation; a provider template selects a
+role, never another store. Private run payloads remain under the hidden memory
+root. Worker MCP calls keep their real process/session proof and ordinary
+ownership checks. See [workflows](workflows.md) for the execution and access
+contract. Invalid or retired memory refuses execution without Global V1 fallback.

@@ -20,6 +20,7 @@ if TYPE_CHECKING:
         check_memory_available,
         create_agent_folder,
         logger,
+        platform_compat,
         redact_credentials,
         redact_exfiltration_urls,
         sel,
@@ -59,6 +60,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         _agent_prevalidated: bool = False,
         _from_queue: bool = False,
         _preassigned_id: str = "",
+        _memory_mode: str | None = None,
     ) -> SubagentInfo | None:
         """Spawn a subagent for *task*.
 
@@ -167,6 +169,51 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         # --- Redact task once for all SubagentInfo storage (raw task kept for kiro-cli prompt) ---
         _redacted_task = redact_credentials(redact_exfiltration_urls(task)[0])[0]
 
+        # Synchronous and yield-free with registration below: a spawn is either
+        # visible to the updater's busy count before the pause, or rejected after
+        # SessionManager closes admission. MagicMock-based embedders only block
+        # when they expose the literal boolean True.
+        if getattr(self._manager._sessions, "admission_closed", False) is True:
+            return self._manager._announce_rejection(
+                SubagentInfo(
+                    id=agent_id,
+                    task=_redacted_task,
+                    agent=agent,
+                    parent_session_key=parent_session_key,
+                    done=True,
+                    error="spawn refused: gateway admission is closed",
+                    batch_id=batch_id,
+                    batch_total=max(0, int(batch_total)),
+                )
+            )
+
+        # Freeze before queueing or awaiting approval; a replacement parent must
+        # not change the mode of work already admitted under its predecessor.
+        try:
+            if _memory_mode is None:
+                resolver = self._manager._memory_mode_for_session
+                _memory_mode = (
+                    resolver(parent_session_key) if resolver is not None else "persistent"
+                )
+            if not isinstance(_memory_mode, str) or _memory_mode not in {
+                "persistent",
+                "incognito",
+                "temporary",
+            }:
+                raise ValueError("unknown memory mode")
+        except Exception:
+            return self._manager._announce_rejection(
+                SubagentInfo(
+                    id=agent_id,
+                    task=_redacted_task,
+                    parent_session_key=parent_session_key,
+                    done=True,
+                    error="memory_unavailable: the parent's memory mode could not be established",
+                    batch_id=batch_id,
+                    batch_total=max(0, int(batch_total)),
+                )
+            )
+
         # Validate before queueing/starting. An explicit private identity may
         # never degrade to V1 after deletion, a config error, or a restart.
         try:
@@ -224,6 +271,39 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                 batch_total=max(0, int(batch_total)),
             )
             return self._manager._announce_rejection(info)
+        if avail_gb < 0 and platform_compat.IS_LINUX:
+            # A negative reading means the guard did not run: /proc/meminfo is
+            # unreadable on the one platform where it must exist. Proceeding
+            # is the stated fail-open contract for an unmeasurable host, but
+            # on Linux it must be observable rather than indistinguishable
+            # from a healthy check. macOS/Windows structurally lack
+            # /proc/meminfo, so emitting there would fire on every spawn and
+            # drown the signal.
+            logger.warning(
+                "Subagent memory guard could not run (min %.1f GB); proceeding unchecked",
+                min_mem,
+            )
+            # Context-aware pass so a host with a companion loaded is not
+            # audited with the weaker OSS baseline (the census gate in
+            # test_security_posture.py pins the baseline site count). Imported
+            # here because this function runs rebound on the subagent module's
+            # namespace, where a module-level import in this file is inert
+            # (see _component.bind_component_globals). The slice comes AFTER
+            # redaction: slicing first could split a companion-only credential
+            # at the boundary and persist an unmatched fragment.
+            from kiro_crew.platform.context import redact_log_via_context
+
+            task_note = redact_log_via_context(_redacted_task)[:120]
+            sel().log_tool_invocation(
+                session_key=parent_session_key or "",
+                source="subagent",
+                tool_name="spawn_run",
+                outcome="memory_check_unavailable",
+                metadata={
+                    "min_gb": min_mem,
+                    "task": task_note,
+                },
+            )
 
         # --- Admission gate: refuse NEW spawns while host memory posture is
         # critical. Complements the absolute spawn_min_memory_gb floor above
@@ -396,6 +476,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                     # the concurrency gate runs against the GLOBAL memory instead
                     # of the crew it was handed to.
                     "memory_store": memory_store,
+                    "_memory_mode": _memory_mode,
                     "_agent_prevalidated": _agent_prevalidated,
                     "_preassigned_id": agent_id,
                 }
@@ -427,6 +508,8 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                 agent=agent,
                 app=app,
                 queued=True,
+                parent_session_key=parent_session_key,
+                memory_mode=_memory_mode,
                 batch_id=batch_id,
                 batch_total=max(0, int(batch_total)),
                 include_memory=include_memory,
@@ -487,8 +570,10 @@ class SpawnAdmissionCoordinator(ManagerComponent):
             include_lessons=include_lessons,
             include_project=include_project,
             memory_store=memory_store or "",
+            memory_mode=_memory_mode,
         )
         info._raw_task = task  # unredacted prompt for kiro-cli execution
+        info._memory_mode_ready = not bool(conversation_key)
         self._manager._agents[agent_id] = info
         self._manager._running_count += 1
         self._manager._last_spawn_ts = time.monotonic()  # stagger gate: one start per interval
@@ -905,14 +990,14 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                 max_turns=info.max_turns,
                 context_groups=_context_groups_field(info),
                 memory_store=info.memory_store,
+                memory_mode=info.memory_mode,
             )
         except Exception:
             logger.warning("Failed to create agent folder for %s", info.id, exc_info=True)
-            if info.memory_store:
-                # The run task may already be registered. Its normal terminal
-                # path settles the failure before allocating a provider.
-                info.error = "memory_unavailable: could not persist this member's run binding"
-                return
+            # The run task may already be registered. Its normal terminal path
+            # settles the failure before allocating a provider, for every store.
+            info.error = "memory_unavailable: could not persist this run's memory binding"
+            return
 
         Stats().inc_subagent_spawned()
         # Beside that stat, and for the same reason: this is the confirmed-start

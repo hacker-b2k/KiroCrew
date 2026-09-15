@@ -47,6 +47,7 @@ from kiro_crew.atomic_write import refuse_linked_parent
 from kiro_crew.config.paths import config_dir, kiro_agents_dir
 from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
 from kiro_crew.identity_stores import AUTH_SQLITE_DB, AUTH_SQLITE_SIDECAR_SUFFIXES
+from kiro_crew.memory_stores import EXECUTION_LOGS_DIR_NAME, MEMORY_STORES_DIR_NAME
 from kiro_crew.pinned_fs import fd_real_path
 from kiro_crew.platform import current_context
 
@@ -65,6 +66,20 @@ logger = logging.getLogger(__name__)
 # Launcher scripts and seatbelt profiles are read exactly once at child exec.
 # Any file older than this threshold is garbage regardless of PID liveness.
 _LAUNCHER_MAX_AGE_SECONDS = 3600
+
+#: Run-directory artifact families the sweep reclaims, by filename prefix ->
+#: accepted suffixes. Every family tags the writing process's PID right after the
+#: prefix. ``kirocrew_sandbox_``: per-spawn launchers and Seatbelt profiles,
+#: consumed once at exec. ``kirocrew_pi_gate_``: the pi tool-gate launcher and
+#: the sealed extension copy (``acp/client.py``), written once per gateway
+#: process and reused by its later spawns.
+_SANDBOX_ARTIFACT_PREFIX = "kirocrew_sandbox_"
+_RUN_DIR_ARTIFACTS: dict[str, tuple[str, ...]] = {
+    _SANDBOX_ARTIFACT_PREFIX: (".sb", ".py"),
+    # ``.tmp`` is the mkstemp stage both pi artifacts are written under before
+    # the rename; a crash between the two leaves it behind under the same PID.
+    "kirocrew_pi_gate_": (".sh", ".cmd", ".ts", ".tmp"),
+}
 
 # Bind-mount SOURCES staged by the namespace launcher (empty dirs/files bound
 # over credential paths, plus the SSH shadow dir). The kernel pins a source for
@@ -2926,6 +2941,9 @@ _AGENT_DENIED_ENV_KEYS: list[str] = [
     "FEISHU_APP_SECRET",
     "JIRA_API_TOKEN",
     "JIRA_TOKEN_",
+    "AZURE_DEVOPS_EXT_PAT",
+    "BITBUCKET_EMAIL",
+    "BITBUCKET_API_TOKEN",
     "KIROCREW_OWNER_ID",
     # The central-governance fetch configuration — see
     # ``platform/policy_distribution.py``. The URL is listed as well as the header,
@@ -4330,6 +4348,22 @@ def _validate_private_mcp_gateway_socket(
             )
 
 
+def _private_memory_scan_failure(
+    operation: Literal["root_iterdir", "entry_stat", "entry_iterdir"],
+    tree: Literal["root_tmp", "sessions", "snapshots", "memory"],
+    exc: OSError,
+) -> RuntimeError:
+    """Describe a failed scan without copying exception text or filesystem names."""
+    fields = [f"operation={operation}", f"tree={tree}"]
+    for name in ("errno", "winerror"):
+        value = getattr(exc, name, None)
+        if type(value) is int and 0 <= value <= 0xFFFFFFFF:
+            fields.append(f"{name}={value}")
+    return RuntimeError(
+        "memory_unavailable: cannot verify protected memory hardlinks (" + " ".join(fields) + ")"
+    )
+
+
 def _validate_private_memory_hardlinks(layout: _PrivateMemoryLayout | None = None) -> None:
     """A path mask cannot hide another name for the same protected inode."""
     remaining = 100_000
@@ -4352,23 +4386,36 @@ def _validate_private_memory_hardlinks(layout: _PrivateMemoryLayout | None = Non
                     "create or correct it, then start the private member again"
                 )
             continue
-        for entry in root.iterdir():
-            name = entry.name
-            if (
-                name in ("memory", "backups")
-                or name.startswith(("memory.", "memory_", "lessons.", ".memory", ".lessons"))
-                or name.endswith(".tmp")
-                or (root_name in layout.homes and name in ("snapshots", "sessions"))
-            ):
-                pending.append(entry)
+        try:
+            for entry in root.iterdir():
+                name = entry.name
+                if (
+                    name in ("memory", "backups")
+                    or name.startswith(("memory.", "memory_", "lessons.", ".memory", ".lessons"))
+                    or name.endswith(".tmp")
+                    or (root_name in layout.homes and name in ("snapshots", "sessions"))
+                ):
+                    tree: Literal["root_tmp", "sessions", "snapshots", "memory"] = "memory"
+                    if name == "sessions":
+                        tree = "sessions"
+                    elif name == "snapshots":
+                        tree = "snapshots"
+                    elif name.endswith(".tmp"):
+                        tree = "root_tmp"
+                    pending.append((entry, tree))
+        except OSError as exc:
+            raise _private_memory_scan_failure("root_iterdir", "memory", exc) from exc
     while pending:
-        path = pending.pop()
+        path, tree = pending.pop()
         remaining -= 1
         if remaining < 0:
             raise RuntimeError(
                 "memory_unavailable: private memory hardlink verification exceeded its file limit"
             )
-        info = path.stat()
+        try:
+            info = path.stat()
+        except OSError as exc:
+            raise _private_memory_scan_failure("entry_stat", tree, exc) from exc
         inode = (info.st_dev, info.st_ino)
         if inode in visited:
             continue
@@ -4379,7 +4426,10 @@ def _validate_private_memory_hardlinks(layout: _PrivateMemoryLayout | None = Non
                 "remove the extra link before starting this private member"
             )
         if stat.S_ISDIR(info.st_mode):
-            pending.extend(path.iterdir())
+            try:
+                pending.extend((entry, tree) for entry in path.iterdir())
+            except OSError as exc:
+                raise _private_memory_scan_failure("entry_iterdir", tree, exc) from exc
 
 
 def _prepare_private_log_dir(layout: _PrivateMemoryLayout | None = None) -> str:
@@ -4388,7 +4438,7 @@ def _prepare_private_log_dir(layout: _PrivateMemoryLayout | None = None) -> str:
     except OSError as exc:
         raise RuntimeError("memory_unavailable: cannot verify protected memory hardlinks") from exc
     home = config_dir().resolve()
-    root = home / "memory_stores" / ".execution-logs"
+    root = home / MEMORY_STORES_DIR_NAME / EXECUTION_LOGS_DIR_NAME
     if root.resolve() != root:
         raise RuntimeError("Private execution log directory is redirected")
     platform_compat.make_owner_only_dir(root)
@@ -4559,7 +4609,7 @@ def _private_memory_seatbelt_rules(
             rules.append(f"(deny network-outbound (remote unix-socket {predicate}))")
         # Task text in a diagnostic belongs only to its execution. The path
         # hint does not grant access; these OS predicates are the authority.
-        log_root = json.dumps(home + "/memory_stores/.execution-logs")
+        log_root = json.dumps(f"{home}/{MEMORY_STORES_DIR_NAME}/{EXECUTION_LOGS_DIR_NAME}")
         exception = f" (require-not (subpath {json.dumps(log_directory)}))" if log_directory else ""
         for operation in ("file-read*", "file-write*", "file-link"):
             rules.append(f"(deny {operation} (require-all (subpath {log_root}){exception}))")
@@ -6551,21 +6601,22 @@ def cleanup_stale_sandbox_profiles(*, data_home: Path, legacy_dir: str | None = 
     # ── Sweep <config_dir>/run/ (PID + age) ──
     if os.path.isdir(run_dir):
         for entry in os.listdir(run_dir):
-            if not entry.startswith("kirocrew_sandbox_"):
+            prefix = next((p for p in _RUN_DIR_ARTIFACTS if entry.startswith(p)), None)
+            if prefix is None:
                 continue
-            if entry.endswith(".sb"):
-                suffix = ".sb"
-            elif entry.endswith(".py"):
-                suffix = ".py"
-            else:
+            suffix = next((x for x in _RUN_DIR_ARTIFACTS[prefix] if entry.endswith(x)), None)
+            if suffix is None:
                 continue
             filepath = os.path.join(run_dir, entry)
-            # Age check first — handles the spawner-PID design flaw
+            # Age check first — handles the spawner-PID design flaw. Not for the
+            # pi gate artifacts: those are written once per gateway process and
+            # REUSED by every later spawn of that process, so their age says
+            # nothing, and the PID in their name is the owner's own.
             try:
                 mtime = os.stat(filepath).st_mtime
             except OSError:
                 continue
-            if (now - mtime) > _LAUNCHER_MAX_AGE_SECONDS:
+            if prefix == _SANDBOX_ARTIFACT_PREFIX and (now - mtime) > _LAUNCHER_MAX_AGE_SECONDS:
                 try:
                     os.remove(filepath)
                     removed += 1
@@ -6573,7 +6624,7 @@ def cleanup_stale_sandbox_profiles(*, data_home: Path, legacy_dir: str | None = 
                     pass
                 continue
             # Fresh file — fall back to PID liveness check
-            middle = entry[len("kirocrew_sandbox_") : -len(suffix)]
+            middle = entry[len(prefix) : -len(suffix)]
             pid = _parse_pid_segment(middle.split("_", 1)[0])
             if pid is None:
                 continue

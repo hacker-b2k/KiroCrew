@@ -61,7 +61,7 @@ was added 2026-08-27. The `rfc-crew-agent-sdk-boundary` row was added 2026-08-28
 | [rfc-app-sandbox-isolation.md](rfc-app-sandbox-isolation.md) | `draft` | Nothing. Apps still run in-process with full privileges (see `docs/architecture/app-platform-trust-model.md`); no isolation code exists |
 | [rfc-issue-radar-dispatch.md](rfc-issue-radar-dispatch.md) | `draft` | Nothing. Issue Radar has Investigate and Review; no verb produces work, and issues carry no link to the change that resolves them |
 | [rfc-perpetual-agent.md](rfc-perpetual-agent.md) | `draft` | Nothing. Verified at `9ac3716a`: no schedule kind self-reschedules, and `binding_key_for` has no `cron:` branch |
-| [rfc-token-efficient-monitors.md](rfc-token-efficient-monitors.md) | `draft` | Nothing. Probe-first replacement for token-heavy babysit loops; implementation begins in a stacked series after this RFC |
+| [rfc-token-efficient-monitors.md](rfc-token-efficient-monitors.md) | `in-progress` | Nothing on main. The complete active eight-PR stack ([#5180](https://github.com/kirodotdev/KiroCrew/pull/5180) through [#5305](https://github.com/kirodotdev/KiroCrew/pull/5305)) implements the durable model, completed-turn accounting, provider probes, session-bound control tools, dashboard controls, bounded babysit routing, and GitHub/GitLab/Azure DevOps/Bitbucket review-readiness adapters. Re-audited at `904da5537` |
 | [rfc-consolidated-monitor.md](rfc-consolidated-monitor.md) | `draft` | Nothing of the merge. Verified at `ef38f4cbe`: `probes/__init__.py` `build` maps exactly one kind (`gh-pr`); `monitoring/github_pull_request.py` still reduces a pull request to one fingerprint with no named-entry list, and `decide_monitor` compares that single `fingerprint` against `last_wake_fingerprint`; no coalescing pre-stage reaches the controller, the window exists only in `irq.py`; and `api_autonudge_get` no longer nulls a structured monitor out -- both legacy read routes report an armed monitor's presence, cadence, liveness and state while withholding what it watches, so the goal popover receives the record and only the rendering is outstanding |
 | [rfc-tailnet-dashboard-access.md](rfc-tailnet-dashboard-access.md) | `partial` | Phase 1 landed ([#1761](https://github.com/kirodotdev/KiroCrew/pull/1761), `f8afcff7`) — reports the pin's real scope, does not fix it. Phases 2–4 unstarted; the pin repair is tracked as [#1762](https://github.com/kirodotdev/KiroCrew/issues/1762) |
 | [rfc-pluggable-model-providers.md](rfc-pluggable-model-providers.md) | `draft` | Nothing, by design. `agent.provider` is still fixed to `acp` and [oss-fork-boundaries](../system-specs/oss-fork-boundaries.md) lists "Other providers" under *Never re-add*. This document **recommends** supporting provider choice and asks the maintainers to amend that rule; it proposes no design, and an exploratory implementation is shelved pending the answer ([#1693](https://github.com/kirodotdev/KiroCrew/issues/1693)) |
@@ -132,6 +132,18 @@ silently. If those two fields are far behind main, distrust the status.
 | `partial` | Some phases are on main; the rest are open. The prose status line names which. |
 | `implemented` | Every phase is verifiably on main. |
 | `superseded` | Replaced. `superseded-by` names the replacement. |
+
+The First Principles review lane reads this field, from the **base** commit,
+as the record of a product-shape decision: a change to a default, to what a
+first-class loop, monitor, agent, skill or command does by default, or a
+removal or replacement of a user-facing capability, must trace to a document
+here whose status is one of `accepted`, `in-progress`, `partial` or `implemented`
+(a closed set: `draft`, `superseded` and any undefined value are not a decision,
+and a `partial` plan main deliberately diverged from does not cover the diverged
+shape) -- or to a maintainer's
+`/ai-review override first-principles <head>` on the PR. A PR that flips this
+field, or ships the RFC beside the change, has proposed a decision, not
+recorded one; see `docs/ci/ci-and-reviews.md`.
 
 `partial` is the most common status and the most dangerous one to read
 carelessly — several documents here describe a plan that main only partly

@@ -115,6 +115,10 @@ class TestMemoryStoreOverrideProperty:
 
 
 class TestContextBuilder:
+    # Every test here asserts the SHAPE of a built turn, so the host's own free
+    # memory must not be an input: see the fixture for the advisory it pins off.
+    pytestmark = pytest.mark.usefixtures("ample_host_resources")
+
     def test_empty_context_has_critical_rules(self, tmp_path):
         builder = ContextBuilder(
             memory=MemoryStore(workspace=tmp_path / "ws"),
@@ -266,6 +270,11 @@ class TestContextBuilder:
         assert "END YOUR TURN" in dash
         assert "does not block" in dash
         assert "[OPTIONS:]" in dash
+        # A card is an interruption, so the nudge must also carry the restraint
+        # contract: silence is the default and only a human-only decision that
+        # actually blocks the work earns the interruption.
+        assert "DEFAULT TO SILENCE" in dash
+        assert "human alone can make" in dash
         assert "suggest_followup" in dash, "dashboard session must get the follow-up nudge"
 
         for sk in (None, "cron:job-1", "subagent:abc", "slack:C123"):

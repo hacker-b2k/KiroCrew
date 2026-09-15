@@ -356,6 +356,12 @@ const applySlots = (state: DashboardState, next: ChatSlot[]): void => {
     // Reusing a draft row inside a freshly assigned array is fine: Immer
     // finalizes drafts found in the assigned value within the same scope, so an
     // untouched row resolves back to its base object and keeps its identity.
+    // CONTRACT (leaned on cross-slice): a row keeps its object identity iff
+    // it is jsonEqual to the incoming one; any changed or replaced row gets a
+    // fresh object. chatSlice's switchSlot 404 eviction captures a row at
+    // dispatch and treats a changed identity as "an authoritative frame
+    // altered this row mid-flight" to disarm itself — see the catch in
+    // switchSlot and switchSlotCallsiteClassification/rejection tests.
     const reused = existing !== undefined && jsonEqual(existing, incoming) ? existing : incoming
     // Positional compare, so a pure reorder counts as changed even though every
     // row is individually reusable.
@@ -795,6 +801,26 @@ export const { sseStatus, sseYolo, setYoloDuration, sseConnected, sseDisconnecte
  */
 export function slotSurfaceKey(slot: { mode?: string; surface?: string }): string {
   return slot.surface ?? slot.mode ?? ''
+}
+
+/**
+ * True when a slot's turns run on a connected crew rather than THIS machine —
+ * the single spelling of "crew-bound". Two client surfaces must agree with each
+ * other and with the server on it: `selectContinuable` (which must not OFFER
+ * Continue on a bound slot) and ChatPage's regenerate / edit-resend gates
+ * (which must not offer those either). Mirrors `remote_bound_refusal` in
+ * `src/kiro_crew/dashboard/remote_relay.py`, which REFUSES the same actions with
+ * 409 `remote_action_unsupported`.
+ *
+ * Keyed on `executor` (the binding INTENT), never `instance_id` or `is_remote`:
+ * the server refuses a half-open binding (marker set, triple incomplete) too, so
+ * an unbound `executor` must read as bound here exactly as it does there. An
+ * absent slot is not bound — an older gateway ships `executor` on every slot, so
+ * only a genuinely missing lookup lands here, and a missing slot has no local
+ * action to gate.
+ */
+export function slotIsRemoteBound(slot: { executor?: string } | null | undefined): boolean {
+  return slot?.executor === 'remote'
 }
 
 /**

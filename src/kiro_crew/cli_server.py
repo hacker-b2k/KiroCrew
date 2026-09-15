@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import codecs
 import http.client
+import io
 import json
 import logging
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -15,6 +18,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from pathlib import Path
 from typing import NoReturn
 
@@ -382,6 +386,26 @@ def _report_authenticated_shutdown(port: int) -> bool:
     return True
 
 
+#: Longest process basename ``_stop`` echoes to the operator's terminal.
+_MAX_ECHOED_NAME_LEN = 64
+
+
+def _terminal_safe_name(name: str) -> str:
+    """Reduce an untrusted process name to characters safe to print.
+
+    The name comes from another process's own ``argv[0]``: any local process
+    can bind the gateway port and choose it, so it is attacker-producible text
+    headed for the operator's terminal. Every non-printable code point is dropped
+    -- C0/C1 controls (so ESC and BEL, which start and end ANSI SGR and OSC
+    sequences), and Unicode format characters -- and the result is capped, so a
+    crafted name can neither drive the terminal nor flood the line.
+    ``str.isprintable`` is the filter: it keeps letters, digits, punctuation and
+    ordinary spaces of every script and rejects the whole control and format
+    classes without enumerating escape grammars.
+    """
+    return "".join(ch for ch in name if ch.isprintable())[:_MAX_ECHOED_NAME_LEN]
+
+
 def _stop(cli_port: int | None = None) -> None:
     """Stop a running KiroCrew gateway.
 
@@ -493,16 +517,45 @@ def _stop(cli_port: int | None = None) -> None:
     # Only kill processes that are actually KiroCrew gateways.
     # Note: TOCTOU race exists between this check and the kill — the PID could be
     # recycled. Acceptable risk for an interactive CLI tool with low blast radius.
+    unrecognized = [p for p in pids if not _is_kirocrew_process(p)]
     pids = [p for p in pids if _is_kirocrew_process(p)]
     if not pids:
+        # Something holds the port, but nothing on it classifies as a Kiro Crew
+        # gateway. Reporting "no gateway running" here is misleading — the port
+        # is occupied — and it sends ``kirocrew restart`` on to spawn a
+        # replacement the KIROCREW_HOME lock then refuses. Name the pids and, when
+        # a cmdline is cheap to read, its basename, so the operator can see what
+        # actually holds the port (an unregistered wrapper module is the common
+        # case). Exit 1 with a distinct audit reason.
+        basenames: list[str] = []
+        for p in unrecognized:
+            cmdline = platform_compat.process_command_line(p)
+            if not cmdline:
+                continue
+            # Tokenize the way _args_look_like_kirocrew does: a quoted executable
+            # path ("C:\Program Files\...\python.exe") is one token, so its
+            # basename is reported rather than the fragment before the first space.
+            try:
+                tokens = shlex.split(cmdline, posix=not platform_compat.IS_WINDOWS)
+            except ValueError:
+                tokens = cmdline.split()
+            if tokens:
+                safe = _terminal_safe_name(_basename_stem(tokens[0]))
+                if safe:
+                    basenames.append(safe)
+        pid_list = ", ".join(str(p) for p in unrecognized)
+        detail = f" ({', '.join(basenames)})" if basenames else ""
         sel().log_api_access(
             caller="cli",
             operation="gateway_stop",
             outcome="no_target",
             source="cli",
-            resources=f"port={port} reason=no_kirocrew_process",
+            resources=f"port={port} reason=unrecognized_listener pids={unrecognized}",
         )
-        print(f"No Kiro Crew gateway currently running on port {port}.")
+        print(
+            f"Port {port} is held by pid {pid_list}{detail}, not recognised as a "
+            f"Kiro Crew gateway. Not stopping it."
+        )
         sys.exit(1)
 
     sent: set[int] = set()
@@ -2483,8 +2536,60 @@ def _logs_cmd(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+    if plat == Platform.UNSUPPORTED:
+        try:
+            _tail_log_file(fallback, lines, follow)
+        except OSError as exc:
+            print(
+                f"Unable to read gateway log: {exc}. "
+                "Check file access or retry `kirocrew logs` if the log is rotating.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return
     cmd = ["tail", "-n", str(lines)]
     if follow:
         cmd.append("-f")
     cmd.append(str(fallback))
     os.execvp("tail", cmd)
+
+
+def _tail_log_file(path: Path, lines: int, follow: bool) -> None:
+    """Follow the log by name, allowing the writer to rotate it during reads."""
+    identity: tuple[int, int] | None = None
+    offset = 0
+    first = True
+    decoder = io.IncrementalNewlineDecoder(
+        codecs.getincrementaldecoder("utf-8")(errors="replace"), translate=True
+    )
+    try:
+        while True:
+            try:
+                fd = platform_compat.open_log_file_for_tail(path)
+            except FileNotFoundError:
+                if not follow:
+                    raise
+            else:
+                with os.fdopen(fd, "rb") as log:
+                    info = os.fstat(log.fileno())
+                    current_identity = (info.st_dev, info.st_ino)
+                    if current_identity != identity or info.st_size < offset:
+                        offset = 0
+                        decoder.reset()
+                    if first:
+                        data = b"".join(deque(log, maxlen=abs(lines)))
+                        first = False
+                    else:
+                        log.seek(offset)
+                        data = log.read()
+                    offset = log.tell()
+                    identity = current_identity
+                # Close before output or sleep can block. Rotation after open
+                # is picked up by name on the next poll, without a retry loop.
+                sys.stdout.write(decoder.decode(data, final=not follow))
+                sys.stdout.flush()
+            if not follow:
+                return
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        return

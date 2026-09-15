@@ -26,12 +26,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 from kiro_crew import autonudge, mcp_core, platform_compat, session_directive
+from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.mcp_shared import ToolCancelled, is_tool_cancelled
 from kiro_crew.mcp_tools._limits import (
     _MONITOR_DEFAULT_MAX_CYCLES,
     _MONITOR_DEFAULT_MAX_RUNTIME_SECS,
 )
-from kiro_crew.monitoring.github_pull_request import parse_github_pull_request_target
 from kiro_crew.monitoring.models import (
     DEFAULT_MONITOR_AGENT_TURNS,
     DEFAULT_MONITOR_CADENCE_SECS,
@@ -51,6 +51,7 @@ from kiro_crew.monitoring.registry import (
     publicly_armable_kinds,
     publicly_armable_objectives,
 )
+from kiro_crew.monitoring.targets import normalize_pull_request_target
 from kiro_crew.security import (
     redact_and_truncate,
     redact_credentials,
@@ -304,7 +305,7 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "monitor_watch",
             "description": (
-                "Watch a GitHub pull request with cheap provider probes. The owning session "
+                "Watch a supported pull request with cheap provider probes. The owning session "
                 "is woken only when a new revision needs action; unchanged, pending, retry, "
                 "and terminal probes use no agent turn. Available from dashboard, Slack, and "
                 "Discord sessions. One structured monitor per session."
@@ -313,7 +314,7 @@ def schemas() -> list[dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "kind": {"type": "string", "enum": sorted(publicly_armable_kinds())},
-                    "target": {"type": "string", "description": "Public GitHub PR URL"},
+                    "target": {"type": "string", "description": "Canonical provider PR URL"},
                     "objective": {"type": "string", "enum": sorted(publicly_armable_objectives())},
                     "interval_secs": {
                         "type": "integer",
@@ -352,16 +353,20 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "monitor_inspect",
             "description": (
-                "Inspect the structured monitor bound to your authenticated current session. "
-                "Takes no session key or monitor id."
+                "Inspect the monitor bound to your authenticated current session. "
+                "Reports a structured monitor's full record, or a legacy timer "
+                "loop's presence and cadence reading, whichever the session "
+                "holds. Takes no session key or monitor id."
             ),
             "inputSchema": {"type": "object", "properties": {}},
         },
         {
             "name": "monitor_stop",
             "description": (
-                "Durably stop the structured monitor on your current session while retaining "
-                "its terminal outcome for inspection."
+                "Durably stop the monitor on your current session. A structured "
+                "monitor is retained with its terminal outcome for inspection; a "
+                "legacy timer loop is stopped and leaves no record behind, so a "
+                "later monitor_inspect reports it as not armed."
             ),
             "inputSchema": {
                 "type": "object",
@@ -375,7 +380,7 @@ def schemas() -> list[dict[str, Any]]:
                 "including first-class self-session patrol by conductor agents. For "
                 "monitoring targets, this is also the legacy fallback for targets, "
                 "objectives, or required evidence unsupported by monitor_watch. "
-                "Use monitor_watch for public GitHub pull-request review readiness only when "
+                "Use monitor_watch for supported pull-request review readiness only when "
                 "the objective is fully determined by typed provider facts. Use the prompt "
                 "loop when comments or advisory review evidence must be interpreted. "
                 "Start a prompt loop on YOUR CURRENT session: every "
@@ -1293,12 +1298,11 @@ def _monitor_context_refusal(
     return f"Error: {message}"
 
 
-def _parsed_pull_request_target(raw: Any) -> tuple[str, str]:
+def _parsed_pull_request_target(kind: Any, raw: Any) -> tuple[str, str]:
     """Return ``(url, "")`` for a valid PR target, or ``("", "Error: …")``.
 
-    ONE guarded parse for BOTH callers (``monitor_watch`` and ``monitor_update``)
-    rather than a ``try`` at each site. `parse_github_pull_request_target` raises,
-    and a raise from a directive tool escapes this server's own return path: the
+    Guard normalization before emitting a new monitor. Target normalization
+    raises, and a raise from a directive tool escapes this server's own return path: the
     JSON-RPC layer turns it into the same ``"Error: …"`` text, but past the point
     that tags a decline as a refusal, so the consumer reads it as a LOST directive
     marker and fires the WARNING reserved for a transport regression. Guarding the
@@ -1306,7 +1310,14 @@ def _parsed_pull_request_target(raw: Any) -> tuple[str, str]:
     single seam makes the next caller correct by construction.
     """
     try:
-        return parse_github_pull_request_target(str(raw)).url, ""
+        return (
+            normalize_pull_request_target(
+                str(kind),
+                str(raw),
+                gitlab_hosts=KiroCrewConfig.load().dashboard.gitlab_hosts,
+            ),
+            "",
+        )
     except ValueError as exc:
         return "", f"Error: {exc}"
 
@@ -1327,7 +1338,7 @@ def monitor_watch(name: str, args: dict[str, Any]) -> str:
             "monitor_watch only works from within a dashboard, Slack, or "
             f"Discord session (current session_key={sk!r}).",
         )
-    target, target_error = _parsed_pull_request_target(args["target"])
+    target, target_error = _parsed_pull_request_target(args["kind"], args["target"])
     if target_error:
         return target_error
     payload = {
@@ -1354,7 +1365,14 @@ def monitor_watch(name: str, args: dict[str, Any]) -> str:
 
 
 def monitor_inspect(name: str, args: dict[str, Any]) -> str:
-    """Read only the monitor bound to a verified strict session identity."""
+    """Read the monitor bound to a verified strict session identity.
+
+    Reports whichever shape the session's loop holds: a structured monitor's
+    full record, or a legacy timer loop's presence and cadence reading. The
+    session-monitor endpoint returns the legacy reading under ``autonudge_loop``,
+    so a widened gate here lets a caller verify a timer loop is armed and firing
+    rather than being told inspection is unavailable for its session type.
+    """
     validate_tool_args(args, MONITOR_INSPECT_SCHEMA)
     sk, strict_err = mcp_core.require_strict_session_key(
         "Monitor inspection unavailable without an authenticated strict session binding. "
@@ -1362,7 +1380,10 @@ def monitor_inspect(name: str, args: dict[str, Any]) -> str:
     )
     if not sk:
         return _monitor_context_refusal("monitor_inspect", sk, strict_err)
-    if mcp_core._structured_monitor_binding_key(sk) is None:
+    # The GENERAL binding, so a legacy timer loop resolves here too (this also
+    # admits a Webex session, which hosts a legacy loop but no structured
+    # monitor). The endpoint distinguishes the shapes.
+    if mcp_core._autonudge_binding_key(sk) is None:
         return _monitor_context_refusal(
             "monitor_inspect",
             sk,
@@ -1454,7 +1475,7 @@ def _compact_monitor_inspection(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def monitor_stop(name: str, args: dict[str, Any]) -> str:
-    """Emit a durable structured-stop directive without caller identity."""
+    """Emit a durable stop directive for this session's monitor, without caller identity."""
     args = validate_tool_args(args, MONITOR_STOP_SCHEMA)
     sk, strict_err = mcp_core.require_strict_session_key(
         "monitor_stop requires an authenticated strict session binding. "
@@ -1462,17 +1483,22 @@ def monitor_stop(name: str, args: dict[str, Any]) -> str:
     )
     if not sk:
         return _monitor_context_refusal("monitor_stop", sk, strict_err)
-    if mcp_core._structured_monitor_binding_key(sk) is None:
+    # The GENERAL binding, so a legacy timer loop resolves here too (and a Webex
+    # session, which hosts a legacy loop but no structured monitor). A stop that
+    # answered only for a structured monitor is a silent no-op on the loop shape
+    # most sessions run: the caller believes the loop ended while it keeps
+    # firing. The applier routes by the resolved loop's shape.
+    if mcp_core._autonudge_binding_key(sk) is None:
         return _monitor_context_refusal(
             "monitor_stop",
             sk,
-            "monitor_stop only works from within a dashboard, Slack, or "
-            f"Discord session (current session_key={sk!r}).",
+            "monitor_stop only works from within a dashboard, Slack, Discord, "
+            f"or Webex session (current session_key={sk!r}).",
         )
     return _emit_directive(
         "monitor_stop",
         {"reason": str(args.get("reason") or "").strip()},
-        "Structured monitor stop requested for this session.",
+        "Monitor stop requested for this session.",
     )
 
 
@@ -1510,9 +1536,8 @@ def monitor_update(name: str, args: dict[str, Any]) -> str:
     if args.get("max_runtime_secs") is not None:
         patch["max_runtime_secs"] = int(args["max_runtime_secs"])
     if args.get("target") is not None:
-        patch["target"], target_error = _parsed_pull_request_target(args["target"])
-        if target_error:
-            return target_error
+        # The authoritative applier validates the target against the retained kind.
+        patch["target"] = str(args["target"])
     if args.get("objective") is not None:
         patch["objective"] = str(args["objective"])
     for field in ("max_agent_turns", "max_tokens", "max_provider_errors"):

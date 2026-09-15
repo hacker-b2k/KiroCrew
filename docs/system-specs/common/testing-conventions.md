@@ -58,7 +58,35 @@ mock_process.returncode = None
 client._process = mock_process
 ```
 
+### Liveness tests with fabricated PIDs
+
+A fabricated PID can identify a real process on the test host. Give a real
+`LivenessOracle` an explicit process backend or a fixture-owned proc tree rather
+than letting it select the host backend. Keep that source isolated across
+`fresh()` and exercise the real cross-tick state transitions. A collision case
+must still detect the fabricated child's exit without reading the host table.
+Windows pod handle-stop fixtures must also own the separate numeric `pid_exists`
+probe: after a simulated handle exits, a real host process with the same PID
+must not change the verdict. Cover both a gone PID and a recycled live PID;
+the latter must still refuse state deletion after exact-handle draining.
+
+Tests of executable ownership pin only the ancestors above their temporary tree;
+fixture files retain their real ownership and permission bits. Host kernel headers
+must be matched to their architecture before validating syscall numbers. Nested
+pytest processes clear inherited `PYTEST_ADDOPTS`, and Unix-socket fixtures use
+`short_tmp_base()` so a deep `TMPDIR` cannot exceed the socket path limit. A real
+cgroup enforcement test skips an unreachable user bus, not other scope failures.
+Duration-accounting tests use injected clocks and report durations for exact
+arithmetic; subprocess integration tests verify reporting and cleanup without a
+wall-clock ceiling tied to runner speed.
+
+Cancellation-during-persistence tests must wait for a worker-entered handshake
+before cancelling, not infer entry from a short sleep. Keep the worker's wait
+bounded, release it in `finally`, and await the cancelled task's write drain;
+assertions must still prove the lock stays held and the real write completes.
+
 ### Config overrides
+
 Use `monkeypatch` to override config paths:
 ```python
 def test_load_from_file(self, tmp_path, monkeypatch):
@@ -79,6 +107,11 @@ Use `tmp_path` fixture:
 def test_custom_work_dir(self, tmp_path):
     client = AcpClient(work_dir=tmp_path)
 ```
+
+Assert path containment against the fixture's resolved root, not a substring
+such as `.kiro/crew` that may also occur in `tmp_path`'s ancestors. Parameterize
+path-repair tests with a same-named ancestor directory so this stays independent
+of the runner's temporary directory.
 
 ### Links: use the conftest helpers, do not skip on Windows
 
@@ -647,6 +680,15 @@ which testpath asked for the workers.
   on `[` matched a *different* string for grouped vs ungrouped tests and for `-n0` vs
   `loadgroup` runs. Never add the `@group` suffix to an entry — it makes the line match
   in one invocation and silently miss in another.
+
+  **macOS uses the same list mechanism, not a second one.**
+  `test/macos-expected-failures.txt` is applied by the same rootdir
+  `_apply_tracked_gap_list` matcher, with the same plain-node-id spelling and the same
+  burn-down semantics: anything not on the list still fails the macOS shards. Prefer a
+  precise `skipif(sys.platform == "darwin", reason=...)` on the test when the reason is
+  a named capability difference; use the list when the gap is a real one to be fixed
+  later, with a `# TODO` reason line above the entry. `test/macos-collect-ignore.txt`
+  exists for the blunt case only — a file that cannot be *collected* on darwin.
 - Tests SHOULD be fast (< 1s each)
 - Async tests MUST use `@pytest.mark.asyncio` — and ONLY async tests. The mark on a
   plain `def` is accepted silently by pytest-asyncio strict mode and the test then
@@ -1215,7 +1257,14 @@ about the code. Each is a hermeticity gap, and each has one fix:
 
 ## Running the suite: the defaults, and how to narrow safely
 
-The checkpoint run is the whole suite with the configured defaults:
+The checkpoint run before a commit is the change-related set on both surfaces,
+with a bounded worker count -- the full suite is CI's job:
+
+```bash
+python3 scripts/local-gate.py
+```
+
+The whole suite with the configured defaults is a human's run, not a gate:
 
 ```bash
 python -m pytest
@@ -1229,6 +1278,31 @@ agent run, while CI asks for it explicitly. So you no longer need an override ju
 avoid coverage. (Coverage's cost is overwhelmingly TIME, not memory: re-measured
 across three slices it added +33% to +160% wall clock but only +1.6% to +8.1% peak
 worker RSS.)
+
+### Opt-in Windows CI progress records
+
+The Windows test job loads `scripts.ci_pytest_progress` explicitly with `-p` and
+`--ci-progress-dir`; importing the plugin without that option registers no recorder
+and creates no files. It leaves selection, scheduling, coverage and timeout limits
+unchanged. One open JSONL stream per worker records collection start/end and selected
+count, test start/end, and pytest's setup/call/teardown durations. File names include
+worker, PID and a fresh UUID, so nested runs and repeated in-process runs cannot
+replace one another. Each record is flushed, without per-event fsync or path probes.
+Source declarations are parsed once per selected module for structural names;
+parameter values and dynamic node names are never copied. A selected-collection
+ordinal distinguishes cases; unsupported declarations use `dynamic`. No captured
+output, exception text, locals or absolute paths are recorded.
+
+The controller emits a bounded `CI_PROGRESS` summary at most once per 30 seconds
+of incoming phase reports, with the last phase, last completed test and slowest
+phase since the previous summary. Worker-ready/collected and session-end markers
+are also logged. These are event-driven, not a heartbeat: a stuck collection or
+worker can leave no new summary, and the last summary need not name the test active
+at cancellation. JSONL preserves prior events on process termination, but a job
+limit can skip artifact upload and a machine loss can lose the files entirely.
+The Actions log then retains only the sampled summaries, not a complete trace.
+Diagnostic file I/O failures disable that stream without changing the test verdict.
+Linux child-process tests verify these mechanics, not native Windows performance.
 
 ### Running on a machine with little RAM
 
@@ -1433,7 +1507,7 @@ rest of the list, which is why a single-file run needs no `--override-ini` at al
 | Debugging a specific failure | `pytest --lf` with the override, or `-k "test_name" -n0` |
 | One file | `pytest test/test_foo.py -n0 -q` |
 | Small-RAM laptop | Run a subset. For a full run, let the budget clamp `-n auto` and expect it to be slow; do not raise it. |
-| Checkpoint before committing | `scripts/check_black_formatting.py && scripts/check_subprocess_encoding.py && isort && flake8 && mypy && python -m pytest` |
+| Checkpoint before committing | `scripts/check_black_formatting.py && scripts/check_subprocess_encoding.py && isort && flake8 && mypy && python3 scripts/local-gate.py` (related tests; the full suite is CI's) |
 
 ## Determinism: the six flake classes
 
@@ -1729,6 +1803,30 @@ The same applies to `Event.wait()`, `Queue.get()`, `Condition.wait()`, and a
 matters when the property is broken); make it generous and keep it well under
 `--timeout`, so the failure is a named assertion and not a dead worker.
 
+### The gateway harness runs on all three platforms
+
+`kiro_crew.testing.harness.spawn_feature_gateway` boots a real gateway subprocess
+on an isolated throwaway `KIROCREW_HOME`. Two of its internals are platform
+contracts rather than implementation taste, and both used to be POSIX-shaped:
+
+- The `KIROCREW_READY:` wait reads the child's stdout through ONE daemon reader
+  thread feeding a `queue.Queue`. It is not a selector, because
+  `selectors.DefaultSelector()` is select()-based on Windows and accepts sockets
+  only, so registering a subprocess pipe there raises. The queue's bounded `get`
+  keeps what the selector poll bought: the `KIROCREW_HARNESS_READY_TIMEOUT`
+  deadline (default 60s) is enforced even while the child is alive and silent,
+  and a child that exits during the wait fails IMMEDIATELY with its stderr tail
+  rather than waiting out the deadline.
+- Teardown routes through `platform_compat.kill_process_tree` on Windows and
+  `terminate_pgid` on POSIX. There is no `setsid` or `killpg` on Windows, and
+  `taskkill /F` gives the child no shutdown budget there.
+
+Because the harness spawns a real process per test, a module built on it runs
+with `-n0` and an explicit `--timeout` above the widest readiness window: under
+xdist a block would take the worker with it (flake class 6 above), and on Windows
+that aborts the run. `test/e2e/test_gateway_boot_matrix.py` is the reference
+shape; `docs/ci/e2e-gate.md` documents the job that runs it.
+
 ## Keeping the suite fast
 
 The suite is ~89.5k tests. At that count a per-test cost is multiplied by 89,500, so
@@ -1869,11 +1967,15 @@ git diff --stat "$f"                     # should show only what you had before
 
 ### Shard balance
 
-`ci.yml` splits the backend suite into 4 `pytest-split` groups. Splitting is balanced by
+`ci.yml` splits the backend suite into 4 `pytest-split` groups on Linux and Windows,
+and 3 on macOS. Splitting is balanced by
 recorded runtime **only when a `.test_durations` file is committed**; without one
 pytest-split falls back to an even split by test *count*. No such file is committed here:
 `test-durations.yml` would generate one weekly but has failed on a transient `git push`
-502 both times it ran, so it has never landed.
+502 both times it ran, so it has never landed. So every OS splits by count today, and
+there is no Linux-recorded duration file that could mis-balance the Windows or macOS
+shards. If one is ever committed, note that it is recorded on Linux: check the macOS
+shard spread afterwards rather than assuming it improved.
 
 **Measure a shard by running it, not by summing durations.** Each shard runs its own
 tests at `-n 4`, so per-test times from a `--store-durations` run include worker

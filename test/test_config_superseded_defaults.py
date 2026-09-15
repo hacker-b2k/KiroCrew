@@ -46,6 +46,10 @@ LOOP_STALL_ENTRY = next(
     e for e in SD.SUPERSEDED_DEFAULTS if e.dotted_key == "dashboard.loop_stall_exit_after_secs"
 )
 
+SESSION_CONTROL_ENTRY = next(
+    e for e in SD.SUPERSEDED_DEFAULTS if e.dotted_key == "agent.session_control"
+)
+
 
 @pytest.fixture(autouse=True)
 def _forget_process_warnings():
@@ -98,6 +102,27 @@ def test_stored_old_default_is_reported_as_drift():
 
 def test_stored_current_default_is_not_drift():
     assert superseded_default_drift({"mcp_gateway": {"forward_declared_env": True}}) == []
+
+
+def test_stored_session_control_false_is_reported_but_not_adopted(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    _point_home(tmp_path, monkeypatch)
+    _write_config(tmp_path, {"agent": {"session_control": False}})
+
+    assert superseded_default_drift(_on_disk(tmp_path)) == [SESSION_CONTROL_ENTRY]
+    cfg = KiroCrewConfig.load()
+    assert cfg.agent.session_control is False
+    assert _on_disk(tmp_path)["agent"]["session_control"] is False
+
+    issues: list[str] = []
+    SD.render_doctor_section(issues)
+    out = capsys.readouterr().out
+    assert "agent.session_control" in out
+    assert "kirocrew config defaults --adopt" in out
+    assert issues == []
 
 
 def test_absent_key_and_absent_section_are_not_drift():
@@ -673,6 +698,7 @@ def test_only_unpinned_broken_budgets_adopt_themselves():
         "stt.model",
         "mcp_gateway.forward_declared_env",
         "instances.warm_set_cap",
+        "agent.session_control",
     ):
         assert pinned not in adopting, f"{pinned}'s stored value is guaranteed elsewhere"
 
@@ -977,7 +1003,7 @@ def test_the_running_config_never_diverges_from_the_stored_one(tmp_path, monkeyp
     assert "subagent_timeout_secs" not in _on_disk(tmp_path).get("agent", {})
 
 
-def test_a_failed_write_keeps_the_value_and_does_not_re_adopt_later(tmp_path, monkeypatch):
+def test_a_failed_write_keeps_the_value_and_does_not_re_adopt_later(tmp_path, monkeypatch, caplog):
     """The chosen side of an unavoidable two-file window, pinned end to end.
 
     ``config.json`` and the sidecar have no shared transaction, so exactly one of two
@@ -999,11 +1025,13 @@ def test_a_failed_write_keeps_the_value_and_does_not_re_adopt_later(tmp_path, mo
         raise OSError("no space left on device")
 
     monkeypatch.setattr(L, "_write_migration_backup", _fail_backup)
-    failed = KiroCrewConfig.load()
+    with caplog.at_level(logging.WARNING, logger=L.__name__):
+        failed = KiroCrewConfig.load()
 
     # Nothing was destroyed, and memory did not run ahead of the file.
     assert _on_disk(tmp_path)["agent"]["subagent_timeout_secs"] == 1800
     assert failed.agent.subagent_timeout_secs == 1800
+    assert not any("adopted current default" in r.getMessage() for r in caplog.records)
 
     monkeypatch.undo()
     _point_home(tmp_path, monkeypatch)
@@ -1059,13 +1087,19 @@ def test_load_adopts_the_stale_timeout_on_disk_and_in_memory(tmp_path, monkeypat
     _point_home(tmp_path, monkeypatch)
     _write_config(tmp_path, {"agent": {"subagent_timeout_secs": 1800}})
 
-    with caplog.at_level(logging.INFO, logger=L.__name__):
+    with caplog.at_level(logging.WARNING, logger=L.__name__):
         cfg = KiroCrewConfig.load()
 
     assert cfg.agent.subagent_timeout_secs == 10800
     assert "subagent_timeout_secs" not in _on_disk(tmp_path).get("agent", {})
     assert SD.adopted_superseded() == {"agent.subagent_timeout_secs": 1800}
-    assert any("adopted the current default" in r.getMessage() for r in caplog.records)
+    notices = [
+        r.getMessage() for r in caplog.records if "adopted current default" in r.getMessage()
+    ]
+    assert len(notices) == 1
+    assert "agent.subagent_timeout_secs" in notices[0]
+    assert "1800" in notices[0]
+    assert "kirocrew config set agent.subagent_timeout_secs 1800" in notices[0]
 
 
 def test_a_deliberately_chosen_value_survives_the_adoption(tmp_path, monkeypatch):
@@ -1162,9 +1196,17 @@ def test_the_load_does_not_tell_the_operator_to_fix_what_it_just_fixed(
     with caplog.at_level(logging.WARNING, logger=L.__name__):
         KiroCrewConfig.load()
 
-    warnings = " ".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
-    assert "forward_declared_env" in warnings
-    assert "subagent_timeout_secs" not in warnings
+    drift_warnings = " ".join(
+        r.getMessage()
+        for r in caplog.records
+        if "still hold a superseded default" in r.getMessage()
+    )
+    assert "forward_declared_env" in drift_warnings
+    assert "subagent_timeout_secs" not in drift_warnings
+    assert any(
+        "adopted current default for agent.subagent_timeout_secs" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def test_a_failed_ledger_write_aborts_the_adoption(tmp_path, monkeypatch):

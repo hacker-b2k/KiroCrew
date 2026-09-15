@@ -258,7 +258,7 @@
         "titleblock_live": "IN FLIGHT",
         "notes_heading": "NOTES",
         "note_1": "A lane runs left to right across the phase columns; the head marks the item's live phase.",
-        "note_2": "A chamfered chip has a PR open; a plain rect has none yet.",
+        "note_2": "A #N pill means the item has a PR; a lane with no PR shows no #N pill.",
         "note_3": "A dot-dash span means the item skipped a phase; an under-lane arc is a re-entered phase.",
         "note_4": "A stub off the lane is an exit — skipped, yielded, handed back, preempted, or awaiting a reply.",
         "note_5": "A dwell over an hour is flagged; the open dwell counts from the most recent entry into the current phase.",
@@ -1487,6 +1487,14 @@
             "your": "Your"
           },
           "repoSettings": {
+            "browse_for_workspace_folder": "Browse for workspace folder",
+            "browse": "Browse",
+            "workspace": "Workspace",
+            "local_workspace_path": "Local workspace path",
+            "where_this_repo_is_checked_out_investigate_cwd": "Where this repo is checked out on the machine running the gateway. Investigate opens its chat session in this directory so the agent sees the repo's real source. Local-only — never sent to the source host.",
+            "users_you_code_owner_repo": "/Users/you/code/owner/repo",
+            "investigate_will_run_in": "New Investigate sessions will run in",
+            "leave_empty_to_use_the_default_working_directory": "Leave empty to use the default working directory.",
             "ai_label_recommendations": "AI label recommendations",
             "also_treat_issues_with": "Also treat issues with",
             "and_can_t_be_changed_here_to_add_or_remove_a_mem": "and can't be changed here — to add or remove a member or\n              collaborator, manage access on",
@@ -1809,6 +1817,8 @@
         "cancel": "Cancel",
         "chatEmpty": "Nothing sent to {{name}} yet.",
         "diagramFrameTitle": "{{name}} diagram",
+        "discardDraft": "Discard unsaved changes",
+        "discardDraftHint": "Your unsaved changes will be permanently deleted.",
         "edit": "Edit this output",
         "edited": "Edited",
         "editorLabel": "{{name}} output, editable",
@@ -1817,8 +1827,9 @@
         "mute": "Mute {{name}}",
         "mutedHint": "Not listening to the meeting",
         "revert": "Discard my edits",
-        "revertHint": "Discard my edits and show what {{name}} wrote",
+        "revertHint": "Permanently delete my edits and show what {{name}} wrote",
         "save": "Save",
+        "saving": "Saving…",
         "send": "Send",
         "showChat": "Show chat",
         "showOutput": "Show output",
@@ -3330,7 +3341,6 @@
         "creating": "Creating",
         "directly_under_the_root": "Directly under the root",
         "inside_name": "Inside {{name}}",
-        "n_already_existed": "{{n}} already existed",
         "n_created": "{{n}} created",
         "n_failed": "{{n}} failed",
         "n_possible_sub_folders_inside_packages_above": "{{n}} possible sub-folders inside packages above",
@@ -4230,7 +4240,7 @@
       "message_input": "Message input",
       "model": "Model",
       "optimizing_prompt": "Optimizing prompt…",
-      "plan_pre_filled_add_context_then_send": "Plan pre-filled — add context then Send",
+      "plan_pre_filled_add_context_then_send": "Prompt pre-filled — add context, then Send",
       "queue_message": "Queue message",
       "quick_actions_like_clearing_the_chat_or_checking": "Quick actions like clearing the chat or checking usage",
       "reference_a_file": "Reference a file",
@@ -4729,15 +4739,17 @@
       "auto_default": "Default",
       "credit_multiplier": "{{value}} the credit cost of Auto",
       "credit_multiplier_baseline": "{{value}}, the baseline credit cost",
+      "loading_models": "Loading models…",
       "no_matches": "No matches"
     },
     "modelEffortDropdown": {
+      "manage_in_settings": "Manage in Settings",
+      "manage_visible_models": "Manage visible models",
       "default_for_agent": "Default model for <agent/>",
       "filter_models": "Filter models",
       "model_list": "Model list",
-      "models": "Models",
+      "models_failed": "Couldn't load the remote crew's models.",
       "pin_model_unavailable": "<model/> isn't offered right now",
-      "reasoning": "Reasoning",
       "set_default_for_agent": "Set <model/> as default model for <agent/>",
       "set_default_for_new_sessions": "Global default for new sessions…",
       "type_to_filter": "Type to filter…"
@@ -4802,6 +4814,12 @@
       "skip": "Skip",
       "tell_kiro_about_you": "Tell Kiro about you",
       "your_role": "Your role"
+    },
+    "pierreEditorImpl": {
+      "highlighting_restarting_editing_available": "Syntax highlighting is restarting. Editing remains available.",
+      "highlighting_starting_editing_available": "Syntax highlighting is starting. Editing remains available.",
+      "highlighting_unavailable_content_readable_reload": "Syntax highlighting is unavailable until you reload. Content remains readable.",
+      "highlighting_unavailable_reload": "Syntax highlighting is unavailable. Save or copy your draft, then reload to restore syntax highlighting; editing remains available."
     },
     "projectPicker": {
       "back": "Back",
@@ -6491,7 +6509,12 @@
       "untagged": "+ untagged",
       "will_be_moved_to_older_sessions": "will be moved to older sessions.",
       "within": "Within",
-      "autopilot_desc": "One job, done in steps — it plans first, you approve, then it runs stage by stage."
+      "autopilot_desc": "One job, done in steps — it plans first, you approve, then it runs stage by stage.",
+      "remote_sessions_not_shown_in_board_view_one": "{{count}} remote session is not shown in board view — board columns manage local sessions only.",
+      "remote_sessions_not_shown_in_board_view_other": "{{count}} remote sessions are not shown in board view — board columns manage local sessions only.",
+      "sessions_from_instance_unavailable": "Sessions from {{names}} are unavailable right now.",
+      "checking_remote_instances": "Checking remote instances…",
+      "remote_instances_list_unavailable": "Remote instances could not be listed, so their sessions are not shown."
     },
     "contextBreakdown": {
       "axis_bar": "bar length ∝ √chars · segments = that turn's composition",
@@ -6660,7 +6683,9 @@
       "featurePreviewsTab": {
         "inbound_webhook_tokens_registered_contexts_and_r": "Inbound webhook tokens, registered contexts, and run history. The API works; the page is not finished.",
         "open_webhooks": "Open Webhooks",
-        "webhooks": "Webhooks"
+        "webhooks": "Webhooks",
+        "remote_instance_sessions": "Remote instance sessions",
+        "merge_a_connected_remote_instances_live_sessions": "Merge a connected remote instance's live sessions into the Sessions list, each marked with a server badge. Functional, but not finished."
       }
     },
     "developerPage": {
@@ -7005,6 +7030,7 @@
       "thread_repair_failed": "Couldn't reconnect this conversation. Reopen the member to try again.",
       "title": "Crew Members",
       "unread_message": "Unread message",
+      "stopped_indicator": "Stopped",
       "workspace": "Workspace",
       "drawer_working": "Working",
       "stat_today": "Today",
@@ -7187,7 +7213,6 @@
         "next_update_check_cycle": "Next update check cycle.",
         "no_agents_defined": "No agents defined",
         "no_memory_stores": "No memory stores",
-        "orchestrator_mode": "Orchestrator Mode",
         "pool_agent": "Pool Agent",
         "pool_size": "Pool Size",
         "pool_ttl": "Pool TTL",
@@ -7466,7 +7491,6 @@
         "delete": "Delete",
         "embed_model_label": "{{model}} · {{dim}}-dim",
         "embed_model_runs_locally": "{{model}} · {{dim}}-dim · runs locally in-process",
-        "embeddings": "Embeddings",
         "entries": "entries",
         "episodic_context_injected_per_message": "Episodic Context (injected per-message)",
         "episodic_memory": "Episodic Memory",
@@ -7484,6 +7508,7 @@
         "no_episodic_entries": "No episodic entries",
         "no_events": "No events",
         "of": "of",
+        "open_embedding_model_settings": "Open embedding model settings",
         "preview": "Preview",
         "ready": "Ready!",
         "retry": "Retry",
@@ -8044,6 +8069,8 @@
         "composer": "Composer",
         "concise_trim_filler": "Concise — trim filler and narration",
         "confirm_before_closing_session": "Confirm Before Closing Session",
+        "compact_empty_folders": "Compact Empty Folders",
+        "a_folder_with_no_chats_takes_one_row_instead_of": "A folder with no chats takes one row instead of two, and its New chat button moves onto the folder's own row",
         "content_width": "Content Width",
         "context": "Context",
         "context_usage_at_which_auto_compaction_triggers": "Context usage % at which auto-compaction triggers. Lower = more frequent compaction, longer sessions",

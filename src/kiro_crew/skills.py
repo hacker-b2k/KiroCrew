@@ -39,7 +39,11 @@ from kiro_crew.hooks import (
     validate_file_path,
 )
 from kiro_crew.metrics.provider import get_recorder
-from kiro_crew.platform_compat import is_link_or_junction
+from kiro_crew.platform_compat import (
+    ensure_owner_rwx_dirs,
+    is_link_or_junction,
+    rmtree_force,
+)
 from kiro_crew.project_scope import project_scope_satisfied
 from kiro_crew.security import (
     is_sensitive_path,
@@ -842,7 +846,9 @@ _FINGERPRINT_MAX_BYTES = 32 * 1024 * 1024
 _FINGERPRINT_MAX_ENTRIES = 4096
 
 
-def _tree_entries(root: Path) -> Iterator[tuple[str, str, str]]:
+def _tree_entries(
+    root: Path, *, assume_owner_rwx_dirs: bool = False
+) -> Iterator[tuple[str, str, str]]:
     """Yield ``(relative path, kind, detail)`` for the tree under *root*.
 
     Deterministic order (sorted, top-down), lstat-based, and it never opens or
@@ -886,9 +892,23 @@ def _tree_entries(root: Path) -> Iterator[tuple[str, str, str]]:
                 # Permission bits, like file modes below: a chmod on an
                 # installed builtin's directory is a user customization and
                 # must diverge the tree instead of being silently reset by
-                # the next sync. copytree preserves directory modes, so a
-                # clean install still fingerprints equal to its package.
-                yield rel, "dir", f"{stat.S_IMODE(mode):o}"
+                # the next sync. One deliberate asymmetry: when the caller
+                # sets ``assume_owner_rwx_dirs`` (used ONLY for the
+                # PACKAGED SOURCE side of a comparison), owner rwx is OR-ed
+                # in because the install adds those bits to the fresh
+                # copy's directories (``ensure_owner_rwx_dirs`` -- a
+                # read-only source such as a Nix store ships 0o555 and the
+                # copy must accept marker writes and directory search).
+                # A 0o455-class source needs execute added too. Hashing AS
+                # THE COPY WILL LOOK keeps that install-owned repair from
+                # reading as a user chmod, while the INSTALLED side is always
+                # hashed with its real modes -- so a user chmod on the copy,
+                # including removing an owner-rwx bit, still diverges. Files
+                # are never normalized: the install never rewrites file modes.
+                dir_mode = stat.S_IMODE(mode)
+                if assume_owner_rwx_dirs:
+                    dir_mode |= stat.S_IRWXU
+                yield rel, "dir", f"{dir_mode:o}"
         for fname in sorted(filenames):
             entry = Path(dirpath) / fname
             rel = (rel_dir / fname).as_posix()
@@ -932,12 +952,18 @@ def _trees_stat_equal(a: Path, b: Path) -> bool:
     directory itself is as much a user customization as one on any child.
     """
     try:
-        if stat.S_IMODE(os.lstat(a).st_mode) != stat.S_IMODE(os.lstat(b).st_mode):
+        # ``a`` is the INSTALLED tree (hashed with real modes), ``b`` is the
+        # PACKAGED SOURCE, whose directory modes are compared as the copy
+        # will look after ``ensure_owner_rwx_dirs`` -- the same
+        # asymmetry ``_tree_entries`` applies for child directories. A user
+        # chmod on the installed side (including removing owner rwx)
+        # therefore still diverges.
+        if stat.S_IMODE(os.lstat(a).st_mode) != (stat.S_IMODE(os.lstat(b).st_mode) | stat.S_IRWXU):
             return False
     except OSError:
         return False
     entries = 0
-    for ea, eb in zip_longest(_tree_entries(a), _tree_entries(b)):
+    for ea, eb in zip_longest(_tree_entries(a), _tree_entries(b, assume_owner_rwx_dirs=True)):
         entries += 1
         if entries > _FINGERPRINT_MAX_ENTRIES:
             return False
@@ -946,7 +972,7 @@ def _trees_stat_equal(a: Path, b: Path) -> bool:
     return True
 
 
-def _skill_tree_fingerprint(root: Path) -> str | None:
+def _skill_tree_fingerprint(root: Path, *, assume_owner_rwx_dirs: bool = False) -> str | None:
     """Stable content hash of the whole skill tree under *root*.
 
     Covers every entry ``_tree_entries`` yields — file bytes, symlink targets,
@@ -973,13 +999,19 @@ def _skill_tree_fingerprint(root: Path) -> str | None:
     # on the skill directory itself must diverge the fingerprint exactly like
     # a chmod on any entry inside it.
     try:
+        # ``assume_owner_rwx_dirs`` (set only when hashing the PACKAGED
+        # SOURCE) ORs owner rwx in, so the recorded fingerprint describes
+        # the copy as it will exist after ``ensure_owner_rwx_dirs``.
+        # The installed side is always hashed with its real modes.
         root_mode = stat.S_IMODE(os.lstat(root).st_mode)
+        if assume_owner_rwx_dirs:
+            root_mode |= stat.S_IRWXU
     except OSError:
         return None
     digest.update(f"root\0{root_mode:o}\0".encode("utf-8"))
     budget = _FINGERPRINT_MAX_BYTES
     entries = 0
-    for rel, kind, detail in _tree_entries(root):
+    for rel, kind, detail in _tree_entries(root, assume_owner_rwx_dirs=assume_owner_rwx_dirs):
         if kind == "unreadable":
             return None
         entries += 1
@@ -1104,7 +1136,7 @@ def _verified_unchanged_fingerprint(dest_dir: Path, src_dir: Path | None) -> str
     dest_fingerprint = _skill_tree_fingerprint(dest_dir)
     if dest_fingerprint is None:
         return None
-    if dest_fingerprint != _skill_tree_fingerprint(src_dir):
+    if dest_fingerprint != _skill_tree_fingerprint(src_dir, assume_owner_rwx_dirs=True):
         return None
     return dest_fingerprint
 
@@ -1425,13 +1457,10 @@ def _dispose_superseded_slot(slot: Path, dest_dir: Path) -> bool:
         if not _remove_ignorable_dir(slot_claim):
             _finalize_user_backup(slot_claim, dest_dir)
     elif _verified_unchanged_fingerprint(slot_claim, None) is not None:
-        try:
-            shutil.rmtree(slot_claim)
-        except OSError:
+        if not rmtree_force(slot_claim):
             logger.warning(
                 "could not remove epoch-old superseded skill copy %s; " "preserving what remains",
                 slot_claim,
-                exc_info=True,
             )
             _finalize_user_backup(slot_claim, dest_dir)
     else:
@@ -1618,7 +1647,7 @@ def _ensure_builtin_skills(base: Path) -> None:
             # during the hash as sync-owned, licensing its later deletion. The
             # copy equals the source (the package ships only regular files and
             # directories), so the source fingerprint is the copy's.
-            src_fingerprint = _skill_tree_fingerprint(src_dir)
+            src_fingerprint = _skill_tree_fingerprint(src_dir, assume_owner_rwx_dirs=True)
             try:
                 shutil.copytree(src_dir, dest_dir)
             except FileExistsError:
@@ -1628,6 +1657,18 @@ def _ensure_builtin_skills(base: Path) -> None:
                 # crash the sync.
                 logger.info("Skill %s installed concurrently elsewhere; keeping it", name)
                 continue
+            # copytree preserves source modes verbatim, so a read-only
+            # install source (0o555 -- a Nix store path, a read-only mount)
+            # yields a copy whose directories reject the provenance-marker
+            # write below. Add owner rwx: file creation needs a writable
+            # and searchable parent (including 0o455-class sources). The
+            # recorded source fingerprint above is computed with
+            # ``assume_owner_rwx_dirs=True``, i.e. it describes the
+            # copy AS IT EXISTS AFTER this repair, so a clean install does
+            # not read as a user customization on the next sync -- while any
+            # later chmod on the installed copy (including removing
+            # any owner-rwx bit) still diverges.
+            ensure_owner_rwx_dirs(dest_dir)
             if src_fingerprint is not None:
                 _write_provenance_marker(dest_dir, src_fingerprint)
             else:
@@ -1727,8 +1768,170 @@ def _ensure_builtin_skills(base: Path) -> None:
                     )
 
 
+#: SHA-256 of the static outputs from the retired conductor skill generator.
+#: Exact identity keeps user-authored or edited files outside cleanup scope.
+RETIRED_CONDUCTOR_SKILL_SHA256 = frozenset(
+    {
+        # select_crew-era text (crew triggers, `spawn_run(crew=...)` guidance)
+        "ee91da7d58b89ddc4cd3ff097a87f520335193d78cb5937d7636e5baa9ee6ca5",
+        # the first select_crew revision, before the crew= vs agent= warning
+        "e967c693613dca258f66992b9788a8e5e8e12c4397147f58f6595ee42ffa21be",
+    }
+)
+_RETIRED_CONDUCTOR_SKILL_MAX_BYTES = 16 * 1024
+
+
+def is_retired_conductor_skill(data: bytes) -> bool:
+    """Return whether *data* is a generated conductor skill revision.
+
+    CRLF output from Windows is normalized to the generator's LF form before
+    hashing. Bare carriage returns stay significant, as the generator emits none.
+    """
+    normalized = data.replace(b"\r\n", b"\n")
+    return hashlib.sha256(normalized).hexdigest() in RETIRED_CONDUCTOR_SKILL_SHA256
+
+
 def skills_dir() -> Path:
     return config_dir() / SKILLS_DIR_NAME
+
+
+def remove_retired_conductor_skill() -> bool:
+    """Remove a byte-exact generated conductor skill through pinned descriptors.
+
+    Return ``True`` only when the skill file is removed. Missing, user-authored,
+    and edited files return ``False``. Read and unlink errors propagate so each
+    caller can report them without blocking setup or gateway startup; an empty-dir
+    prune failure is ignored. A linked conductor directory is refused before any
+    file is read.
+
+    The conductor directory is opened relative to the pinned skills-root
+    descriptor with ``O_NOFOLLOW``, so a link swapped in at that name raises
+    ``OSError`` and propagates to the caller instead of being followed.
+
+    Platforms without descriptor-relative opens keep the no-link final-name and
+    bounded-read checks, but ancestor pinning and atomic identity-checked unlink
+    degrade to by-name checks around the open and unlink.
+    """
+    skill_path = skills_dir() / "conductor" / "SKILL.md"
+    parent = skill_path.parent
+    parent_info = pinned_fs.lstat_by_name(parent)
+    if (
+        parent_info is None
+        or not stat.S_ISDIR(parent_info.st_mode)
+        or pinned_fs.is_reparse_point(parent)
+    ):
+        return False
+
+    if not pinned_fs.supports_pinned_walk():
+        before = pinned_fs.lstat_by_name(skill_path)
+        if (
+            before is None
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_size > _RETIRED_CONDUCTOR_SKILL_MAX_BYTES
+        ):
+            return False
+        fd = os.open(skill_path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_size > _RETIRED_CONDUCTOR_SKILL_MAX_BYTES
+                or (
+                    before.st_ino
+                    and opened.st_ino
+                    and (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+                )
+            ):
+                return False
+            data = os.read(fd, _RETIRED_CONDUCTOR_SKILL_MAX_BYTES)
+            if os.fstat(fd).st_size != len(data):
+                return False
+        finally:
+            os.close(fd)
+        if not is_retired_conductor_skill(data):
+            return False
+        current = pinned_fs.lstat_by_name(skill_path)
+        if (
+            current is None
+            or not stat.S_ISREG(current.st_mode)
+            or (
+                opened.st_ino
+                and current.st_ino
+                and (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+            )
+        ):
+            return False
+        skill_path.unlink()
+        try:
+            if not os.listdir(parent):
+                parent.rmdir()
+        except OSError:
+            pass
+        return True
+
+    root_fd = pinned_fs.pin_parent(
+        os.path.realpath(parent.parent),
+        what="retired conductor skill directory",
+        refusal=OSError,
+    )
+    dir_fd: int | None = None
+    try:
+        current_parent = pinned_fs.stat_at(root_fd, parent.name)
+        if (
+            current_parent is None
+            or not stat.S_ISDIR(current_parent.st_mode)
+            or (current_parent.st_dev, current_parent.st_ino)
+            != (parent_info.st_dev, parent_info.st_ino)
+        ):
+            return False
+        dir_fd = os.open(parent.name, pinned_fs.dir_flags(), dir_fd=root_fd)
+        pinned_parent = os.fstat(dir_fd)
+        parent_identity = (pinned_parent.st_dev, pinned_parent.st_ino)
+        if parent_identity != (current_parent.st_dev, current_parent.st_ino):
+            return False
+        before = pinned_fs.stat_at(dir_fd, skill_path.name)
+        if (
+            before is None
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_size > _RETIRED_CONDUCTOR_SKILL_MAX_BYTES
+        ):
+            return False
+        fd = os.open(
+            skill_path.name,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=dir_fd,
+        )
+        try:
+            opened = os.fstat(fd)
+            identity = (opened.st_dev, opened.st_ino)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_size > _RETIRED_CONDUCTOR_SKILL_MAX_BYTES
+            ):
+                return False
+            data = os.read(fd, _RETIRED_CONDUCTOR_SKILL_MAX_BYTES)
+            if os.fstat(fd).st_size != len(data):
+                return False
+        finally:
+            os.close(fd)
+        if not is_retired_conductor_skill(data):
+            return False
+        if not pinned_fs.unlink_verified(dir_fd, skill_path.name, identity):
+            return False
+        try:
+            if not os.listdir(dir_fd):
+                pinned_fs.remove_dir_verified(
+                    root_fd,
+                    parent.name,
+                    expect=parent_identity,
+                )
+        except OSError:
+            pass
+        return True
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
+        os.close(root_fd)
 
 
 class SkillsLoader:

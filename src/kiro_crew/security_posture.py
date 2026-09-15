@@ -105,6 +105,14 @@ class PostureControl:
 # Where a sink runs only ONE of the two scanners, its detail text says so.
 _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     (
+        "Member capability editor responses",
+        "agent_capabilities.py",
+        "Owner-facing capability rows, Parent-change previews and impact summaries. "
+        "safe_view applies redact_via_context before serialization and masks credential "
+        "map values while preserving their structure. Retained secret values and "
+        "source-content digests remain server-side.",
+    ),
+    (
         "Memory recovery responses",
         "dashboard/handlers/memory_admin.py",
         "Retired episode text and supersession references, plus backup and restore "
@@ -377,6 +385,36 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "conversation_log.search_sessions directly, bypassing the "
         "/api/sessions/search handler where the local redaction normally runs, "
         "so the same title/snippet scrub is applied here.",
+    ),
+    (
+        "Peer live-session list",
+        "dashboard/handlers_instances.py",
+        "Rows returned by GET /api/instances/{id}/chat-slots, straight to the "
+        "browser's Sessions list. A second, distinct boundary in this module from "
+        "the federated search above: these are a connected peer's OPEN session "
+        "titles, and a title is MODEL-AUTHORED text produced on the other machine. "
+        "The local half of that same list has its title scrubbed by "
+        "dashboard/slot_projection.py before it renders, so a peer row forwarded "
+        "as-sent would be the one row in a merged list whose text never met a "
+        "redactor. Allowlist-reshaped to the fields the sidebar reads, then every "
+        "string run through the peer-text sink (scrub before clamp, so a "
+        "credential cannot survive by sitting past the length limit).",
+    ),
+    (
+        "Adopted peer transcript",
+        "dashboard/remote_adopt.py",
+        "A peer session's whole HISTORY, copied into a local slot when the user "
+        "opens that session here (POST /api/chat/slots with adopt_remote_slot). A "
+        "third boundary distinct from the two above, and the widest: those forward "
+        "one row's metadata, this one copies every message BODY the other machine "
+        "produced — model output, tool calls and their results — and PERSISTS it "
+        "into this hub's own transcript file, where later readers cannot tell it "
+        "came from a peer. Every role is scrubbed, user text included: the local "
+        "rule leaves user-authored text raw because its author is its only reader, "
+        "which stops being true once the text arrives over a wire. Row meta goes "
+        "through the deep scrub as well, because that is where tool payloads live. "
+        "The inherited agent, title and memory_mode take the same pass before they "
+        "land on the slot.",
     ),
     (
         "Profile artifact",
@@ -1302,6 +1340,14 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # goes out to a human.
         "context.py",
         "agent.py",
+        # Transfer-side log hygiene: both redact a URL down to scheme+host before it
+        # reaches a gateway log line ("Downloading %s from %s", a fetch failure, a
+        # manifest that overran its byte bound). The url is operator- or
+        # manifest-supplied and its path or query can carry a token, so the redaction
+        # keeps that out of the log ring and /api/logs. Neither module writes to a
+        # human-bound or third-party output, so neither is an egress boundary.
+        "asset_downloader.py",
+        "feature_videos_manifest.py",
         # Gate-side log hygiene: the update provider redacts an update command's
         # stderr before writing it to the gateway log. It is a boot-time
         # operational log line, not an output boundary bound for a human or a
@@ -1426,6 +1472,10 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # read, not an egress pass.
         "autonudge.py",
         "autonudge_authz.py",
+        # Inbound structured-monitor target validation. A canonical provider URL
+        # is rejected when its path contains credential-shaped text, before the
+        # target reaches persistence, inspection, or a wake envelope.
+        "monitoring/targets.py",
         # Gate-side log hygiene for a channel whose user identity IS a phone
         # number or an Apple Account email. ``redact_handle`` shortens a handle
         # before it reaches a gateway log line or a SEL ``caller`` field. None of
@@ -1704,6 +1754,7 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # credentials before they enter canonical monitor state. The controller's
         # later agent-session injection is the registered output boundary.
         "monitoring/github_pull_request.py",
+        "monitoring/pull_request.py",
         # Computer use: the redaction pass runs on third-party desktop content
         # (window titles, accessibility values) on its way INTO the model's
         # context, exactly like the MCP tool-result paths above. `policy.py` owns
@@ -1836,6 +1887,14 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # (an internal model field). The egress boundary is the dashboard API
         # handler that serializes hooks via to_dict() — already a registered sink.
         "hooks.py",
+        # Helper, not a boundary: `redact_oauth_client_secrets` /
+        # `restore_redacted_oauth_client_secrets` are pure functions over an agent
+        # spec dict that mask (and, on the write-back, un-mask) a pre-registered
+        # Connections client's `oauth.clientSecret`. Nothing leaves the process
+        # here; the egress boundaries are the two dashboard reads that CALL the
+        # masker -- `GET /api/agent/config` and `GET /api/agents/detail/{name}`
+        # in `dashboard/handlers/agents.py`, an already-registered sink.
+        "mcp_utils.py",
     }
 )
 

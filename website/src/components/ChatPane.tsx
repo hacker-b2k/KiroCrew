@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import { useNavigate } from 'react-router-dom'
-import { X } from 'lucide-react'
+import { X, LoaderCircle } from 'lucide-react'
 import { SplitGlyph } from './SplitGlyph'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { useModelsDegraded } from '../providers/modelListHealth'
@@ -13,8 +13,12 @@ import ChatInput, { type ComposerBusyMode } from './ChatInput'
 import ErrorNotice from './ErrorNotice'
 import { Btn } from './ui'
 import ChatDropOverlay, { useChatFileDrop } from './ChatDropOverlay'
+import PaneDim from './PaneDim'
+
+/** What the top-left split pane does about the shell's sidebar toggle — see
+ *  ChatPane's `leading` prop. */
+export type PaneLeading = { inset?: boolean; control?: React.ReactNode }
 import PendingQuestionCard from './PendingQuestionCard'
-import PendingDecisionCard from './PendingDecisionCard'
 import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from './QueueStack'
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
 import ChatFooter from '../pages/chat/ChatFooter'
@@ -26,12 +30,16 @@ import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
 import { agentOrDefaultLabel } from '../utils/agentLabel'
 import { useRemoteCapabilities } from '../hooks/useRemoteCapabilities'
 import ModelDropdownList from './ModelDropdownList'
+import { ManageModelsFooter } from './ModelEffortDropdown'
+import { settingsPath } from './settingsPath'
 import { SlotProvider } from '../providers/SlotContext'
 import { useProvider } from '../providers'
+import type { ModelInfo } from '../providers/types'
 import { useAgents } from '../hooks/useAgents'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
 import { useAvailableModels } from '../hooks/useAvailableModels'
+import { filterInteractiveModels, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
 import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
 import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
@@ -83,6 +91,7 @@ export default function ChatPane({
   followContentWidth,
   hideEmptyHint,
   openSideChat,
+  leading,
   busyMode = 'split',
 }: {
   slotKey: string
@@ -99,6 +108,13 @@ export default function ChatPane({
    *  the agent picker is not offered at all, instead of offering a control
    *  whose every selection the backend 409s. */
   agentLocked?: boolean
+  /** Split view: this pane owns the surface's top-left corner, where the shell
+   *  keeps the sessions-sidebar toggle. `inset` reserves that toggle's column
+   *  (desktop: the toggle is the shell's absolutely positioned button, and the
+   *  header would otherwise run under it); `control` renders the toggle inline
+   *  (mobile, where the single-chat title row that normally carries it is not
+   *  rendered in split view). Undefined = the header starts at its own inset. */
+  leading?: PaneLeading
   /** Embedded-in-a-page mode (member DM threads): the HOST renders the
    *  identity header, so the pane's own title bar and its card chrome
    *  (border, rounded corners) would duplicate it. Split-view panes keep
@@ -440,8 +456,27 @@ export default function ChatPane({
       .catch(() => setDefaultAgentFailed(true))
   }, [dispatch])
   const agentDD = useFilteredDropdown(installedAgents)
-  const availableModels = useAvailableModels()
-  const modelDD = useFilteredDropdown(availableModels)
+  const localModels = useAvailableModels()
+  const effectiveModels = useMemo<ModelInfo[]>(() => {
+    if (!paneRemoteCrew.isRemote) return localModels
+    return (paneRemoteCrew.capabilities?.models ?? []).map(model => ({
+      name: model.model_name,
+      description: model.description || model.display_name,
+      contextWindow: model.context_window || undefined,
+    }))
+  }, [paneRemoteCrew.isRemote, paneRemoteCrew.capabilities, localModels])
+  const hiddenModelsQ = useModelPickerHiddenModelsQuery()
+  const hiddenModelIds = hiddenModelsQ.data
+  const modelPickerConfigured = useModelPickerConfigured()
+  const availableModels = effectiveModels
+  const modelPickerModels = useMemo(
+    () => filterInteractiveModels(effectiveModels, hiddenModelIds, [
+      paneSlot?.model || '',
+      paneSlot?.served_model || '',
+    ]),
+    [effectiveModels, hiddenModelIds, paneSlot?.model, paneSlot?.served_model],
+  )
+  const modelDD = useFilteredDropdown(modelPickerModels)
   // See ChatPage: display what will actually run, not a pin the account lost
   // access to. The slot's own `model_withheld` verdict answers that when the
   // backend has one; the degraded flag gates only the list-membership fallback —
@@ -1166,7 +1201,19 @@ export default function ChatPane({
         } as React.CSSProperties}
       >
         {!frameless && (
-        <div className="relative z-50 flex items-center gap-2 px-3 py-2 border-b border-border bg-card shrink-0">
+        <div data-pane-title-row className={`relative z-50 flex items-center gap-2 pr-3 py-2 border-b border-border bg-card shrink-0 transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)] ${leading?.inset ? 'pl-[49px]' : 'pl-3'}`}>
+          {/* Leading edge (#10585): in split view this pane may stand in for
+              the single-chat title row at the surface's top-left. `inset`
+              clears the shell's stationary sidebar toggle: the pane starts at
+              container x 3 (2px grid inset + 1px border) and the toggle spans
+              container x 8..36 (TOGGLE_RECT), so the hairline sits at
+              container 44 = pane 41 and the title starts at container 52 =
+              pane 49 — the same columns the single-chat row uses (its
+              left-[52px] / pl-[60px] are measured from container x -8).
+              Absolute, so the divider never joins the row's flex layout.
+              `control` renders the toggle inline ahead of the title. */}
+          {leading?.inset && <span aria-hidden="true" data-pane-leading-divider className="absolute left-[41px] top-1/2 -translate-y-1/2 w-px h-5 bg-border" />}
+          {leading?.control}
           <span className={`w-2 h-2 rounded-full shrink-0 ${running ? 'bg-ok animate-pulse' : 'bg-accent'}`} />
           <span className="text-[13px] font-semibold text-text-strong truncate min-w-0">{title}</span>
           {parentKey && (
@@ -1197,6 +1244,11 @@ export default function ChatPane({
         </div>
         )}
 
+        {/* Split view only: `focused` is a boolean from the grid. A pane that
+            owns the whole surface (undefined) is never dimmed. Sits above the
+            title row (z-10) and the message chrome, below the drop overlay
+            (z-[60]) and every shell layer (>= 46). */}
+        {focused !== undefined && <PaneDim dimmed={!focused} />}
         <ChatDropOverlay active={dragOver} />
 
         {/* Zero-height anchor so the top fade overlays the scroller's first
@@ -1354,33 +1406,6 @@ export default function ChatPane({
             })
           }}
         />
-
-        {/* Buried [OPTIONS:] decision, per pane like the question card above —
-            in split mode the loop that buried its ask may not be the pane the
-            user is looking at. The question card owns the band when both are
-            pending (sidebar precedence: needs_input outranks pending_decision);
-            needs_input rides the same slot payload as pending_decision, so the
-            gate holds even while the async questions map is still hydrating. */}
-        {!pendingQuestion && !paneSlot?.needs_input && paneSlot?.pending_decision && (
-          <div className="mx-4 mb-2">
-            <PendingDecisionCard
-              slotKey={slotKey}
-              decision={paneSlot.pending_decision}
-              onPick={(o) => setInput((prev) => (prev.trim() ? `${prev.trimEnd()}, ${o}` : o))}
-              onSendDirect={(o) => {
-                // Same failure recovery as the question card's fallback send:
-                // a refused/failed direct send goes back into the composer
-                // rather than vanishing.
-                void sendTurn({ message: o, slot: slotKey }).then((receipt) => {
-                  if (receipt.status === 'refused' || receipt.status === 'transport-error' || receipt.status === 'response-late') {
-                    reportSendFailure(receipt.reason, receipt.status)
-                    restoreIntoComposer(o, [], slotKey)
-                  }
-                })
-              }}
-            />
-          </div>
-        )}
 
         {/* No hand-off: the composer draft (`input`) below is unsaved local state. */}
         <ErrorNotice
@@ -1589,9 +1614,42 @@ export default function ChatPane({
                 className={ddInputCls}
               />
             </div>
+            {hiddenModelsQ.isError && (
+              <div className="flex items-center gap-2 px-1.5 py-1">
+                {/* No hand-off: this pane's composer may hold an unsent draft.
+                    Retry keeps the user in the owning chat. */}
+                <ErrorNotice
+                  className="min-w-0 flex-1"
+                  variant="inline"
+                  message={i18nT('pages.settings.chatPanel.failed_to_load_dashboard_config')}
+                />
+                <Btn type="button" className="shrink-0" onClick={() => hiddenModelsQ.refetch()}>
+                  {i18nT('pages.settings.chatPanel.retry')}
+                </Btn>
+              </div>
+            )}
+            {paneRemoteCrew.failed && (
+              <div className="flex items-center gap-2 px-1.5 py-1">
+                {/* No hand-off: this pane's composer may hold an unsent draft.
+                    Retry keeps the user in the owning chat. */}
+                <ErrorNotice
+                  className="min-w-0 flex-1"
+                  variant="inline"
+                  message={i18nT('components.modelEffortDropdown.models_failed')}
+                />
+                <Btn type="button" className="shrink-0" onClick={() => paneRemoteCrew.refetch()} disabled={paneRemoteCrew.retrying}>
+                  {paneRemoteCrew.retrying && <LoaderCircle className="lucide-inline animate-spin" aria-hidden />}
+                  {i18nT('pages.settings.chatPanel.retry')}
+                </Btn>
+              </div>
+            )}
             <div role="listbox" aria-label={i18nT('components.chatPane.model_list')} className="overflow-y-auto max-h-[280px]">
-              <ModelDropdownList models={modelDD.filtered} activeModel={shownModel} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} />
+              <ModelDropdownList models={modelDD.filtered} activeModel={shownModel} onSelect={(name) => { switchModel(name); modelDD.setOpen(false) }} loading={paneRemoteCrew.modelsPending} failed={paneRemoteCrew.failed} />
             </div>
+            {!modelPickerConfigured && <ManageModelsFooter onManage={() => {
+              modelDD.setOpen(false)
+              navigate(settingsPath({ tab: 'chat', highlight: 'key:dashboard.model_picker_hidden_models' }))
+            }} />}
           </div>,
           document.body,
         )}

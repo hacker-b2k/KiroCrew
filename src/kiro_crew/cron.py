@@ -311,6 +311,59 @@ def referenced_skill_names() -> set[str]:
     return out
 
 
+def agent_sequence_dispatches(seq: list[str]) -> bool:
+    """Whether a job's ``agent_sequence`` is what dispatch actually runs.
+
+    A sequence of more than one agent takes precedence over ``agent_id``; a
+    shorter one is dormant and dispatch falls through to ``agent_id``. This is
+    the ONE spelling of that gate -- the Slack dispatch path, session-key
+    stability, and the doctor's disk reader all call it, so a change to the
+    dispatch semantics cannot silently leave a consumer reporting (or keying)
+    against the old rule.
+    """
+    return len(seq) > 1
+
+
+def job_agent_names_from_disk() -> list[tuple[str, str]]:
+    """``(job name, agent name)`` for every agent a stored cron job dispatches.
+
+    Read-only + best-effort like :func:`referenced_skill_names`: reads
+    ``crons.json`` directly (so it needs no running scheduler) and returns an
+    empty list on any error. ``kirocrew doctor`` uses this to warn when a job
+    still names a deprecated agent spec.
+
+    Mirrors dispatch, not storage: a ``script`` or ``command`` job bypasses
+    agent dispatch entirely, so its agent fields are dormant and the record is
+    skipped whole; otherwise, when :func:`agent_sequence_dispatches` the
+    sequence entries are reported and ``agent_id`` is dormant, else
+    ``agent_id`` is reported and the sequence (if any) is dormant. A record
+    whose fields the scheduler's own loader rejects (a non-list sequence, a
+    non-string entry or ``agent_id``) dispatches nothing, so it contributes
+    nothing here rather than failing doctor over a job that never runs.
+    """
+    out: list[tuple[str, str]] = []
+    try:
+        for j in _read_job_records(config_dir() / _CRONS_FILE)[0]:
+            if j.get("script") or j.get("command"):
+                continue  # runs with no LLM; agent fields are dormant
+            label = j.get("name") or j.get("id")
+            holder = label if isinstance(label, str) and label else "<unnamed job>"
+            seq = j.get("agent_sequence", [])
+            if not isinstance(seq, list) or any(not isinstance(s, str) for s in seq):
+                continue  # the scheduler's loader rejects this record whole
+            agent_id = j.get("agent_id", "")
+            if agent_id is not None and not isinstance(agent_id, str):
+                continue  # same rejection class
+            if agent_sequence_dispatches(seq):
+                names = [s for s in seq if s]
+            else:
+                names = [agent_id] if agent_id else []
+            out.extend((holder, name) for name in names)
+    except Exception:
+        return []
+    return out
+
+
 _STORE_VERSION = 2
 _MIN_INTERVAL_SECS = 60
 _JOB_TIMEOUT_SECS = 1800  # 30 min per job
@@ -717,6 +770,19 @@ class CronJob:
     # benign (they self-heal on the job's next folder move).
     folder_id: str = ""
     model: str = ""  # per-job model override (canonical key or provider id); "" = inherit
+    # Transient-retry telemetry for the LAST completed run. Both fields are
+    # written in ONE place, `CronService._execute`, right after it stamps
+    # `last_run_ts`: it reads the in-flight `_transient_attempts` counter the
+    # gateway callback leaves on the live job object (a runtime attribute that
+    # never reaches disk) and clears it. 0 means the last run needed no retry,
+    # or this is a legacy record with neither key.
+    last_retry_count: int = 0
+    #: The ``last_run_ts`` the count above describes -- the same `time.time()`
+    #: value, assigned in the same place. A cancelled run advances
+    #: ``last_run_ts`` on its own path (the ``every`` scheduler needs it to, or
+    #: the schedule drifts) and never reaches the stamp, so the two disagree and
+    #: the Schedule page shows no count for it rather than the previous run's.
+    last_retry_run_ts: float = 0.0
 
     # A sequence of MORE THAN ONE agent takes precedence over agent_id: the
     # gateway runs those agents in order, each on its own session key. A
@@ -959,7 +1025,7 @@ def cron_session_key_is_stable(job: CronJob) -> bool:
     record separates them. The sequential path ignores ``persistent_session``
     entirely, which is why it is checked second rather than combined.
     """
-    if len(job.agent_sequence) > 1:
+    if agent_sequence_dispatches(job.agent_sequence):
         return True
     return job.persistent_session
 
@@ -1888,6 +1954,8 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
         hide_in_chat=j.get("hide_in_chat", False),
         folder_id=_guard_str("folder_id"),
         model=_guard_str("model"),
+        last_retry_count=_guard_num("last_retry_count", 0),
+        last_retry_run_ts=_guard_num("last_retry_run_ts", 0.0),
         agent_sequence=_str_list("agent_sequence"),
         env=j.get("env", {}),
         timeout_secs=_guard_num("timeout_secs", _JOB_TIMEOUT_SECS),
@@ -3468,11 +3536,10 @@ class CronService:
             logger.warning("Deferred cron removals held: grant-epoch bump failed", exc_info=True)
             self._pending_removals |= pending
             return []
-        self._jobs = [j for j in self._jobs if j.id not in to_remove]
         # A Done()/delete_after_run job that self-removes retires its principal
         # just as a CLI remove does, so its children are released in the SAME
-        # save (see _release_children_of_removed).
-        restore = self._release_children_of_removed(to_remove)
+        # save (see _remove_job_rows).
+        restore = self._remove_job_rows(to_remove)
         # BACKGROUND writer: this runs inside the due-scan, so an unreadable
         # store must not abort the tick and stop every other job. The deferred
         # delete simply stays pending until the store is readable again.
@@ -3557,11 +3624,13 @@ class CronService:
         """
         with self._file_lock():
             self._sync_for_write()
-            before = len(self._jobs)
+            # Bump UNCONDITIONALLY: grant_epoch_ids() raises on corrupt epoch
+            # state, so removing even a missing id surfaces that corruption
+            # instead of answering a quiet False. The bump reads live rows, so
+            # it must precede the filter inside _remove_job_rows.
             self._bump_grant_epochs_for({job_id})
-            self._jobs = [j for j in self._jobs if j.id != job_id]
-            if len(self._jobs) < before:
-                restore = self._release_children_of_removed({job_id})
+            if any(j.id == job_id for j in self._jobs):
+                restore = self._remove_job_rows({job_id})
                 try:
                     self._save()
                 except BaseException:
@@ -3579,6 +3648,26 @@ class CronService:
                 logger.info("Removed cron job %s", job_id)
                 return True
         return False
+
+    def _remove_job_rows(self, removed_ids: set[str]) -> list[tuple[CronJob, str]]:
+        """Filter ``removed_ids`` out of ``self._jobs`` and cascade the release.
+
+        The ONLY sanctioned spelling of a structural remove. Every site that
+        drops a job's row from ``self._jobs`` must route through this helper so
+        the removal and the release of the removed jobs' children land in the
+        SAME save -- a bare list-comprehension filter compiles and passes tests
+        while silently skipping the cascade, stranding every child the removed
+        cron owns. ``test_cron_remove_rows_structural.py`` fails any filter
+        site that bypasses this helper.
+
+        Same contract as :meth:`_release_children_of_removed`: IN-LOCK ONLY,
+        after ``_sync_for_write()``; the caller must ``_save()`` afterwards and
+        on save failure restore the returned ``(job, previous_owner)`` pairs
+        (and reset the fingerprint where its path requires it). Grant-epoch
+        bumps read the live rows, so callers bump BEFORE calling this.
+        """
+        self._jobs = [j for j in self._jobs if j.id not in removed_ids]
+        return self._release_children_of_removed(removed_ids)
 
     def _release_children_of_removed(self, removed_ids: set[str]) -> list[tuple[CronJob, str]]:
         """Clear ownership on jobs whose cron principal is among ``removed_ids``.
@@ -3652,8 +3741,7 @@ class CronService:
                     missing.append(jid)
             if targets:
                 self._bump_grant_epochs_for(targets)
-                self._jobs = [j for j in self._jobs if j.id not in targets]
-                restore = self._release_children_of_removed(targets)
+                restore = self._remove_job_rows(targets)
                 try:
                     self._save()
                 except BaseException:
@@ -3772,8 +3860,7 @@ class CronService:
             if removed:
                 targets = set(removed)
                 self._bump_grant_epochs_for(targets)
-                self._jobs = [j for j in self._jobs if j.id not in targets]
-                restore = self._release_children_of_removed(targets)
+                restore = self._remove_job_rows(targets)
                 try:
                     self._save()
                 except BaseException:
@@ -4799,8 +4886,16 @@ class CronService:
             except Exception:
                 logger.debug("push_refresh failed on job end", exc_info=True)
             if not reaped and not cancelled:
-                # For 'every' jobs, use started_at to prevent cumulative drift
+                # For 'every' jobs, use started_at to prevent cumulative drift.
+                # `_execute` bound this run's retry count to the `last_run_ts` it
+                # stamped; moving that stamp has to move the binding with it, or
+                # the pair disagrees for every completed `every` run and the
+                # Schedule page never shows a count. Only a bound pair moves: a
+                # run that timed out never reached `_execute`'s stamp, so its
+                # pair is (previous run, this run) and stays mismatched.
                 if job.schedule.kind == "every":
+                    if job.last_retry_run_ts == job.last_run_ts:
+                        job.last_retry_run_ts = started_at
                     job.last_run_ts = started_at
                 # One clear per result-less run. Scattering it over exit sites is
                 # what let the fire-time deny and script Skip paths keep a result.
@@ -5005,9 +5100,21 @@ class CronService:
         job.last_status = None
         job.fire_time_denied = False
         job.run_never_started = False
+        # Transient retries the callback took this run. The gateway callback only
+        # INCREMENTS `_transient_attempts` (a runtime attribute on the live job);
+        # this method is the one owner of reading it, clearing it and persisting
+        # it -- see the stamp after `last_run_ts` below. The read-and-clear sits
+        # in a `finally` so a cancelled or timed-out run (CancelledError skips
+        # everything after the await) cannot leak a half-spent budget into the
+        # next run's retry allowance.
+        retries = 0
         try:
             if self._on_job:
-                await self._on_job(job)
+                try:
+                    await self._on_job(job)
+                finally:
+                    retries = int(getattr(job, "_transient_attempts", 0) or 0)
+                    job._transient_attempts = 0  # type: ignore[attr-defined]
             # Only mark "ok" if the callback did not itself report failure. The
             # command/script paths return NORMALLY and signal failure by mutating
             # the shared job (last_status="error"); only the LLM path raises.
@@ -5044,6 +5151,16 @@ class CronService:
             logger.error("Cron job '%s' failed: %s", job.name, exc)
 
         job.last_run_ts = time.time()
+        # Retry telemetry is stamped HERE, with the `last_run_ts` it describes,
+        # so the two can never disagree for a run that completed. Stamping it
+        # anywhere inside the callback would bind it to the PREVIOUS run's
+        # `last_run_ts` (this line has not run yet while the callback is
+        # executing), and the Schedule page -- which shows the count only when
+        # the two stamps match -- would never show it. A cancelled run never
+        # reaches this line, so its own `last_run_ts` write leaves the pair
+        # mismatched and the page shows no count rather than a stale one.
+        job.last_retry_count = retries
+        job.last_retry_run_ts = job.last_run_ts
 
         # One-shot "at" jobs: disable after the run. A fire-time-DENIED at-job
         # is disabled too — its due time has passed, so leaving it enabled
@@ -5107,6 +5224,13 @@ class CronService:
                 by_id[job.id].last_failure_hash = job.last_failure_hash
                 by_id[job.id].last_failure_at = job.last_failure_at
                 by_id[job.id].consecutive_failures = job.consecutive_failures
+                # Same shape as the other runtime->disk copies on this call: a
+                # field `_execute` sets on the in-memory `job` is invisible after
+                # reload unless copied here explicitly. A cancelled run never
+                # reached the stamp in `_execute`, so on it these still hold the
+                # last completed run's values and the copy changes nothing.
+                by_id[job.id].last_retry_count = job.last_retry_count
+                by_id[job.id].last_retry_run_ts = job.last_retry_run_ts
             # A fire-time-DENIED run is a policy refusal, not a completed run:
             # deleting the one-shot here would make the documented
             # resume-on-policy-loosening semantic impossible for at-jobs.
@@ -5160,14 +5284,14 @@ class CronService:
                         by_id[job.id].user_paused = True
                     self._pending_removals.add(job.id)
                 else:
-                    self._jobs = [j for j in self._jobs if j.id != job.id]
-                    consumed_row = True
                     # Consuming the one-shot retires its principal cron:<job id>,
                     # so a child that job created is released in the SAME save --
-                    # the fifth removal core alongside the four locked cores. Runs
-                    # after the row is filtered out so the job cannot release
-                    # itself; rolled back below if the save fails.
-                    restore = self._release_children_of_removed({job.id})
+                    # the fifth removal core alongside the four locked cores.
+                    # _remove_job_rows filters the row out before releasing so
+                    # the job cannot release itself; rolled back below if the
+                    # save fails.
+                    restore = self._remove_job_rows({job.id})
+                    consumed_row = True
             # BACKGROUND writer: a job has already run, so an unreadable store
             # must not surface as a job-runner crash. The run result is lost,
             # which is strictly better than clobbering the store.
@@ -5924,6 +6048,8 @@ class CronService:
                     "hide_in_chat": j.hide_in_chat,
                     "folder_id": j.folder_id,
                     "model": j.model,
+                    "last_retry_count": j.last_retry_count,
+                    "last_retry_run_ts": j.last_retry_run_ts,
                     "agent_sequence": j.agent_sequence,
                     "env": j.env,
                     "timeout_secs": j.timeout_secs,

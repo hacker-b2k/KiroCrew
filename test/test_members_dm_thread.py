@@ -48,6 +48,8 @@ def _fake_config(names, default=CREW):
         agents={name: KiroCrewAgentConfig(kiro_agent=name) for name in names},
         default_agent=default,
         memory_stores={},
+        workspaces={"default": SimpleNamespace(dir="workspace")},
+        default_workspace="default",
     )
 
 
@@ -219,6 +221,51 @@ class TestMemberRoutes:
         # A member with no transcript stays at 0 — sorted last, never an error.
         assert rows["Docs_Writer"]["last_active_ts"] == 0.0
         assert rows["Docs_Writer"]["last_message"] == ""
+        # No stop card in either thread, so the flag is absent (omitted when
+        # false — see below) on both rows.
+        assert "last_message_stopped" not in rows[CREW]
+        assert "last_message_stopped" not in rows["Docs_Writer"]
+
+    @pytest.mark.asyncio
+    async def test_roster_flags_a_thread_whose_newest_event_is_a_stop(self, tmp_path):
+        """A just-stopped thread carries last_message_stopped=True on the wire.
+
+        The preview is the last CONVERSATIONAL line (the stop card's JSON is
+        skipped), but that line reads as ongoing work on a thread the user has
+        stopped. So the row also carries a locale-independent boolean the
+        locale-aware client turns into a "Stopped" chip — never the word
+        "Stopped" from here, where the client's locale is unknown. The flag is
+        OMITTED (not False) when the newest event is not a stop, so the common
+        row stays byte-for-byte what it is without it; a later real message
+        leaves it absent.
+        """
+        state = _make_state(tmp_path)
+        write_dm_binding(CREW, member=CREW, slot_key=member_slot_key(CREW))
+        key = f"dashboard:{member_slot_key(CREW)}"
+        state.conversation_log.append(key, "assistant", "Running the analysis now.")
+        stop_payload = json.dumps({"kind": "stop_event", "id": "s1", "state": "stopped"})
+        state.conversation_log.append(key, "system", stop_payload, cls=stop_payload)
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get("/api/members")
+                assert resp.status == 200
+                data = await resp.json()
+        row = {r["name"]: r for r in data["members"]}[CREW]
+        # Preview is the conversational line, not the stop JSON…
+        assert row["last_message"] == "Running the analysis now."
+        # …and the flag says the newest event is a stop, so the chip renders.
+        assert row["last_message_stopped"] is True
+
+        # The member speaks again: the newest real row is now that message, the
+        # flag clears to absent, and the chip comes down.
+        state.conversation_log.append(key, "user", "actually, hold on")
+        with _patched_config([CREW]):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                resp = await client.get("/api/members")
+                data = await resp.json()
+        row = {r["name"]: r for r in data["members"]}[CREW]
+        assert row["last_message"] == "actually, hold on"
+        assert "last_message_stopped" not in row
 
     @pytest.mark.asyncio
     async def test_roster_preview_redacts_before_truncation(self, tmp_path):
@@ -324,6 +371,101 @@ class TestMemberRoutes:
         assert slot.mode == DM_SLOT_MODE
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("private", [False, True])
+    @pytest.mark.parametrize("workspace", ["team-a", "missing"])
+    async def test_thread_create_honors_member_workspace_and_project(
+        self, tmp_path, monkeypatch, private, workspace
+    ):
+        """A new member DM uses the configured workspace for cwd and project guides."""
+        from member_memory_helpers import patch_private_memory_supported
+
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.config.sections import WorkspaceConfig
+        from kiro_crew.memory_stores import provision_member_memory
+
+        team_dir = tmp_path / "team-a-workspace"
+        team_dir.mkdir()
+        cfg = KiroCrewConfig.load()
+        cfg.agents[CREW] = KiroCrewAgentConfig(kiro_agent=CREW, workspace=workspace)
+        cfg.workspaces["team-a"] = WorkspaceConfig(dir=str(team_dir))
+        cfg.default_workspace = "team-a"
+        if private:
+            patch_private_memory_supported(monkeypatch)
+            await asyncio.to_thread(provision_member_memory, cfg, CREW)
+        await asyncio.to_thread(cfg.save)
+        state = _make_state(tmp_path)
+        frames = []
+        monkeypatch.setattr(state, "_slots_broadcast_lock", None)
+        monkeypatch.setattr(
+            state,
+            "_do_slots_broadcast",
+            lambda: frames.append(
+                [(slot.workspace, slot.project) for slot in state._slots.values()]
+            ),
+        )
+        async with TestClient(TestServer(_make_members_app(state))) as client:
+            resp = await client.post(f"/api/members/{CREW}/thread")
+            assert resp.status == 200, await resp.text()
+            data = await resp.json()
+        slot = state._slots[data["slot_key"]]
+        assert slot.workspace == "team-a"
+        assert slot.project == str(team_dir.resolve())
+        assert frames and frames[0] == [("team-a", str(team_dir.resolve()))]
+        if private:
+            assert slot.memory_store == cfg.agents[CREW].memory_store
+
+    @pytest.mark.asyncio
+    async def test_workspace_resolution_does_not_overwrite_a_concurrent_opener(self, tmp_path):
+        state = _make_state(tmp_path)
+        entered, release = threading.Event(), threading.Event()
+
+        def resolve(workspace):
+            entered.set()
+            assert release.wait(timeout=5)
+            return str(tmp_path / "resolved")
+
+        with (
+            _patched_config([CREW]),
+            patch("kiro_crew.dashboard.handlers.members.default_project_dir", resolve),
+        ):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                pending = asyncio.create_task(client.post(f"/api/members/{CREW}/thread"))
+                try:
+                    assert await asyncio.to_thread(entered.wait, 5)
+                    slot = state.get_or_create_slot(
+                        member_slot_key(CREW), agent=CREW, mode=DM_SLOT_MODE, workspace="chosen"
+                    )
+                    slot.project = str(tmp_path / "chosen")
+                finally:
+                    release.set()
+                    response = await asyncio.wait_for(pending, timeout=5)
+                assert response.status == 200
+        assert state._slots[member_slot_key(CREW)] is slot
+        assert slot.project == str(tmp_path / "chosen")
+        assert slot.workspace == "chosen"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("project", ["", "chosen-project"])
+    async def test_reopening_live_member_preserves_explicit_project(self, tmp_path, project):
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot(
+            member_slot_key(CREW), agent=CREW, mode=DM_SLOT_MODE, workspace="chosen"
+        )
+        slot.project = project
+        with (
+            _patched_config([CREW]),
+            patch(
+                "kiro_crew.dashboard.handlers.members.default_project_dir",
+                side_effect=AssertionError("existing project was re-resolved"),
+            ),
+        ):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                response = await client.post(f"/api/members/{CREW}/thread")
+                assert response.status == 200
+        assert slot.workspace == "chosen"
+        assert slot.project == project
+
+    @pytest.mark.asyncio
     async def test_thread_reopen_rehydrates_dormant_history(self, tmp_path):
         """A dormant thread's transcript comes back when the thread reopens.
 
@@ -421,6 +563,26 @@ class TestMemberRoutes:
         assert second["member"] == "Review_Agent"
         bound_rows = [r for r in roster["members"] if r["slot_key"]]
         assert [r["name"] for r in bound_rows] == ["Review_Agent"]
+
+    @pytest.mark.asyncio
+    async def test_colliding_slug_honors_a_binding_naming_the_later_crew(self, tmp_path):
+        """A corroborated binding OUTRANKS config order, it does not tie it.
+
+        Binding the second of two colliding names is the only case where the
+        bound member and the config-order fallback differ, so it is the only
+        case that can observe which of the two the handler picks. Every other
+        binding in this suite names the sole owner, where both answers agree.
+        """
+        state = _make_state(tmp_path)
+        write_dm_binding(
+            "review-agent", member="review-agent", slot_key=member_slot_key("review-agent")
+        )
+        with _patched_config(["Review_Agent", "review-agent"], default="Review_Agent"):
+            async with TestClient(TestServer(_make_members_app(state))) as client:
+                opened = await (await client.post("/api/members/review-agent/thread")).json()
+        # Config order answers Review_Agent; the binding answers review-agent.
+        assert opened["member"] == "review-agent"
+        assert read_dm_binding("review-agent")["member"] == "review-agent"
 
     @pytest.mark.asyncio
     async def test_app_tokens_are_denied(self, tmp_path):
